@@ -32,6 +32,22 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
     end
   end
 
+  describe "params shape validation" do
+    test "known callbacks reject nil params as invalid params" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request("fs/read_text_file", nil, nil)
+
+      assert message =~ "expected a JSON object"
+    end
+
+    test "known callbacks reject list params as invalid params" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request("terminal/create", [], nil)
+
+      assert message =~ "expected a JSON object"
+    end
+  end
+
   # -- fs/read_text_file -----------------------------------------------------
 
   describe "fs/read_text_file" do

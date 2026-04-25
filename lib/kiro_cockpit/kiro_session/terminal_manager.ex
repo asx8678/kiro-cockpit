@@ -224,7 +224,13 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
     case Map.fetch(state.terminals, terminal_id) do
       {:ok, terminal} ->
         exit_status = format_exit_status(terminal)
-        result = %{"output" => terminal.buffer, "truncated" => terminal.truncated}
+
+        # Ports deliver arbitrary bytes; JSON-RPC responses must be valid
+        # UTF-8 for Jason encoding. In particular, outputByteLimit can cut a
+        # multi-byte codepoint in half. Sanitize at response time while keeping
+        # the raw bounded buffer internally.
+        output = ensure_valid_utf8(terminal.buffer)
+        result = %{"output" => output, "truncated" => terminal.truncated}
 
         result =
           if exit_status != nil do
@@ -516,6 +522,46 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
       {truncated_bin, true}
     else
       {combined, false}
+    end
+  end
+
+  @replacement_character "�"
+
+  @spec ensure_valid_utf8(binary()) :: String.t()
+  defp ensure_valid_utf8(buffer) do
+    if String.valid?(buffer) do
+      buffer
+    else
+      replace_invalid_utf8(buffer, [])
+    end
+  end
+
+  defp replace_invalid_utf8(<<>>, acc) do
+    acc
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+  end
+
+  defp replace_invalid_utf8(buffer, acc) do
+    case :unicode.characters_to_binary(buffer, :utf8, :utf8) do
+      converted when is_binary(converted) ->
+        [converted | acc]
+        |> Enum.reverse()
+        |> IO.iodata_to_binary()
+
+      {:error, valid_prefix, rest} ->
+        # Drop exactly one invalid byte, preserve any valid prefix, and insert
+        # U+FFFD so callers can see where lossy decoding happened.
+        <<_bad_byte, tail::binary>> = rest
+        replace_invalid_utf8(tail, [@replacement_character, valid_prefix | acc])
+
+      {:incomplete, valid_prefix, _rest} ->
+        # A trailing partial UTF-8 sequence (commonly caused by byte-limit
+        # truncation) cannot be encoded as JSON. Preserve the valid prefix and
+        # mark the incomplete codepoint with U+FFFD.
+        [@replacement_character, valid_prefix | acc]
+        |> Enum.reverse()
+        |> IO.iodata_to_binary()
     end
   end
 

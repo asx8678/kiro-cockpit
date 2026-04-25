@@ -33,15 +33,17 @@ defmodule KiroCockpit.KiroSession.Callbacks do
 
   # -- Known methods ----------------------------------------------------------
 
-  @known_methods MapSet.new([
-                   "fs/read_text_file",
-                   "fs/write_text_file",
-                   "terminal/create",
-                   "terminal/output",
-                   "terminal/wait_for_exit",
-                   "terminal/kill",
-                   "terminal/release"
-                 ])
+  @known_method_list [
+    "fs/read_text_file",
+    "fs/write_text_file",
+    "terminal/create",
+    "terminal/output",
+    "terminal/wait_for_exit",
+    "terminal/kill",
+    "terminal/release"
+  ]
+
+  @known_methods MapSet.new(@known_method_list)
 
   @doc """
   Check if a method is auto-handled by this module.
@@ -61,9 +63,23 @@ defmodule KiroCockpit.KiroSession.Callbacks do
   The `terminal_manager` argument is required for `terminal/*` methods
   and ignored for `fs/*` methods.
   """
-  @spec handle_request(String.t(), map(), GenServer.server() | nil) ::
+  @spec handle_request(String.t(), term(), GenServer.server() | nil) ::
           {:ok, term()} | {:error, integer(), String.t(), term()}
   def handle_request(method, params, terminal_manager \\ nil)
+
+  # Top-level guard: all known callback methods require JSON object params.
+  # ACP/JSON-RPC permits params to be omitted/null/array in general, but these
+  # client callbacks are object-shaped. Reject invalid shapes before helper
+  # functions call Map.fetch/Map.get and raise BadMapError.
+  def handle_request(method, params, _terminal_manager)
+      when is_binary(method) and not is_map(params) do
+    if known_method?(method) do
+      {:error, @error_invalid_params,
+       "Invalid params: expected a JSON object (map), got #{inspect(params)}", nil}
+    else
+      {:error, -32_601, "Method not found: #{method}", nil}
+    end
+  end
 
   # -- fs/read_text_file ------------------------------------------------------
 

@@ -130,6 +130,34 @@ defmodule KiroCockpit.KiroSession.TerminalManagerTest do
       assert byte_size(result["output"]) <= 2
       assert result["truncated"] == true
     end
+
+    test "returns JSON-safe output when process emits invalid UTF-8", %{tm: tm} do
+      printf = System.find_executable("printf") || flunk("printf not found")
+      {:ok, term_id} = TerminalManager.create(tm, printf, ["\\377"], nil, [], 1_048_576)
+
+      assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+      assert {:ok, result} = TerminalManager.output(tm, term_id)
+
+      assert String.valid?(result["output"])
+      assert result["output"] =~ "�"
+      assert Jason.encode!(result)
+    end
+
+    test "returns JSON-safe output when truncation cuts a codepoint", %{tm: tm} do
+      printf = System.find_executable("printf") || flunk("printf not found")
+
+      # "\\342\\202\\254" is the three-byte UTF-8 encoding for "€".
+      # Limit to two bytes so the raw buffer ends with an incomplete codepoint.
+      {:ok, term_id} = TerminalManager.create(tm, printf, ["\\342\\202\\254"], nil, [], 2)
+
+      assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+      assert {:ok, result} = TerminalManager.output(tm, term_id)
+
+      assert result["truncated"] == true
+      assert String.valid?(result["output"])
+      assert result["output"] =~ "�"
+      assert Jason.encode!(result)
+    end
   end
 
   # -- wait_for_exit ---------------------------------------------------------

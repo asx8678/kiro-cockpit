@@ -1020,39 +1020,59 @@ defmodule KiroCockpit.KiroSession do
   end
 
   # terminal/* methods may block (wait_for_exit) — handle async via Task.
-  @spec handle_terminal_callback_async(t(), pid(), integer() | binary(), String.t(), map()) :: :ok
+  # Both exceptions and exits from Callbacks.handle_request/3 (e.g. a dead
+  # TerminalManager causing GenServer.call to exit) are converted to a safe
+  # JSON-RPC Internal error response. safe_respond also catches exits around
+  # response-sending itself, so a dead PortProcess won't crash the Task either.
+  @spec handle_terminal_callback_async(t(), pid(), integer() | binary(), String.t(), term()) ::
+          :ok
   defp handle_terminal_callback_async(state, port_pid, id, method, params) do
     tm = state.terminal_manager
 
     Task.start(fn ->
-      try do
-        result = Callbacks.handle_request(method, params, tm)
-
-        case result do
-          {:ok, value} ->
-            safe_respond(port_pid, id, fn ->
-              PortProcess.respond(port_pid, id, value)
-            end)
-
-          {:error, code, message, data} ->
-            safe_respond(port_pid, id, fn ->
-              PortProcess.respond_error(port_pid, id, code, message, data)
-            end)
-        end
-      rescue
-        e ->
-          Logger.warning(fn ->
-            "KiroSession terminal callback handler crashed: #{Exception.message(e)}"
-          end)
-
-          # Send a best-effort error response so the agent doesn't hang.
-          safe_respond(port_pid, id, fn ->
-            PortProcess.respond_error(port_pid, id, -32_000, "Internal error", nil)
-          end)
-      end
+      method
+      |> run_terminal_callback(params, tm)
+      |> send_terminal_callback_response(port_pid, id)
     end)
 
     :ok
+  end
+
+  @spec run_terminal_callback(String.t(), term(), GenServer.server() | nil) ::
+          {:ok, term()} | {:error, integer(), String.t(), term()}
+  defp run_terminal_callback(method, params, terminal_manager) do
+    Callbacks.handle_request(method, params, terminal_manager)
+  catch
+    :exit, reason ->
+      Logger.warning(fn ->
+        "KiroSession terminal callback handler exited: #{inspect(reason)}"
+      end)
+
+      {:error, -32_000, "Internal error", nil}
+
+    :error, exception ->
+      Logger.warning(fn ->
+        "KiroSession terminal callback handler crashed: #{Exception.message(exception)}"
+      end)
+
+      {:error, -32_000, "Internal error", nil}
+  end
+
+  @spec send_terminal_callback_response(
+          {:ok, term()} | {:error, integer(), String.t(), term()},
+          pid(),
+          JsonRpc.id()
+        ) :: :ok
+  defp send_terminal_callback_response({:ok, value}, port_pid, id) do
+    safe_respond(port_pid, id, fn ->
+      PortProcess.respond(port_pid, id, value)
+    end)
+  end
+
+  defp send_terminal_callback_response({:error, code, message, data}, port_pid, id) do
+    safe_respond(port_pid, id, fn ->
+      PortProcess.respond_error(port_pid, id, code, message, data)
+    end)
   end
 
   # Best-effort response: if the ACP port process has died, respond/3 or
