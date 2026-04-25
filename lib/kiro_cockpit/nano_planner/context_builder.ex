@@ -100,19 +100,7 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
           session_summary: session_summary
         )
 
-      markdown = ProjectSnapshot.to_markdown(snapshot)
-
-      case enforce_budget(markdown, max_total) do
-        {:ok, trimmed} ->
-          total_chars = String.length(trimmed)
-          {:ok, %{snapshot | total_chars: total_chars}}
-
-        {:error, :budget_exceeded} ->
-          case trim_to_budget(snapshot, max_total, max_file_chars) do
-            {:ok, trimmed_snapshot} -> {:ok, trimmed_snapshot}
-            {:error, reason} -> {:error, reason}
-          end
-      end
+      finalize_snapshot(snapshot, max_total, max_file_chars)
     end
   end
 
@@ -310,6 +298,18 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
       {:ok, markdown}
     else
       {:error, :budget_exceeded}
+    end
+  end
+
+  defp finalize_snapshot(snapshot, max_total, max_file_chars) do
+    markdown = ProjectSnapshot.to_markdown(snapshot)
+
+    case enforce_budget(markdown, max_total) do
+      {:ok, trimmed} ->
+        {:ok, %{snapshot | total_chars: String.length(trimmed)}}
+
+      {:error, :budget_exceeded} ->
+        trim_to_budget(snapshot, max_total, max_file_chars)
     end
   end
 
