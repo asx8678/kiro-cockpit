@@ -97,7 +97,9 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
             session_id: nil,
             current_mode: "code",
             config_options: @default_config_options,
-            pending_prompt_id: nil
+            pending_prompt_id: nil,
+            pending_session_id: nil,
+            session_counter: 0
 
   # -- Public entry point ----------------------------------------------------
 
@@ -207,6 +209,14 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
   # Callback scenario: got the client's reply to our `fs/read_text_file`
   # request during an active prompt. Emit tool_call_update, then finally
   # respond to the pending session/prompt request.
+  #
+  # Guard: if there is no pending prompt (stray/unexpected response), silently
+  # discard it rather than emitting a JSON-RPC success response with id: nil.
+  defp handle_response(@fs_read_text_file_id, msg, %{pending_prompt_id: nil} = state) do
+    _ = msg
+    {[], state}
+  end
+
   defp handle_response(@fs_read_text_file_id, msg, state) do
     file_content =
       case msg do
@@ -216,7 +226,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
 
     tool_update =
       notify("session/update", %{
-        "sessionId" => state.session_id,
+        "sessionId" => state.pending_session_id,
         "update" => %{
           "sessionUpdate" => "tool_call_update",
           "toolCallId" => "call_read_001",
@@ -228,7 +238,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
       })
 
     prompt_reply = success_response(state.pending_prompt_id, %{"stopReason" => "end_turn"})
-    state = %{state | pending_prompt_id: nil}
+    state = %{state | pending_prompt_id: nil, pending_session_id: nil}
 
     {[tool_update, prompt_reply], state}
   end
@@ -297,7 +307,8 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
   # ACP lifecycle: session/new
 
   defp handle_request(id, "session/new", _params, state) do
-    session_id = "sess_fake_" <> random_suffix()
+    session_counter = state.session_counter + 1
+    session_id = "sess_fake_#{pad_counter(session_counter)}"
 
     result = %{
       "sessionId" => session_id,
@@ -311,7 +322,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
       "configOptions" => state.config_options
     }
 
-    state = %{state | session_id: session_id}
+    state = %{state | session_id: session_id, session_counter: session_counter}
 
     {[success_response(id, result)], state}
   end
@@ -508,7 +519,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
       })
     ]
 
-    state = %{state | pending_prompt_id: id}
+    state = %{state | pending_prompt_id: id, pending_session_id: session_id}
 
     {actions, state}
   end
@@ -569,7 +580,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
 
   # -- Misc ------------------------------------------------------------------
 
-  defp random_suffix do
-    :crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)
+  defp pad_counter(n) when is_integer(n) and n > 0 do
+    n |> Integer.to_string() |> String.pad_leading(3, "0")
   end
 end

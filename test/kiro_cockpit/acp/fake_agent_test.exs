@@ -92,17 +92,27 @@ defmodule KiroCockpit.Test.Acp.FakeAgentTest do
   # -- Lifecycle: session/new ------------------------------------------------
 
   describe "session/new" do
-    test "returns sessionId, modes, and configOptions" do
+    test "returns deterministic sessionId, modes, and configOptions" do
       pid = start_fake_agent()
 
       assert {:ok, result} =
                PortProcess.request(pid, "session/new", %{"cwd" => "/tmp"}, 5_000)
 
-      assert String.starts_with?(result["sessionId"], "sess_fake_")
+      assert result["sessionId"] == "sess_fake_001"
       assert result["modes"]["currentModeId"] == "code"
       assert length(result["modes"]["availableModes"]) == 2
       assert length(result["configOptions"]) == 1
       assert hd(result["configOptions"])["id"] == "model"
+    end
+
+    test "sessionId increments deterministically across calls" do
+      pid = start_fake_agent()
+
+      assert {:ok, r1} = PortProcess.request(pid, "session/new", %{"cwd" => "/tmp"}, 5_000)
+      assert r1["sessionId"] == "sess_fake_001"
+
+      assert {:ok, r2} = PortProcess.request(pid, "session/new", %{"cwd" => "/tmp"}, 5_000)
+      assert r2["sessionId"] == "sess_fake_002"
     end
   end
 
@@ -238,14 +248,22 @@ defmodule KiroCockpit.Test.Acp.FakeAgentTest do
       assert_receive {:acp_notification, ^pid,
                       %{
                         method: "session/update",
-                        params: %{"update" => %{"sessionUpdate" => "tool_call"}}
+                        params:
+                          %{
+                            "sessionId" => "test",
+                            "update" => %{"sessionUpdate" => "tool_call"}
+                          } = _p1
                       }},
                      2_000
 
       assert_receive {:acp_notification, ^pid,
                       %{
                         method: "session/update",
-                        params: %{"update" => %{"sessionUpdate" => "tool_call_update"}}
+                        params:
+                          %{
+                            "sessionId" => "test",
+                            "update" => %{"sessionUpdate" => "tool_call_update"}
+                          } = _p2
                       }},
                      2_000
 
@@ -253,7 +271,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgentTest do
                       %{
                         id: req_id,
                         method: "fs/read_text_file",
-                        params: %{"path" => "/tmp/kiro-fake.txt"}
+                        params: %{"path" => "/tmp/kiro-fake.txt", "sessionId" => "test"} = _p3
                       }},
                      2_000
 
@@ -264,13 +282,74 @@ defmodule KiroCockpit.Test.Acp.FakeAgentTest do
       assert {:ok, result} = Task.await(task, 5_000)
       assert result["stopReason"] == "end_turn"
 
-      # Should also get the tool_call_update (completed) notification.
+      # Should also get the tool_call_update (completed) notification with the
+      # prompt's sessionId, NOT state.session_id.
       assert_receive {:acp_notification, ^pid,
                       %{
                         method: "session/update",
-                        params: %{"update" => %{"sessionUpdate" => "tool_call_update"}}
+                        params: %{
+                          "sessionId" => "test",
+                          "update" => %{
+                            "sessionUpdate" => "tool_call_update",
+                            "status" => "completed"
+                          }
+                        }
                       }},
                      2_000
+    end
+
+    test "all callback notifications and requests carry the prompt's sessionId" do
+      pid = start_fake_agent("callback")
+
+      {:ok, _} = PortProcess.request(pid, "session/new", %{"cwd" => "/tmp"}, 5_000)
+
+      prompt_session_id = "my_custom_session"
+
+      task =
+        Task.async(fn ->
+          PortProcess.request(
+            pid,
+            "session/prompt",
+            %{
+              "sessionId" => prompt_session_id,
+              "prompt" => [%{"type" => "text", "text" => "read a file"}]
+            },
+            10_000
+          )
+        end)
+
+      Process.sleep(100)
+
+      # Collect ALL notifications and requests emitted during the callback flow.
+      all_messages = drain_inbox(pid, 500)
+
+      # Find the fs/read_text_file request
+      {:request, callback_req} =
+        Enum.find(all_messages, fn
+          {:request, %{method: "fs/read_text_file"}} -> true
+          _ -> false
+        end)
+
+      assert callback_req.params["sessionId"] == prompt_session_id
+
+      # Every session/update notification so far must carry the prompt sessionId
+      for {:notification, %{method: "session/update", params: params}} <- all_messages do
+        assert params["sessionId"] == prompt_session_id,
+               "session/update notification missing prompt sessionId: #{inspect(params)}"
+      end
+
+      # Reply to the callback
+      :ok = PortProcess.respond(pid, callback_req.id, %{"content" => "data"})
+
+      assert {:ok, _} = Task.await(task, 5_000)
+
+      # Collect the post-reply messages (completed tool_call_update)
+      post_reply = drain_inbox(pid, 500)
+
+      for {:notification, %{method: "session/update", params: params}} <- post_reply do
+        assert params["sessionId"] == prompt_session_id,
+               "post-reply notification missing prompt sessionId: #{inspect(params)}"
+      end
     end
   end
 
@@ -343,6 +422,29 @@ defmodule KiroCockpit.Test.Acp.FakeAgentTest do
                )
 
       assert result["currentModeId"] == "ask"
+    end
+  end
+
+  # -- Stray callback response guard ----------------------------------------
+
+  describe "stray callback response (id 9002)" do
+    test "does not emit a JSON-RPC response with id nil when no prompt is pending" do
+      pid = start_fake_agent("callback")
+
+      # Initialize so the agent is ready, but do NOT send session/prompt.
+      assert {:ok, _} =
+               PortProcess.request(pid, "initialize", %{"protocolVersion" => 1}, 5_000)
+
+      # Send a stray response to id 9002 (fs/read_text_file_id).
+      # With no pending prompt, the guard should swallow it silently.
+      :ok = PortProcess.respond(pid, 9002, %{"content" => "stray"})
+
+      # Give the agent a moment to process.
+      Process.sleep(100)
+
+      # No spurious notifications or requests should arrive.
+      stray = drain_inbox(pid, 200)
+      assert stray == []
     end
   end
 
