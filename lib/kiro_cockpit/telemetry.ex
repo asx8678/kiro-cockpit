@@ -57,14 +57,14 @@ defmodule KiroCockpit.Telemetry do
 
   # Closed set of contexts. Adding a context is a deliberate code change
   # — see moduledoc.
-  @contexts [:acp, :session, :event_store]
+  @contexts [:acp, :session, :event_store, :hook]
 
-  # Closed set of actions per context. Phase 1 seed only — these are the
-  # actions ACP/session/EventStore work is expected to emit.
+  # Closed set of actions per context. Adding an action is a deliberate code change.
   @actions %{
     acp: [:initialize, :prompt, :turn, :update, :callback],
     session: [:create, :resume, :archive],
-    event_store: [:append, :read]
+    event_store: [:append, :read],
+    hook: [:chain, :run, :persistence]
   }
 
   @phases [:start, :stop, :exception]
@@ -80,11 +80,16 @@ defmodule KiroCockpit.Telemetry do
     :agent_id,
     :permission_level,
     :trace_id,
-    :span_id
+    :span_id,
+    :action_name,
+    :phase,
+    :hook_name,
+    :priority,
+    :decision
   ]
 
   @typedoc "One of the canonical contexts."
-  @type context :: :acp | :session | :event_store
+  @type context :: :acp | :session | :event_store | :hook
 
   @typedoc "One of the canonical phases."
   @type phase :: :start | :stop | :exception
