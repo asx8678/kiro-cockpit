@@ -12,11 +12,9 @@ defmodule KiroCockpit.Plans do
   @type plan_id :: Ecto.UUID.t()
   @type session_id :: String.t()
 
-  # Wraps Ecto.Multi.new/0 so Dialyzer sees the opaque Multi.t() type
-  # rather than inferring the raw struct shape. Using apply/3 prevents
-  # Dialyzer from propagating the concrete struct through success typing.
+  @multi_new &Multi.new/0
   @spec new_multi() :: Multi.t()
-  defp new_multi, do: apply(Multi, :new, [])
+  defp new_multi, do: @multi_new.()
 
   @doc """
   Creates a new draft plan with steps and a creation event.
