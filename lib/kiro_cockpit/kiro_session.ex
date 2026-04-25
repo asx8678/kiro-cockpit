@@ -547,11 +547,17 @@ defmodule KiroCockpit.KiroSession do
     protocol_version = Keyword.get(opts, :protocol_version, @default_protocol_version)
     client_info = Keyword.get(opts, :client_info, build_default_client_info())
 
-    client_capabilities =
+    requested_client_capabilities =
       Keyword.get(
         opts,
         :client_capabilities,
         Callbacks.capabilities_for_policy(state.callback_policy)
+      )
+
+    client_capabilities =
+      Callbacks.clamp_capabilities_for_policy(
+        requested_client_capabilities,
+        state.callback_policy
       )
 
     timeout = Keyword.get(opts, :timeout, @default_request_timeout)
@@ -758,6 +764,7 @@ defmodule KiroCockpit.KiroSession do
       modes: state.modes,
       config_options: state.config_options,
       protocol_version: state.protocol_version,
+      client_capabilities: state.client_capabilities,
       auto_callbacks: state.auto_callbacks,
       callback_policy: state.callback_policy,
       turn_id: state.turn_id,

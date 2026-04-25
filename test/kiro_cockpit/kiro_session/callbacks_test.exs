@@ -597,6 +597,40 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
     end
   end
 
+  describe "clamp_capabilities_for_policy/2" do
+    test ":read_only clamps unsafe caller capability overrides" do
+      unsafe = %{
+        "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+        "terminal" => true
+      }
+
+      caps = Callbacks.clamp_capabilities_for_policy(unsafe, :read_only)
+
+      assert caps["fs"]["readTextFile"] == true
+      assert caps["fs"]["writeTextFile"] == false
+      assert caps["terminal"] == false
+    end
+
+    test ":read_only permits callers to reduce read capabilities" do
+      requested = %{"fs" => %{"readTextFile" => false, "writeTextFile" => true}}
+
+      caps = Callbacks.clamp_capabilities_for_policy(requested, :read_only)
+
+      assert caps["fs"]["readTextFile"] == false
+      assert caps["fs"]["writeTextFile"] == false
+      assert caps["terminal"] == false
+    end
+
+    test ":all keeps caller capability overrides unchanged" do
+      requested = %{
+        "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+        "terminal" => true
+      }
+
+      assert Callbacks.clamp_capabilities_for_policy(requested, :all) == requested
+    end
+  end
+
   describe "denied_error/1" do
     test "returns an error tuple with method name in message" do
       assert {:error, -32_000, message, nil} = Callbacks.denied_error("fs/write_text_file")

@@ -122,6 +122,33 @@ defmodule KiroCockpit.KiroSession.Callbacks do
   end
 
   @doc """
+  Clamp caller-supplied client capabilities so they cannot exceed policy.
+
+  Under `:read_only`, callers may further reduce capabilities (for example
+  disable fs read) but cannot advertise write or terminal support. Trusted
+  policies keep the caller-supplied map unchanged.
+  """
+  @spec clamp_capabilities_for_policy(map(), callback_policy()) :: map()
+  def clamp_capabilities_for_policy(capabilities, :read_only) when is_map(capabilities) do
+    fs =
+      capabilities
+      |> Map.get("fs", %{})
+      |> case do
+        fs when is_map(fs) -> fs
+        _other -> %{}
+      end
+      |> Map.put("writeTextFile", false)
+
+    capabilities
+    |> Map.put("fs", fs)
+    |> Map.put("terminal", false)
+  end
+
+  def clamp_capabilities_for_policy(capabilities, policy)
+      when is_map(capabilities) and policy in [:all, :trusted],
+      do: capabilities
+
+  @doc """
   Returns a denied-method error tuple suitable for a JSON-RPC error response.
 
   Used when a known mutating callback is requested under a `:read_only` policy.
