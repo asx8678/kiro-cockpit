@@ -48,7 +48,7 @@ defmodule KiroCockpit.EventStore do
   @doc """
   Records a raw ACP message using a direction, raw payload, and optional metadata.
 
-  Options may include `:session_id`, `:plan_id`, `:task_id`, `:agent_id`,
+  Options may include `:session_id` (the ACP protocol `sessionId` string),
   `:trace_id`, `:occurred_at`, `:correlation_id`, and `:causation_id`.
   """
   @spec record_acp_message(direction(), payload(), keyword() | map()) :: record_result()
@@ -64,10 +64,10 @@ defmodule KiroCockpit.EventStore do
   Lists ACP messages for a session ordered by occurrence time.
 
   Passing `nil` lists messages captured before a session was attached. Supported
-  filters: `:direction`, `:message_type`, `:method`, `:trace_id`, `:plan_id`,
-  `:task_id`, `:agent_id`, `:limit`, and `:order` (`:asc` or `:desc`).
+  filters: `:direction`, `:message_type`, `:method`, `:trace_id`, `:limit`,
+  and `:order` (`:asc` or `:desc`).
   """
-  @spec list_acp_messages(Ecto.UUID.t() | nil, keyword() | map()) :: [RawAcpMessage.t()]
+  @spec list_acp_messages(String.t() | nil, keyword() | map()) :: [RawAcpMessage.t()]
   def list_acp_messages(session_id, opts \\ []) do
     opts = Map.new(opts)
 
@@ -77,9 +77,6 @@ defmodule KiroCockpit.EventStore do
     |> filter_equals(:message_type, Map.get(opts, :message_type))
     |> filter_equals(:method, Map.get(opts, :method))
     |> filter_equals(:trace_id, Map.get(opts, :trace_id))
-    |> filter_equals(:plan_id, Map.get(opts, :plan_id))
-    |> filter_equals(:task_id, Map.get(opts, :task_id))
-    |> filter_equals(:agent_id, Map.get(opts, :agent_id))
     |> order_messages(Map.get(opts, :order, :asc))
     |> maybe_limit(normalize_limit(Map.get(opts, :limit, @default_limit)))
     |> Repo.all()
@@ -183,9 +180,6 @@ defmodule KiroCockpit.EventStore do
       "method" => message.method,
       "rpc_id" => message.rpc_id,
       "message_type" => message.message_type,
-      "plan_id" => message.plan_id,
-      "task_id" => message.task_id,
-      "agent_id" => message.agent_id,
       "trace_id" => message.trace_id
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)

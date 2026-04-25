@@ -2,9 +2,11 @@ defmodule KiroCockpit.EventStore.RawAcpMessage do
   @moduledoc """
   Raw ACP JSON-RPC message captured before higher-level session/runtime layers exist.
 
-  The raw payload is preserved exactly as the caller supplied it. Derived fields
-  (`method`, `rpc_id`, and `message_type`) are indexing aids for queries and do
-  not replace the raw JSON-RPC map.
+  The raw payload is preserved exactly as the caller supplied it. `session_id`
+  is the ACP protocol `sessionId` string (for example, `sess_abc123`), not an
+  internal application UUID. Derived fields (`method`, `rpc_id`, and
+  `message_type`) are indexing aids for queries and do not replace the raw
+  JSON-RPC map.
   """
 
   use Ecto.Schema
@@ -23,9 +25,6 @@ defmodule KiroCockpit.EventStore.RawAcpMessage do
     rpc_id
     message_type
     raw_payload
-    plan_id
-    task_id
-    agent_id
     trace_id
     occurred_at
   )a
@@ -35,15 +34,12 @@ defmodule KiroCockpit.EventStore.RawAcpMessage do
 
   @type t :: %__MODULE__{
           id: Ecto.UUID.t() | nil,
-          session_id: Ecto.UUID.t() | nil,
+          session_id: String.t() | nil,
           direction: String.t() | nil,
           method: String.t() | nil,
           rpc_id: String.t() | nil,
           message_type: String.t() | nil,
           raw_payload: map() | nil,
-          plan_id: Ecto.UUID.t() | nil,
-          task_id: Ecto.UUID.t() | nil,
-          agent_id: String.t() | nil,
           trace_id: String.t() | nil,
           occurred_at: DateTime.t() | nil,
           inserted_at: DateTime.t() | nil,
@@ -51,15 +47,12 @@ defmodule KiroCockpit.EventStore.RawAcpMessage do
         }
 
   schema "raw_acp_messages" do
-    field :session_id, Ecto.UUID
+    field :session_id, :string
     field :direction, :string
     field :method, :string
     field :rpc_id, :string
     field :message_type, :string
     field :raw_payload, :map
-    field :plan_id, Ecto.UUID
-    field :task_id, Ecto.UUID
-    field :agent_id, :string
     field :trace_id, :string
     field :occurred_at, :utc_datetime_usec
 
@@ -78,6 +71,7 @@ defmodule KiroCockpit.EventStore.RawAcpMessage do
     |> validate_required(@required_fields)
     |> validate_inclusion(:direction, @directions)
     |> validate_inclusion(:message_type, @message_types)
+    |> validate_length(:session_id, max: 255)
     |> validate_change(:raw_payload, &validate_raw_payload/2)
     |> check_constraint(:direction, name: :raw_acp_messages_direction_check)
     |> check_constraint(:message_type, name: :raw_acp_messages_message_type_check)
@@ -202,18 +196,33 @@ defmodule KiroCockpit.EventStore.RawAcpMessage do
 
   defp json_rpc_shape(payload) do
     {
-      !is_nil(extract_method(payload)),
+      json_rpc_2_0?(payload),
+      json_rpc_method?(payload),
       has_payload_key?(payload, :id),
       has_payload_key?(payload, :result),
       has_payload_key?(payload, :error)
     }
   end
 
-  defp classify_json_rpc_shape({true, true, false, false}), do: "request"
-  defp classify_json_rpc_shape({true, false, false, false}), do: "notification"
-  defp classify_json_rpc_shape({_has_method?, _has_id?, _has_result?, true}), do: "error"
-  defp classify_json_rpc_shape({_has_method?, _has_id?, true, false}), do: "response"
+  defp classify_json_rpc_shape({true, true, true, false, false}), do: "request"
+  defp classify_json_rpc_shape({true, true, false, false, false}), do: "notification"
+  defp classify_json_rpc_shape({true, false, true, true, false}), do: "response"
+  defp classify_json_rpc_shape({true, false, true, false, true}), do: "error"
   defp classify_json_rpc_shape(_shape), do: "unknown"
+
+  defp json_rpc_2_0?(payload) do
+    case fetch_payload_value(payload, :jsonrpc) do
+      {:ok, "2.0"} -> true
+      _missing_or_invalid -> false
+    end
+  end
+
+  defp json_rpc_method?(payload) do
+    case fetch_payload_value(payload, :method) do
+      {:ok, method} when is_binary(method) -> true
+      _missing_or_invalid -> false
+    end
+  end
 
   defp has_payload_key?(payload, key),
     do: match?({:ok, _value}, fetch_payload_value(payload, key))

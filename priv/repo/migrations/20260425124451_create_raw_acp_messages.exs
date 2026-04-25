@@ -4,15 +4,12 @@ defmodule KiroCockpit.Repo.Migrations.CreateRawAcpMessages do
   def change do
     create table(:raw_acp_messages, primary_key: false) do
       add :id, :uuid, primary_key: true, null: false
-      add :session_id, :uuid
+      add :session_id, :string
       add :direction, :string, null: false
       add :method, :string
       add :rpc_id, :string
       add :message_type, :string, null: false
       add :raw_payload, :map, null: false
-      add :plan_id, :uuid
-      add :task_id, :uuid
-      add :agent_id, :string
       add :trace_id, :string
       add :occurred_at, :utc_datetime_usec, null: false
 
@@ -38,7 +35,7 @@ defmodule KiroCockpit.Repo.Migrations.CreateRawAcpMessages do
     execute(
       """
       COMMENT ON INDEX raw_acp_messages_session_occurred_at_index IS
-      'Query: list raw ACP messages for a session ordered by occurred_at and id. Rationale: session_id is the equality predicate; occurred_at/id gives stable timeline order, including nullable pre-session capture.'
+      'Query: list raw ACP messages for an ACP protocol sessionId ordered by occurred_at and id. Rationale: session_id is the protocol string equality predicate; occurred_at/id gives stable timeline order, including nullable pre-session capture.'
       """,
       "COMMENT ON INDEX raw_acp_messages_session_occurred_at_index IS NULL"
     )

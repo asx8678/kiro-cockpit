@@ -6,10 +6,17 @@ defmodule KiroCockpit.EventStoreTest do
   alias KiroCockpit.EventStore.RawAcpMessage
 
   describe "JSON-RPC classification" do
-    test "classifies requests, notifications, responses, errors, and unknown payloads" do
+    test "classifies only unambiguous JSON-RPC 2.0 shapes" do
       assert EventStore.classify_message_type(%{
                "jsonrpc" => "2.0",
                "id" => 1,
+               "method" => "session/prompt"
+             }) ==
+               "request"
+
+      assert EventStore.classify_message_type(%{
+               "jsonrpc" => "2.0",
+               "id" => nil,
                "method" => "session/prompt"
              }) ==
                "request"
@@ -20,10 +27,30 @@ defmodule KiroCockpit.EventStoreTest do
       assert EventStore.classify_message_type(%{"jsonrpc" => "2.0", "id" => 1, "result" => %{}}) ==
                "response"
 
+      assert EventStore.classify_message_type(%{"jsonrpc" => "2.0", "id" => nil, "result" => nil}) ==
+               "response"
+
       assert EventStore.classify_message_type(%{"jsonrpc" => "2.0", "id" => nil, "error" => %{}}) ==
                "error"
+    end
 
-      assert EventStore.classify_message_type(%{"jsonrpc" => "2.0"}) == "unknown"
+    test "returns unknown for malformed or ambiguous JSON-RPC shapes" do
+      unknown_payloads = [
+        %{"id" => 1, "method" => "session/prompt"},
+        %{"jsonrpc" => "1.0", "id" => 1, "method" => "session/prompt"},
+        %{"jsonrpc" => "2.0"},
+        %{"jsonrpc" => "2.0", "result" => %{}},
+        %{"jsonrpc" => "2.0", "error" => %{}},
+        %{"jsonrpc" => "2.0", "method" => 123},
+        %{"jsonrpc" => "2.0", "id" => 1, "method" => "session/prompt", "result" => %{}},
+        %{"jsonrpc" => "2.0", "id" => 1, "method" => "session/prompt", "error" => %{}},
+        %{"jsonrpc" => "2.0", "id" => 1, "result" => %{}, "error" => %{}}
+      ]
+
+      for payload <- unknown_payloads do
+        assert EventStore.classify_message_type(payload) == "unknown"
+      end
+
       assert EventStore.classify_message_type("not a map") == "unknown"
     end
 
@@ -48,11 +75,13 @@ defmodule KiroCockpit.EventStoreTest do
       changeset =
         RawAcpMessage.changeset(%RawAcpMessage{}, %{
           direction: :client_to_agent,
+          session_id: "sess_abc123",
           raw_payload: payload
         })
 
       assert changeset.valid?
       assert get_change(changeset, :direction) == "client_to_agent"
+      assert get_change(changeset, :session_id) == "sess_abc123"
       assert get_change(changeset, :method) == "session/prompt"
       assert get_change(changeset, :rpc_id) == "abc-123"
       assert get_change(changeset, :message_type) == "request"
@@ -95,7 +124,7 @@ defmodule KiroCockpit.EventStoreTest do
 
   describe "record_acp_message/3" do
     test "persists the raw message and event envelope atomically" do
-      session_id = Ecto.UUID.generate()
+      session_id = "sess_abc123"
       correlation_id = Ecto.UUID.generate()
 
       payload = %{
@@ -142,6 +171,9 @@ defmodule KiroCockpit.EventStoreTest do
       assert event.payload["session_id"] == session_id
       assert event.payload["method"] == "session/prompt"
       assert event.payload["trace_id"] == "trace-123"
+      refute Map.has_key?(event.payload, "plan_id")
+      refute Map.has_key?(event.payload, "task_id")
+      refute Map.has_key?(event.payload, "agent_id")
       refute Map.has_key?(event.payload, "raw_payload")
     end
 
