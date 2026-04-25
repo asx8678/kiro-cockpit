@@ -76,13 +76,39 @@ defmodule KiroCockpit.PromptValidationTest do
       assert File.exists?(@path), "Expected prompt file at #{@path}"
     end
 
-    test "contains required placeholders" do
+    test "contains §15 structured template placeholders" do
       content = File.read!(@path)
-      assert content =~ "{{approved_plan}}"
+      assert content =~ "{{objective}}"
+      assert content =~ "{{phases}}"
+      assert content =~ "{{files}}"
+      assert content =~ "{{acceptance_criteria}}"
+      assert content =~ "{{risks}}"
+      assert content =~ "{{validation_steps}}"
+    end
+
+    test "contains stale-plan detection support" do
+      content = File.read!(@path)
+      assert content =~ "{{project_snapshot_hash}}"
+      assert content =~ "Stale-plan detection"
+      assert content =~ "If the hashes differ, stop and report the mismatch"
+    end
+
+    test "contains read-only inspection instruction" do
+      content = File.read!(@path)
+      assert content =~ "Begin with read-only inspection, then proceed phase by phase."
+    end
+
+    test "contains additional context placeholders" do
+      content = File.read!(@path)
       assert content =~ "{{active_task}}"
       assert content =~ "{{permission_policy}}"
       assert content =~ "{{project_rules}}"
       assert content =~ "{{gold_memories}}"
+    end
+
+    test "does not contain monolithic approved_plan placeholder" do
+      content = File.read!(@path)
+      refute content =~ "{{approved_plan}}"
     end
 
     test "contains hard rules for execution" do
@@ -90,6 +116,11 @@ defmodule KiroCockpit.PromptValidationTest do
       assert content =~ "Hard rules:"
       assert content =~ "Follow the approved plan and active task"
       assert content =~ "Read relevant files before modifying them"
+    end
+
+    test "has trailing newline" do
+      content = File.read!(@path)
+      assert String.ends_with?(content, "\n"), "Expected file to end with a newline"
     end
   end
 end

@@ -14,8 +14,49 @@ Hard rules:
 8. Preserve raw ACP/event information when debugging timeline issues.
 9. For ACP turn handling, never assume `session/prompt` response means turn completion; wait for turn-end update.
 
-Current approved plan:
-{{approved_plan}}
+## Stale-plan detection
+
+Compare current project snapshot hash with the approved plan snapshot hash:
+
+{{project_snapshot_hash}}
+
+If the hashes differ, stop and report the mismatch. Do not proceed with execution.
+
+## Objective
+
+{{objective}}
+
+## Constraints
+
+- Follow the approved plan.
+- Inspect the listed files before modifying them.
+- Do not skip validation.
+- Ask for permission before write, shell, terminal, external, or destructive actions according to the wrapper policy.
+- If the project state differs from the plan, stop and report the mismatch instead of improvising a risky change.
+
+## Approved phases
+
+{{phases}}
+
+## Files/modules likely involved
+
+{{files}}
+
+## Acceptance criteria
+
+{{acceptance_criteria}}
+
+## Risks to avoid
+
+{{risks}}
+
+## Required validation
+
+{{validation_steps}}
+
+Begin with read-only inspection, then proceed phase by phase.
+
+## Additional context
 
 Active Swarm task:
 {{active_task}}
