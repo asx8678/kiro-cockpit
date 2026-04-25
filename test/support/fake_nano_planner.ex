@@ -119,7 +119,8 @@ defmodule KiroCockpit.Support.FakeNanoPlanner do
         details: "Analyze existing code",
         permission_level: "read",
         validation: "Tree visible",
-        files: %{}
+        files: %{},
+        status: "planned"
       },
       %{
         phase_number: 1,
@@ -128,7 +129,8 @@ defmodule KiroCockpit.Support.FakeNanoPlanner do
         details: "Apply requested changes",
         permission_level: "write",
         validation: "Changes applied",
-        files: %{"test.ex" => "content"}
+        files: %{"test.ex" => "content"},
+        status: "planned"
       }
     ]
   end

@@ -129,16 +129,38 @@ defmodule KiroCockpitWeb.SessionPlanLive do
 
   @impl true
   def handle_event("approve_plan", %{"id" => plan_id}, socket) do
-    # Note: In a real implementation, we'd get the session process reference
-    # For now, we use a mock approach - the Plans context handles state transitions
-    case Plans.approve_plan(plan_id) do
+    case approve_plan_for_session(plan_id, socket.assigns.session_id) do
+      {:ok, %{plan: plan}} ->
+        broadcast_plan_update(socket.assigns.session_id, plan)
+        socket = refresh_plans_and_notify(socket, "Plan approved successfully")
+        {:noreply, socket}
+
       {:ok, plan} ->
         broadcast_plan_update(socket.assigns.session_id, plan)
         socket = refresh_plans_and_notify(socket, "Plan approved successfully")
         {:noreply, socket}
 
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Plan not found")}
+
+      {:error, :stale_plan} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Plan is stale — the project has changed since it was generated. Revise or regenerate."
+         )}
+
       {:error, :invalid_transition} ->
         {:noreply, put_flash(socket, :error, "Cannot approve plan: invalid status transition")}
+
+      {:error, {:prompt_failed, _plan, _reason}} ->
+        # Plan was approved in DB but prompt send failed.
+        # Still reflect the approved status and notify the user.
+        socket =
+          refresh_plans_and_notify(socket, "Plan approved, but execution prompt failed to send")
+
+        {:noreply, socket}
 
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, "Failed to approve plan: #{format_error(reason)}")}
@@ -434,6 +456,31 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   end
 
   # ── Private Functions ─────────────────────────────────────────────────
+
+  defp approve_plan_for_session(plan_id, session_id) do
+    planner_module = Application.get_env(:kiro_cockpit, :nano_planner_module, NanoPlanner)
+
+    if route_approval_through_planner?(planner_module) do
+      session = resolve_planner_session(session_id)
+      planner_module.approve(session, plan_id, session_id: session_id)
+    else
+      Plans.approve_plan(plan_id)
+    end
+  end
+
+  defp route_approval_through_planner?(NanoPlanner) do
+    not is_nil(Application.get_env(:kiro_cockpit, :kiro_session_resolver))
+  end
+
+  defp route_approval_through_planner?(_planner_module), do: true
+
+  defp resolve_planner_session(session_id) do
+    case Application.get_env(:kiro_cockpit, :kiro_session_resolver) do
+      nil -> self()
+      resolver when is_function(resolver, 1) -> resolver.(session_id)
+      {module, function} -> apply(module, function, [session_id])
+    end
+  end
 
   defp generate_plan(session_id, request, mode) do
     # Use the injectable kiro_session_module if configured
