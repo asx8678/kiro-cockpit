@@ -94,24 +94,31 @@ defmodule KiroCockpitWeb.CoreComponents do
     """
   end
 
-  attr :id, :string, default: "flash", required: false
+  attr :id, :string, default: nil
   attr :close, :boolean, default: true
   attr :autoshow, :boolean, default: true
-  attr :kind, :atom, values: [:info, :error]
+  attr :kind, :atom, values: [:info, :error], doc: "used for styling and flash lookup"
   attr :title, :string, default: nil
   attr :hidden, :boolean, default: false
-  attr :flash, :map, default: %{}, required: false
+  attr :flash, :map, default: %{}, doc: "the optional flash map to pull the message from"
   attr :rest, :global
-  slot :inner_block
+  slot :inner_block, doc: "the optional inner block that renders the flash message"
 
   def flash(assigns) do
+    assigns = assign_new(assigns, :id, fn -> "flash-#{assigns.kind}" end)
+
     ~H"""
     <div
-      :if={msg = Phoenix.Flash.get(@flash, @kind)}
+      :if={msg = render_slot(@inner_block) || Phoenix.Flash.get(@flash, @kind)}
       id={@id}
       phx-mounted={@autoshow && show("##{@id}")}
       phx-remove={hide("##{@id}")}
-      phx-click={JS.push("lv:clear-flash") |> JS.remove_class("fade-in-scale", to: "##{@id}")}
+      phx-click={
+        @close &&
+          JS.push("lv:clear-flash", value: %{kind: @kind})
+          |> JS.remove_class("fade-in-scale", to: "##{@id}")
+      }
+      hidden={@hidden}
       role="alert"
       class={[
         "fixed top-2 right-2 w-80 sm:w-96 z-50 rounded-lg p-3 shadow-md",
@@ -120,7 +127,7 @@ defmodule KiroCockpitWeb.CoreComponents do
       ]}
       {@rest}
     >
-      <div :if={@title} class="flex items-start gap-1.5">
+      <div class="flex items-start gap-1.5">
         <.icon
           :if={@kind == :info}
           name="hero-information-circle-mini"
@@ -131,8 +138,14 @@ defmodule KiroCockpitWeb.CoreComponents do
           name="hero-exclamation-circle-mini"
           class="h-4 w-4 fill-rose-900 mt-1"
         />
-        <div class="flex-1 text-sm leading-5">{@title}</div>
-        <button :if={@close} type="button" class="group flex-none" aria-label="close">
+        <div :if={@title} class="flex-1 text-sm leading-5 font-semibold">{@title}</div>
+        <button
+          :if={@close}
+          type="button"
+          class="group flex-none -m-1.5 p-1.5"
+          aria-label="close"
+          phx-click={JS.push("lv:clear-flash", value: %{kind: @kind}) |> hide("##{@id}")}
+        >
           <.icon name="hero-x-mark-solid" class="h-5 w-5 opacity-40 group-hover:opacity-70" />
         </button>
       </div>
@@ -194,6 +207,19 @@ defmodule KiroCockpitWeb.CoreComponents do
   attr :rest, :global,
     include: ~w(accept autocomplete capture cols disabled form list max maxlength min minlength
                 multiple pattern placeholder readonly required rows size step)
+
+  def input(%{field: %Phoenix.HTML.FormField{} = field} = assigns) do
+    # Normalize FormField into id/name/value/errors for stock Phoenix 1.8 pattern
+    errors = if Phoenix.Component.used_input?(field), do: field.errors, else: []
+
+    assigns
+    |> assign(:id, assigns.id || field.id)
+    |> assign(:name, assigns.name || field.name)
+    |> assign(:value, assigns.value || field.value)
+    |> assign(:errors, if(assigns.errors == [], do: errors, else: assigns.errors))
+    |> assign(:field, nil)
+    |> input()
+  end
 
   def input(assigns) do
     ~H"""

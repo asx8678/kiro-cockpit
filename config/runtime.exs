@@ -12,16 +12,18 @@ if config_env() == :prod do
 
   # SSL can be enabled via DATABASE_URL query params or by setting DATABASE_SSL=true
   # SSL verification is NOT disabled by default - use only with valid certificates
-  ssl_config =
-    case System.get_env("DATABASE_SSL") do
-      "true" -> [ssl: true]
-      _ -> []
-    end
+  ssl_enabled? = System.get_env("DATABASE_SSL") == "true"
 
-  config :kiro_cockpit, KiroCockpit.Repo,
+  repo_config = [
     url: database_url,
     pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
-    socket_options: maybe_ipv6 ++ ssl_config
+    socket_options: maybe_ipv6
+  ]
+
+  # Merge SSL option at top level (not in socket_options) when enabled
+  repo_config = if ssl_enabled?, do: Keyword.put(repo_config, :ssl, true), else: repo_config
+
+  config :kiro_cockpit, KiroCockpit.Repo, repo_config
 
   secret_key_base =
     System.get_env("SECRET_KEY_BASE") ||
