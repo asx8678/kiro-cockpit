@@ -111,14 +111,22 @@ defmodule KiroCockpit.Acp.PortProcess do
     * `:executable` (required) — absolute path to the executable.
     * `:args` — argv list (default `[]`).
     * `:owner` — pid that receives agent-initiated requests/notifications and
-      port lifecycle events. Defaults to `self()`.
+      port lifecycle events. Defaults to the calling process.
     * `:cd` — working directory for the child.
     * `:env` — environment variables (`[{name, value} | ...]`).
     * `:max_line_bytes` — line length limit (default 4 MiB).
     * `:name` — GenServer registration name.
+
+  ## Owner default
+
+  The owner pid is captured **here**, in the caller's process, via
+  `Keyword.put_new/3`. If we deferred the default to `init/1`, `self()` would
+  resolve to the GenServer itself — which is precisely the foot-gun this guard
+  exists to prevent.
   """
   @spec start_link([start_opt()]) :: GenServer.on_start()
   def start_link(opts) when is_list(opts) do
+    opts = Keyword.put_new(opts, :owner, self())
     {gen_opts, server_opts} = Keyword.split(opts, [:name])
     GenServer.start_link(__MODULE__, server_opts, gen_opts)
   end
@@ -133,11 +141,15 @@ defmodule KiroCockpit.Acp.PortProcess do
     * `:transport_closed` — the GenServer is shutting down
     * `{:port_exited, status}` — the agent exited before responding
     * `{:rpc_error, %{code, message, data?}}` — agent returned a JSON-RPC error
+
+  `timeout` accepts a non-negative integer (milliseconds) or `:infinity`. When
+  `:infinity` is given, no per-request timer is armed and the call only
+  resolves when the agent replies, the port exits, or the GenServer stops.
   """
   @spec request(GenServer.server(), String.t(), map() | list() | nil, timeout()) ::
           {:ok, term()} | {:error, term()}
   def request(server, method, params \\ %{}, timeout \\ @default_request_timeout)
-      when is_binary(method) do
+      when is_binary(method) and (timeout == :infinity or (is_integer(timeout) and timeout >= 0)) do
     GenServer.call(server, {:request, method, params, timeout}, call_timeout(timeout))
   end
 
@@ -187,8 +199,8 @@ defmodule KiroCockpit.Acp.PortProcess do
     Process.flag(:trap_exit, true)
 
     with {:ok, executable} <- fetch_executable(opts),
+         {:ok, owner} <- fetch_owner(opts),
          args <- Keyword.get(opts, :args, []),
-         owner <- Keyword.get(opts, :owner, self()),
          max_line_bytes <-
            Keyword.get(opts, :max_line_bytes, @default_max_line_bytes),
          port_opts <- build_port_opts(args, max_line_bytes, opts),
@@ -219,7 +231,7 @@ defmodule KiroCockpit.Acp.PortProcess do
 
     case write_line(state, msg) do
       :ok ->
-        timer_ref = Process.send_after(self(), {:request_timeout, id}, timeout)
+        timer_ref = arm_request_timer(id, timeout)
         pending = Map.put(state.pending, id, {from, timer_ref})
         {:noreply, %{state | next_id: id + 1, pending: pending}}
 
@@ -276,18 +288,36 @@ defmodule KiroCockpit.Acp.PortProcess do
     {:noreply, %{state | overflow: true}}
   end
 
-  def handle_info({port, {:exit_status, status}}, %{port: port} = state)
-      when is_port(port) do
-    send(state.owner, {:acp_exit, self(), status})
-    state = fail_all_pending(state, {:port_exited, status})
+  # Clean exit (status 0): stop :normal so a transient supervisor doesn't
+  # restart us. The session above asked the agent to exit; honor that.
+  def handle_info({port, {:exit_status, 0}}, %{port: port} = state) when is_port(port) do
+    send(state.owner, {:acp_exit, self(), 0})
+    state = fail_all_pending(state, {:port_exited, 0})
     {:stop, :normal, %{state | port: nil, closed: true}}
   end
 
+  # Non-zero exit: surface as an abnormal stop so a `:transient` supervisor
+  # restarts us. Stopping `:normal` here would silently swallow agent crashes.
+  def handle_info({port, {:exit_status, status}}, %{port: port} = state)
+      when is_port(port) and is_integer(status) do
+    send(state.owner, {:acp_exit, self(), status})
+    state = fail_all_pending(state, {:port_exited, status})
+    {:stop, {:port_exited, status}, %{state | port: nil, closed: true}}
+  end
+
   # Trapped exit from the port itself (rare — usually exit_status arrives first).
+  # `:normal` from the port driver maps to a normal GenServer stop; anything
+  # else is abnormal and propagates upward as `{:port_exited, reason}`.
+  def handle_info({:EXIT, port, :normal}, %{port: port} = state) when is_port(port) do
+    send(state.owner, {:acp_exit, self(), :normal})
+    state = fail_all_pending(state, {:port_exited, :normal})
+    {:stop, :normal, %{state | port: nil, closed: true}}
+  end
+
   def handle_info({:EXIT, port, reason}, %{port: port} = state) when is_port(port) do
     send(state.owner, {:acp_exit, self(), reason})
     state = fail_all_pending(state, {:port_exited, reason})
-    {:stop, :normal, %{state | port: nil, closed: true}}
+    {:stop, {:port_exited, reason}, %{state | port: nil, closed: true}}
   end
 
   # -- Per-request timeout --------------------------------------------------
@@ -298,6 +328,7 @@ defmodule KiroCockpit.Acp.PortProcess do
         {:noreply, state}
 
       {{from, _timer_ref}, pending} ->
+        # Timer fired ⇒ no need to cancel it.
         GenServer.reply(from, {:error, :timeout})
         {:noreply, %{state | pending: pending}}
     end
@@ -453,7 +484,7 @@ defmodule KiroCockpit.Acp.PortProcess do
         state
 
       {{from, timer_ref}, pending} ->
-        _ = Process.cancel_timer(timer_ref, async: true, info: false)
+        cancel_timer(timer_ref)
         reply = format_response(outcome)
         GenServer.reply(from, reply)
         %{state | pending: pending}
@@ -466,11 +497,43 @@ defmodule KiroCockpit.Acp.PortProcess do
   @spec fail_all_pending(state(), term()) :: state()
   defp fail_all_pending(state, reason) do
     Enum.each(state.pending, fn {_id, {from, timer_ref}} ->
-      _ = Process.cancel_timer(timer_ref, async: true, info: false)
+      cancel_timer(timer_ref)
       GenServer.reply(from, {:error, reason})
     end)
 
     %{state | pending: %{}}
+  end
+
+  # Pending entries created with `:infinity` carry a nil timer ref. Treat that
+  # as a no-op rather than letting `Process.cancel_timer/2` pattern-match crash.
+  @spec cancel_timer(reference() | nil) :: :ok
+  defp cancel_timer(nil), do: :ok
+
+  defp cancel_timer(ref) when is_reference(ref) do
+    _ = Process.cancel_timer(ref, async: true, info: false)
+    :ok
+  end
+
+  # `Process.send_after/3` rejects `:infinity`. We support :infinity by simply
+  # not arming a timer — the call resolves only on response, port exit, or
+  # GenServer stop. The `nil` ref is handled by `cancel_timer/1`.
+  @spec arm_request_timer(integer(), timeout()) :: reference() | nil
+  defp arm_request_timer(_id, :infinity), do: nil
+
+  defp arm_request_timer(id, timeout) when is_integer(timeout) and timeout >= 0 do
+    Process.send_after(self(), {:request_timeout, id}, timeout)
+  end
+
+  # Owner is captured in `start_link/1` from the caller's process. If somebody
+  # bypasses `start_link/1` and calls `init/1` directly without supplying an
+  # owner, fail loudly rather than letting `self()` silently make the GenServer
+  # its own owner.
+  @spec fetch_owner(keyword()) :: {:ok, pid()} | {:stop, {:invalid_option, :owner}}
+  defp fetch_owner(opts) do
+    case Keyword.fetch(opts, :owner) do
+      {:ok, pid} when is_pid(pid) -> {:ok, pid}
+      _ -> {:stop, {:invalid_option, :owner}}
+    end
   end
 
   # Add a small buffer so the GenServer always has a chance to reply with

@@ -128,9 +128,51 @@ defmodule KiroCockpit.Acp.JsonRpcTest do
       assert {:invalid, :bad_jsonrpc_version, ^msg} = JsonRpc.classify(msg)
     end
 
-    test "tolerates missing jsonrpc version" do
+    test "rejects missing jsonrpc version" do
+      # Strict mode (post-fix): a missing version is no longer tolerated.
+      # If a sloppy agent ever requires laxer parsing, that gets its own
+      # opt-in entry point — we don't loosen the default classifier.
       msg = %{"id" => 1, "method" => "ping", "params" => %{}}
-      assert JsonRpc.classify(msg) == {:request, 1, "ping", %{}}
+      assert {:invalid, :bad_jsonrpc_version, ^msg} = JsonRpc.classify(msg)
+    end
+
+    test "rejects request with explicit id: nil (vs absent id = notification)" do
+      # Per JSON-RPC 2.0 §4 a request with `id: null` is discouraged. We
+      # cannot correlate a reply with a null id, and demoting it silently to
+      # a notification (the bug we're fixing) would lie to the caller.
+      msg = %{"jsonrpc" => "2.0", "id" => nil, "method" => "ping", "params" => %{}}
+      assert {:invalid, :null_id_in_request, ^msg} = JsonRpc.classify(msg)
+    end
+
+    test "distinguishes notification (no id key) from request with id: nil" do
+      # Sibling of the above test. With Map.get/2 these two used to be
+      # indistinguishable.
+      notif = %{"jsonrpc" => "2.0", "method" => "session/update", "params" => %{"k" => "v"}}
+      req_with_null = %{"jsonrpc" => "2.0", "id" => nil, "method" => "session/update"}
+
+      assert {:notification, "session/update", %{"k" => "v"}} = JsonRpc.classify(notif)
+      assert {:invalid, :null_id_in_request, ^req_with_null} = JsonRpc.classify(req_with_null)
+    end
+
+    test "classifies error response with id: nil (parse-error case per §5.1)" do
+      # Per spec: when the server can't recover the request id (e.g. parse
+      # error / invalid request), the error response MUST carry `id: null`.
+      # That must classify as a response, not invalid, not notification.
+      msg = %{
+        "jsonrpc" => "2.0",
+        "id" => nil,
+        "error" => %{"code" => -32_700, "message" => "Parse error"}
+      }
+
+      assert {:response, nil, {:error, %{code: -32_700, message: "Parse error"}}} =
+               JsonRpc.classify(msg)
+    end
+
+    test "classifies success response with id: nil as a response (echoes peer)" do
+      # Less common but legal — we preserve whatever id the peer sent so the
+      # PortProcess correlation layer can decide what to do.
+      msg = %{"jsonrpc" => "2.0", "id" => nil, "result" => %{"ok" => true}}
+      assert {:response, nil, {:ok, %{"ok" => true}}} = JsonRpc.classify(msg)
     end
 
     test "rejects non-map input" do

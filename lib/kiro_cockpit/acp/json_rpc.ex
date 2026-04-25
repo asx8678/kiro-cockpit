@@ -93,9 +93,22 @@ defmodule KiroCockpit.Acp.JsonRpc do
   @doc """
   Classify an already-decoded JSON-RPC map into one of the four shapes.
 
-  Tolerates a missing `"jsonrpc"` field (some agents are sloppy) but expects it
-  to be `"2.0"` if present. IDs may be integer OR string — both are preserved
-  exactly. `params` defaults to `%{}` if absent.
+  Strict version check: the `"jsonrpc"` field MUST be present and equal to
+  `"2.0"`. Missing or mismatched versions return `{:invalid, :bad_jsonrpc_version, msg}`.
+
+  IDs may be integer OR string — both are preserved exactly. `params` defaults
+  to `%{}` if absent.
+
+  ## Request vs notification disambiguation
+
+  JSON-RPC 2.0 distinguishes a notification (no `id` member) from a request
+  whose id happens to be `null`. We use `Map.has_key?/2` so that `"id": null`
+  is NOT silently demoted to a notification:
+
+    * `id` key absent          → notification (if `method` present)
+    * `id` key present, integer/string → request (if `method` present), or response
+    * `id` key present, `null` → invalid for requests; valid for error responses
+      (per spec §5.1 a parse-error response MUST carry a null id)
   """
   @spec classify(term()) :: classified()
   def classify(%{} = msg) do
@@ -109,33 +122,47 @@ defmodule KiroCockpit.Acp.JsonRpc do
 
   # -- Internals ------------------------------------------------------------
 
+  # Strict: "jsonrpc" must be present AND equal to "2.0". Any other shape is
+  # rejected. If you need to interop with a sloppy agent, gate that behind an
+  # opt-in compatibility mode in a new entry point — don't loosen this one.
   @spec version_ok?(map()) :: boolean()
   defp version_ok?(%{"jsonrpc" => v}), do: v == @jsonrpc_version
-  # Tolerate missing version — some agents omit it. Reject only when present and wrong.
-  defp version_ok?(_), do: true
+  defp version_ok?(_), do: false
 
   @spec classify_shape(map()) :: classified()
   defp classify_shape(msg) do
-    do_classify(Map.get(msg, "id"), Map.get(msg, "method"), msg)
+    has_id? = Map.has_key?(msg, "id")
+    id = Map.get(msg, "id")
+    method = Map.get(msg, "method")
+    do_classify(has_id?, id, method, msg)
   end
 
-  # Request: id + method, both well-typed.
-  defp do_classify(id, method, msg)
+  # Request: id key present with a well-typed value, plus method.
+  defp do_classify(true, id, method, msg)
        when (is_integer(id) or is_binary(id)) and is_binary(method) do
     {:request, id, method, Map.get(msg, "params", %{})}
   end
 
-  # Notification: no id, has method.
-  defp do_classify(nil, method, msg) when is_binary(method) do
+  # Request with explicit `id: null` is discouraged by spec §4 and we cannot
+  # correlate a reply with a null id, so reject it outright. This is the case
+  # `Map.get/2`-based dispatch used to silently misclassify as a notification.
+  defp do_classify(true, nil, method, msg) when is_binary(method) do
+    {:invalid, :null_id_in_request, msg}
+  end
+
+  # Notification: id key ABSENT, method present.
+  defp do_classify(false, _id, method, msg) when is_binary(method) do
     {:notification, method, Map.get(msg, "params", %{})}
   end
 
-  # Response (success or error): well-typed id, no method.
-  defp do_classify(id, nil, msg) when is_integer(id) or is_binary(id) do
+  # Response (success or error): id key present (any value, including nil),
+  # no method. A null id here is legal — spec §5.1 mandates it for parse-error
+  # responses where the server couldn't recover the request id.
+  defp do_classify(true, id, nil, msg) when is_integer(id) or is_binary(id) or is_nil(id) do
     classify_response(id, msg)
   end
 
-  defp do_classify(_id, _method, msg), do: {:invalid, :unrecognized_shape, msg}
+  defp do_classify(_has_id?, _id, _method, msg), do: {:invalid, :unrecognized_shape, msg}
 
   # Success — `result` present, `error` absent.
   defp classify_response(id, %{"result" => result} = msg)

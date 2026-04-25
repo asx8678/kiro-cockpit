@@ -12,6 +12,10 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
       `session/update` notification, then send a `fs/read` request to the
       client and wait for its response, then emit a `session/done`
       notification.
+    * Inbound `silent` request → consume the request and emit nothing.
+      Used by timeout regression tests. Because we still read stdin in the
+      loop, closing the port (which closes our stdin) drives us to `:eof`
+      and we exit cleanly — no orphaned child process.
     * Any other request → `-32601 Method not found`.
     * Notifications → silently consumed.
 
@@ -144,6 +148,10 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
     write(%{"jsonrpc" => "2.0", "id" => id, "result" => params})
     :ok
   end
+
+  # No reply on purpose. The client will hit its request timeout (or the
+  # `:infinity` path will resolve only when stdin closes / the port exits).
+  defp handle_request(_id, "silent", _params), do: :ok
 
   defp handle_request(id, "boom", _params) do
     write(%{
