@@ -18,6 +18,8 @@ defmodule KiroCockpitWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
+
+    live "/sessions/:id/plan", SessionPlanLive
   end
 
   if Application.compile_env(:kiro_cockpit, :dev_routes, false) do

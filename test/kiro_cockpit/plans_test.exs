@@ -130,6 +130,10 @@ defmodule KiroCockpit.PlansTest do
       {:ok, _} = Plans.reject_plan(plan.id)
       assert {:error, :invalid_transition} = Plans.approve_plan(plan.id)
     end
+
+    test "returns not_found for a missing plan" do
+      assert {:error, :not_found} = Plans.approve_plan(Ecto.UUID.generate())
+    end
   end
 
   describe "reject_plan/2" do
@@ -147,6 +151,10 @@ defmodule KiroCockpit.PlansTest do
       {:ok, _} = Plans.reject_plan(plan.id)
       # plan is now rejected (terminal)
       assert {:error, :invalid_transition} = Plans.reject_plan(plan.id)
+    end
+
+    test "returns not_found for a missing plan" do
+      assert {:error, :not_found} = Plans.reject_plan(Ecto.UUID.generate())
     end
   end
 
@@ -169,27 +177,73 @@ defmodule KiroCockpit.PlansTest do
       assert length(new_plan.plan_events) == 1
       assert hd(new_plan.plan_events).event_type == "revised"
     end
+
+    test "returns not_found for a missing plan" do
+      assert {:error, :not_found} = Plans.revise_plan(Ecto.UUID.generate(), "revise")
+    end
   end
 
   describe "update_status/3" do
-    test "can transition to running, completed, failed" do
+    test "transitions approved plans to running" do
       {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      {:ok, approved_plan} = Plans.approve_plan(plan.id)
 
-      assert {:ok, running_plan} = Plans.update_status(plan.id, "running")
+      assert {:ok, running_plan} = Plans.update_status(approved_plan.id, "running")
       assert running_plan.status == "running"
+      assert Enum.any?(running_plan.plan_events, &(&1.event_type == "running"))
+    end
 
-      assert {:ok, completed_plan} = Plans.update_status(plan.id, "completed")
+    test "transitions running plans to completed" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      {:ok, approved_plan} = Plans.approve_plan(plan.id)
+      {:ok, running_plan} = Plans.update_status(approved_plan.id, "running")
+
+      assert {:ok, completed_plan} = Plans.update_status(running_plan.id, "completed")
       assert completed_plan.status == "completed"
+      assert completed_plan.completed_at != nil
+    end
 
-      assert {:ok, failed_plan} = Plans.update_status(plan.id, "failed", %{"error" => "oops"})
+    test "transitions running plans to failed with payload" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      {:ok, approved_plan} = Plans.approve_plan(plan.id)
+      {:ok, running_plan} = Plans.update_status(approved_plan.id, "running")
+
+      assert {:ok, failed_plan} =
+               Plans.update_status(running_plan.id, "failed", %{"error" => "oops"})
+
       assert failed_plan.status == "failed"
       event = Enum.find(failed_plan.plan_events, &(&1.event_type == "failed"))
       assert event.payload == %{"error" => "oops"}
     end
 
+    test "allows superseding a plan" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+
+      assert {:ok, superseded_plan} = Plans.update_status(plan.id, "superseded")
+      assert superseded_plan.status == "superseded"
+    end
+
     test "fails to transition to invalid status" do
       {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
       assert {:error, :invalid_transition} = Plans.update_status(plan.id, "draft")
+    end
+
+    test "fails to run a draft plan" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      assert {:error, :invalid_transition} = Plans.update_status(plan.id, "running")
+    end
+
+    test "fails to reopen a completed plan as running" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      {:ok, approved_plan} = Plans.approve_plan(plan.id)
+      {:ok, running_plan} = Plans.update_status(approved_plan.id, "running")
+      {:ok, completed_plan} = Plans.update_status(running_plan.id, "completed")
+
+      assert {:error, :invalid_transition} = Plans.update_status(completed_plan.id, "running")
+    end
+
+    test "returns not_found for a missing plan" do
+      assert {:error, :not_found} = Plans.update_status(Ecto.UUID.generate(), "running")
     end
   end
 

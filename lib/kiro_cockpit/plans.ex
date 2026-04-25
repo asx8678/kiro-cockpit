@@ -89,13 +89,15 @@ defmodule KiroCockpit.Plans do
 
   @doc """
   Lists plans for a given session, optionally filtered by status.
+  Preloads plan_steps and plan_events.
   """
   @spec list_plans(session_id, keyword()) :: [Plan.t()]
   def list_plans(session_id, opts \\ []) do
     query =
       from p in Plan,
         where: p.session_id == ^session_id,
-        order_by: [desc: p.inserted_at]
+        order_by: [desc: p.inserted_at],
+        preload: [:plan_steps, :plan_events]
 
     query =
       if status = Keyword.get(opts, :status) do
@@ -112,31 +114,14 @@ defmodule KiroCockpit.Plans do
   """
   @spec approve_plan(plan_id) :: {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
   def approve_plan(plan_id) do
-    plan = Repo.get!(Plan, plan_id)
-
-    if plan.status != "draft" do
-      {:error, :invalid_transition}
-    else
-      new_multi()
-      |> Multi.update(
-        :plan,
-        Plan.changeset(plan, %{status: "approved", approved_at: DateTime.utc_now()})
+    with {:ok, plan} <- fetch_plan(plan_id),
+         :ok <- require_status(plan, "draft") do
+      update_plan_with_event(
+        plan,
+        %{status: "approved", approved_at: DateTime.utc_now()},
+        "approved",
+        %{}
       )
-      |> Multi.run(:event, fn repo, %{plan: plan} ->
-        event_attrs = %{
-          plan_id: plan.id,
-          event_type: "approved",
-          payload: %{},
-          created_at: DateTime.utc_now()
-        }
-
-        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-      end)
-      |> Repo.transaction()
-      |> case do
-        {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
-        {:error, _failed_step, reason, _changes} -> {:error, reason}
-      end
     end
   end
 
@@ -146,28 +131,9 @@ defmodule KiroCockpit.Plans do
   @spec reject_plan(plan_id, String.t() | nil) ::
           {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
   def reject_plan(plan_id, reason \\ nil) do
-    plan = Repo.get!(Plan, plan_id)
-
-    if plan.status in ["rejected", "superseded", "failed", "completed"] do
-      {:error, :invalid_transition}
-    else
-      new_multi()
-      |> Multi.update(:plan, Plan.changeset(plan, %{status: "rejected"}))
-      |> Multi.run(:event, fn repo, %{plan: plan} ->
-        event_attrs = %{
-          plan_id: plan.id,
-          event_type: "rejected",
-          payload: if(reason, do: %{"reason" => reason}, else: %{}),
-          created_at: DateTime.utc_now()
-        }
-
-        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-      end)
-      |> Repo.transaction()
-      |> case do
-        {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
-        {:error, _failed_step, reason, _changes} -> {:error, reason}
-      end
+    with {:ok, plan} <- fetch_plan(plan_id),
+         :ok <- rejectable?(plan.status) do
+      update_plan_with_event(plan, %{status: "rejected"}, "rejected", rejection_payload(reason))
     end
   end
 
@@ -177,47 +143,49 @@ defmodule KiroCockpit.Plans do
   @spec revise_plan(plan_id, String.t(), keyword()) ::
           {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
   def revise_plan(plan_id, revision_request, opts \\ []) do
-    old_plan = Repo.get!(Plan, plan_id) |> Repo.preload(:plan_steps)
+    with {:ok, old_plan} <- fetch_plan(plan_id) do
+      old_plan = Repo.preload(old_plan, :plan_steps)
 
-    # Create a new plan with the revision request as user_request (or keep original?)
-    # For simplicity, we'll treat revision_request as the new user request.
-    # The old plan's steps may be used as a starting point; but we'll just create empty steps.
-    # The caller (NanoPlanner) will generate new steps.
-    # We'll also mark old plan as superseded.
-    new_multi()
-    |> Multi.update(:old_plan, Plan.changeset(old_plan, %{status: "superseded"}))
-    |> Multi.run(:new_plan, fn repo, %{old_plan: old_plan} ->
-      new_plan_attrs = %{
-        session_id: old_plan.session_id,
-        mode: old_plan.mode,
-        status: "draft",
-        user_request: revision_request,
-        plan_markdown: Keyword.get(opts, :plan_markdown, old_plan.plan_markdown),
-        execution_prompt: Keyword.get(opts, :execution_prompt, old_plan.execution_prompt),
-        raw_model_output: Keyword.get(opts, :raw_model_output, old_plan.raw_model_output),
-        project_snapshot_hash:
-          Keyword.get(opts, :project_snapshot_hash, old_plan.project_snapshot_hash)
-      }
+      # Create a new plan with the revision request as user_request (or keep original?)
+      # For simplicity, we'll treat revision_request as the new user request.
+      # The old plan's steps may be used as a starting point; but we'll just create empty steps.
+      # The caller (NanoPlanner) will generate new steps.
+      # We'll also mark old plan as superseded.
+      new_multi()
+      |> Multi.update(:old_plan, Plan.changeset(old_plan, %{status: "superseded"}))
+      |> Multi.run(:new_plan, fn repo, %{old_plan: old_plan} ->
+        new_plan_attrs = %{
+          session_id: old_plan.session_id,
+          mode: old_plan.mode,
+          status: "draft",
+          user_request: revision_request,
+          plan_markdown: Keyword.get(opts, :plan_markdown, old_plan.plan_markdown),
+          execution_prompt: Keyword.get(opts, :execution_prompt, old_plan.execution_prompt),
+          raw_model_output: Keyword.get(opts, :raw_model_output, old_plan.raw_model_output),
+          project_snapshot_hash:
+            Keyword.get(opts, :project_snapshot_hash, old_plan.project_snapshot_hash)
+        }
 
-      repo.insert(Plan.changeset(%Plan{}, new_plan_attrs))
-    end)
-    |> Multi.run(:event, fn repo, %{new_plan: new_plan} ->
-      event_attrs = %{
-        plan_id: new_plan.id,
-        event_type: "revised",
-        payload: %{"previous_plan_id" => plan_id},
-        created_at: DateTime.utc_now()
-      }
+        repo.insert(Plan.changeset(%Plan{}, new_plan_attrs))
+      end)
+      |> Multi.run(:event, fn repo, %{new_plan: new_plan} ->
+        event_attrs = %{
+          plan_id: new_plan.id,
+          event_type: "revised",
+          payload: %{"previous_plan_id" => plan_id},
+          created_at: DateTime.utc_now()
+        }
 
-      repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-    end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{new_plan: new_plan}} ->
-        {:ok, Repo.preload(new_plan, [:plan_steps, :plan_events])}
+        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{new_plan: new_plan}} ->
+          {:ok, Repo.preload(new_plan, [:plan_steps, :plan_events])}
 
-      {:error, _failed_step, reason, _changes} ->
-        {:error, reason}
+        {:error, _failed_step, reason, _changes} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -228,29 +196,9 @@ defmodule KiroCockpit.Plans do
   @spec update_status(plan_id, String.t(), map()) ::
           {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
   def update_status(plan_id, status, payload \\ %{}) do
-    plan = Repo.get!(Plan, plan_id)
-
-    # Guard: only allow status transitions used for running, completed, failed, superseded
-    if status in ["running", "completed", "failed", "superseded"] do
-      new_multi()
-      |> Multi.update(:plan, Plan.changeset(plan, %{status: status}))
-      |> Multi.run(:event, fn repo, %{plan: plan} ->
-        event_attrs = %{
-          plan_id: plan.id,
-          event_type: status,
-          payload: payload,
-          created_at: DateTime.utc_now()
-        }
-
-        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-      end)
-      |> Repo.transaction()
-      |> case do
-        {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
-        {:error, _failed_step, reason, _changes} -> {:error, reason}
-      end
-    else
-      {:error, :invalid_transition}
+    with {:ok, plan} <- fetch_plan(plan_id),
+         :ok <- valid_status_transition?(plan.status, status) do
+      update_plan_with_event(plan, status_attrs(status), status, payload)
     end
   end
 
@@ -262,6 +210,57 @@ defmodule KiroCockpit.Plans do
     case Repo.get(Plan, plan_id, select: [:project_snapshot_hash]) do
       nil -> nil
       plan -> plan.project_snapshot_hash
+    end
+  end
+
+  defp fetch_plan(plan_id) do
+    case Repo.get(Plan, plan_id) do
+      nil -> {:error, :not_found}
+      plan -> {:ok, plan}
+    end
+  end
+
+  defp require_status(%Plan{status: status}, status), do: :ok
+  defp require_status(%Plan{}, _status), do: {:error, :invalid_transition}
+
+  defp rejectable?(status) when status in ["rejected", "superseded", "failed", "completed"] do
+    {:error, :invalid_transition}
+  end
+
+  defp rejectable?(_status), do: :ok
+
+  defp valid_status_transition?("approved", "running"), do: :ok
+  defp valid_status_transition?("running", "completed"), do: :ok
+  defp valid_status_transition?("running", "failed"), do: :ok
+  defp valid_status_transition?(_current_status, "superseded"), do: :ok
+  defp valid_status_transition?(_current_status, _new_status), do: {:error, :invalid_transition}
+
+  defp status_attrs("completed") do
+    %{status: "completed", completed_at: DateTime.utc_now()}
+  end
+
+  defp status_attrs(status), do: %{status: status}
+
+  defp rejection_payload(nil), do: %{}
+  defp rejection_payload(reason), do: %{"reason" => reason}
+
+  defp update_plan_with_event(plan, attrs, event_type, payload) do
+    new_multi()
+    |> Multi.update(:plan, Plan.changeset(plan, attrs))
+    |> Multi.run(:event, fn repo, %{plan: plan} ->
+      event_attrs = %{
+        plan_id: plan.id,
+        event_type: event_type,
+        payload: payload,
+        created_at: DateTime.utc_now()
+      }
+
+      repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
+      {:error, _failed_step, reason, _changes} -> {:error, reason}
     end
   end
 end
