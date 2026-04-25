@@ -23,6 +23,7 @@ defmodule KiroCockpit.ProjectSnapshot do
           root_tree: String.t(),
           detected_stack: [String.t()],
           config_excerpts: %{String.t() => String.t()},
+          file_fingerprints: %{String.t() => String.t()},
           existing_plans: String.t() | nil,
           session_summary: String.t() | nil,
           hash: String.t(),
@@ -35,6 +36,7 @@ defmodule KiroCockpit.ProjectSnapshot do
     :root_tree,
     :detected_stack,
     :config_excerpts,
+    :file_fingerprints,
     :existing_plans,
     :session_summary,
     :hash,
@@ -46,9 +48,12 @@ defmodule KiroCockpit.ProjectSnapshot do
   @doc """
   Computes a stable SHA-256 hash from snapshot content.
 
-  The hash inputs are the root tree, detected stack, config excerpts,
-  existing plans, and session summary — in a deterministic order so the
-  same project state always yields the same hash.
+  The hash inputs are project-state fields only: root tree, detected stack,
+  config excerpts, relevant file fingerprints, and existing project plans —
+  in deterministic order so the same project state always yields the same
+  hash. Conversational context such as `session_summary` is deliberately
+  excluded so it can enrich the prompt without creating false stale-plan
+  positives.
   """
   @spec compute_hash(t()) :: String.t()
   def compute_hash(%ProjectSnapshot{} = snapshot) do
@@ -56,6 +61,13 @@ defmodule KiroCockpit.ProjectSnapshot do
 
     sorted_excerpts =
       snapshot.config_excerpts
+      |> normalize_map()
+      |> Enum.sort_by(fn {k, _v} -> k end)
+      |> Enum.map_join("|", fn {k, v} -> "#{k}=#{v}" end)
+
+    sorted_fingerprints =
+      snapshot.file_fingerprints
+      |> normalize_map()
       |> Enum.sort_by(fn {k, _v} -> k end)
       |> Enum.map_join("|", fn {k, v} -> "#{k}=#{v}" end)
 
@@ -64,8 +76,8 @@ defmodule KiroCockpit.ProjectSnapshot do
         snapshot.root_tree || "",
         sorted_stack,
         sorted_excerpts,
-        snapshot.existing_plans || "",
-        snapshot.session_summary || ""
+        sorted_fingerprints,
+        snapshot.existing_plans || ""
       ]
       |> Enum.join("||")
 
@@ -85,6 +97,7 @@ defmodule KiroCockpit.ProjectSnapshot do
       root_tree: Keyword.get(opts, :root_tree),
       detected_stack: Keyword.get(opts, :detected_stack, []),
       config_excerpts: Keyword.get(opts, :config_excerpts, %{}),
+      file_fingerprints: Keyword.get(opts, :file_fingerprints, %{}),
       existing_plans: Keyword.get(opts, :existing_plans),
       session_summary: Keyword.get(opts, :session_summary),
       hash: "placeholder",
@@ -93,6 +106,9 @@ defmodule KiroCockpit.ProjectSnapshot do
 
     %{snapshot | hash: compute_hash(snapshot)}
   end
+
+  defp normalize_map(nil), do: %{}
+  defp normalize_map(map) when is_map(map), do: map
 
   @doc """
   Renders the snapshot as compact markdown per §8 context format.
