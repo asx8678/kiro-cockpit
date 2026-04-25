@@ -247,6 +247,26 @@ defmodule KiroCockpit.NanoPlanner.PlanSchemaTest do
       assert result.permissions_needed == [:read, :shell_write]
     end
 
+    test "accepts all canonical permission strings" do
+      result =
+        PlanSchema.validate!(
+          valid_plan(
+            permissions_needed:
+              ~w(read write shell_read shell_write terminal external destructive)
+          )
+        )
+
+      assert result.permissions_needed == [
+               :read,
+               :write,
+               :shell_read,
+               :shell_write,
+               :terminal,
+               :external,
+               :destructive
+             ]
+    end
+
     test "normalizes atom permissions" do
       result = PlanSchema.validate!(valid_plan(permissions_needed: [:read, :write]))
       assert result.permissions_needed == [:read, :write]

@@ -210,6 +210,19 @@ defmodule KiroCockpit.NanoPlanner.PromptBuilderTest do
       assert prompt =~ "Use turn-end event"
     end
 
+    test "includes atom-keyed risks with risk and mitigation" do
+      plan =
+        validated_plan(
+          risks: [%{risk: "Project drift", mitigation: "Check snapshot hash before execution"}]
+        )
+
+      {:ok, prompt} = PromptBuilder.build_executor_prompt(plan)
+
+      assert prompt =~ "Project drift"
+      assert prompt =~ "Check snapshot hash before execution"
+      refute prompt =~ "%{risk:"
+    end
+
     test "includes validation steps from phases" do
       plan = validated_plan()
       {:ok, prompt} = PromptBuilder.build_executor_prompt(plan)

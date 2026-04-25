@@ -278,8 +278,11 @@ defmodule KiroCockpit.NanoPlanner.PromptBuilder do
   defp format_risks(risks) when is_list(risks) do
     risks
     |> Enum.map_join("\n", fn
-      %{"risk" => risk, "mitigation" => mit} ->
-        "- **Risk**: #{risk}\n  **Mitigation**: #{mit}"
+      %{risk: risk, mitigation: mitigation} ->
+        format_risk_with_mitigation(risk, mitigation)
+
+      %{"risk" => risk, "mitigation" => mitigation} ->
+        format_risk_with_mitigation(risk, mitigation)
 
       risk when is_binary(risk) ->
         "- #{risk}"
@@ -290,6 +293,10 @@ defmodule KiroCockpit.NanoPlanner.PromptBuilder do
   end
 
   defp format_risks(_), do: "(no risks identified)"
+
+  defp format_risk_with_mitigation(risk, mitigation) do
+    "- **Risk**: #{risk}\n  **Mitigation**: #{mitigation}"
+  end
 
   defp format_validation_steps(plan) do
     phases = get_plan_field(plan, :phases, [])

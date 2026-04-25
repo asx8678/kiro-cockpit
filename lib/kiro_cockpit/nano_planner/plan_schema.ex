@@ -319,27 +319,17 @@ defmodule KiroCockpit.NanoPlanner.PlanSchema do
   end
 
   @canonical_permissions Permissions.escalation_order()
+  @canonical_permission_strings Enum.map(@canonical_permissions, &to_string/1)
+  @permission_alias_strings ~w(shell shell_readonly)
 
   defp valid_permission?(perm) when perm in @canonical_permissions, do: true
 
-  defp valid_permission?(perm) when is_binary(perm),
-    do: Map.has_key?(string_to_permission_map(), String.downcase(perm))
+  defp valid_permission?(perm) when is_binary(perm) do
+    normalized = String.downcase(perm)
+    normalized in @canonical_permission_strings or normalized in @permission_alias_strings
+  end
 
   defp valid_permission?(_), do: false
-
-  defp string_to_permission_map do
-    %{
-      "read" => :read,
-      "write" => :write,
-      "shell_read" => :read,
-      "shell_write" => :shell_write,
-      "shell" => :shell_write,
-      "shell_readonly" => :shell_read,
-      "terminal" => :terminal,
-      "external" => :external,
-      "destructive" => :destructive
-    }
-  end
 
   # ── Normalization ────────────────────────────────────────────────────
 
