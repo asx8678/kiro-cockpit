@@ -48,6 +48,19 @@ defmodule KiroCockpit.Acp.PortProcess do
       {:acp_protocol_error, port_pid, reason, raw}
       {:acp_exit, port_pid, status}
 
+  ## Outbound message capture
+
+  After successfully writing any outbound JSON-RPC message (request, notification,
+  response, or error response), the GenServer sends an `:acp_outbound` tuple
+  to the owner with the **exact** JSON-RPC map that was written to the port.
+  This enables the owner to persist the true raw payload without reconstructing
+  it from caller-supplied arguments.
+
+      {:acp_outbound, port_pid, %{jsonrpc: "2.0", id: id, method: method, params: params}}
+      {:acp_outbound, port_pid, %{jsonrpc: "2.0", method: method, params: params}}
+      {:acp_outbound, port_pid, %{jsonrpc: "2.0", id: id, result: result}}
+      {:acp_outbound, port_pid, %{jsonrpc: "2.0", id: id, error: %{code: code, message: message}}}
+
   ## Restart strategy guidance (for callers)
 
   This module only provides `start_link/1`. When you mount it under a
@@ -231,6 +244,7 @@ defmodule KiroCockpit.Acp.PortProcess do
 
     case write_line(state, msg) do
       :ok ->
+        notify_outbound(state, msg)
         timer_ref = arm_request_timer(id, timeout)
         pending = Map.put(state.pending, id, {from, timer_ref})
         {:noreply, %{state | next_id: id + 1, pending: pending}}
@@ -247,19 +261,34 @@ defmodule KiroCockpit.Acp.PortProcess do
   @impl GenServer
   def handle_cast({:notify, method, params}, state) do
     msg = JsonRpc.notification(method, params)
-    _ = write_line(state, msg)
+
+    case write_line(state, msg) do
+      :ok -> notify_outbound(state, msg)
+      {:error, _reason} -> :ok
+    end
+
     {:noreply, state}
   end
 
   def handle_cast({:respond, id, result}, state) do
     msg = JsonRpc.success_response(id, result)
-    _ = write_line(state, msg)
+
+    case write_line(state, msg) do
+      :ok -> notify_outbound(state, msg)
+      {:error, _reason} -> :ok
+    end
+
     {:noreply, state}
   end
 
   def handle_cast({:respond_error, id, code, message, data}, state) do
     msg = JsonRpc.error_response(id, code, message, data)
-    _ = write_line(state, msg)
+
+    case write_line(state, msg) do
+      :ok -> notify_outbound(state, msg)
+      {:error, _reason} -> :ok
+    end
+
     {:noreply, state}
   end
 
@@ -538,6 +567,14 @@ defmodule KiroCockpit.Acp.PortProcess do
 
   # Add a small buffer so the GenServer always has a chance to reply with
   # `{:error, :timeout}` BEFORE the outer GenServer.call exits the caller.
+  # Send the exact raw JSON-RPC map to the owner so it can persist the
+  # true outbound payload (with the real assigned id) without reconstruction.
+  @spec notify_outbound(state(), map()) :: :ok
+  defp notify_outbound(%{owner: owner}, msg) when is_pid(owner) do
+    send(owner, {:acp_outbound, self(), msg})
+    :ok
+  end
+
   @spec call_timeout(timeout()) :: timeout()
   defp call_timeout(:infinity), do: :infinity
   defp call_timeout(timeout) when is_integer(timeout) and timeout >= 0, do: timeout + 1_000

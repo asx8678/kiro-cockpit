@@ -216,4 +216,83 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
   catch
     :exit, _ -> :ok
   end
+
+  # -- Outbound request persistence with real IDs (MUST FIX 1) ---------------
+
+  describe "outbound request persistence with real assigned IDs" do
+    setup %{elixir: elixir, args: args} do
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          subscriber: self(),
+          persist_messages: true,
+          auto_callbacks: false
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+      # Flush pending {:acp_outbound} messages so they get persisted
+      # before we query EventStore. KiroSession.state/1 is a GenServer.call
+      # that forces the session to process its entire mailbox first.
+      _ = KiroSession.state(session)
+
+      cwd = File.cwd!()
+      assert {:ok, result} = KiroSession.new_session(session, cwd)
+      _ = KiroSession.state(session)
+
+      session_id = result["sessionId"]
+
+      # Drain session/update from session/new
+      assert_receive {:acp_notification, ^session, _}, 2_000
+
+      on_exit(fn -> safe_stop(session) end)
+      {:ok, %{session: session, session_id: session_id}}
+    end
+
+    test "persisted outbound initialize request has real rpc_id (not \"0\")" do
+      # Initialize happens before session creation, so session_id is nil.
+      # Query without session_id filter for initialize messages.
+      requests =
+        EventStore.list_acp_messages(nil,
+          direction: "client_to_agent",
+          message_type: "request",
+          method: "initialize"
+        )
+
+      assert length(requests) >= 1, "Expected at least one persisted outbound initialize"
+
+      request = hd(requests)
+      assert request.message_type == "request"
+      assert request.method == "initialize"
+      assert request.direction == "client_to_agent"
+
+      # The rpc_id must NOT be "0" — it must be the real assigned id
+      refute request.rpc_id == "0",
+             "outbound initialize rpc_id must not be placeholder 0 (got: #{inspect(request.rpc_id)})"
+
+      assert request.rpc_id != nil
+
+      # The raw_payload must have the real id
+      payload = request.raw_payload
+      assert payload["jsonrpc"] == "2.0"
+      assert Map.has_key?(payload, "id")
+      real_id = payload["id"]
+      assert is_integer(real_id) and real_id > 0
+    end
+
+    test "persisted outbound session/new request has real rpc_id",
+         %{session_id: session_id} do
+      requests =
+        EventStore.list_acp_messages(session_id,
+          direction: "client_to_agent",
+          message_type: "request",
+          method: "session/new"
+        )
+
+      assert length(requests) >= 1
+      request = hd(requests)
+      refute request.rpc_id == "0"
+      assert request.rpc_id != nil
+    end
+  end
 end

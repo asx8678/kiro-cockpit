@@ -312,6 +312,147 @@ defmodule KiroCockpit.KiroSession.TerminalManagerTest do
       {:ok, result} = TerminalManager.output(tm, term_id)
       assert result["output"] =~ "hello_from_kiro"
     end
+
+    test "host allowlisted env vars (PATH, HOME) are inherited", %{tm: tm} do
+      sh = System.find_executable("sh") || flunk("sh not found")
+
+      # No agent-supplied env — should still get allowlisted host vars
+      {:ok, term_id} =
+        TerminalManager.create(
+          tm,
+          sh,
+          ["-c", "echo $PATH"],
+          nil,
+          [],
+          1_048_576
+        )
+
+      assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+
+      {:ok, result} = TerminalManager.output(tm, term_id)
+      # PATH should be set (it's on the allowlist)
+      assert result["output"] != "\n", "PATH should be inherited from host env"
+    end
+
+    # MUST FIX 3: terminal env secret isolation
+    test "non-allowlisted host env vars are NOT inherited by subprocess", %{tm: tm} do
+      sh = System.find_executable("sh") || flunk("sh not found")
+
+      # Temporarily set a sensitive-looking env var in the BEAM process
+      original = System.get_env("KIRO_TEST_SECRET_API_KEY")
+      System.put_env("KIRO_TEST_SECRET_API_KEY", "super_secret_value_12345")
+
+      try do
+        {:ok, term_id} =
+          TerminalManager.create(
+            tm,
+            sh,
+            ["-c", "echo KIRO_TEST_SECRET_API_KEY=$KIRO_TEST_SECRET_API_KEY"],
+            nil,
+            [],
+            1_048_576
+          )
+
+        assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+
+        {:ok, result} = TerminalManager.output(tm, term_id)
+        # The secret must NOT be visible in the subprocess output
+        refute result["output"] =~ "super_secret_value_12345",
+               "Non-allowlisted host env var leaked into terminal subprocess"
+
+        # The var should be empty/unset in the subprocess
+        assert result["output"] =~ "KIRO_TEST_SECRET_API_KEY=",
+               "Output should contain the echo but with empty value"
+      after
+        if original do
+          System.put_env("KIRO_TEST_SECRET_API_KEY", original)
+        else
+          System.delete_env("KIRO_TEST_SECRET_API_KEY")
+        end
+      end
+    end
+
+    test "DATABASE_URL from host is NOT inherited by subprocess", %{tm: tm} do
+      sh = System.find_executable("sh") || flunk("sh not found")
+
+      original = System.get_env("DATABASE_URL")
+      System.put_env("DATABASE_URL", "postgresql://secret:pass@db.example.com/prod")
+
+      try do
+        {:ok, term_id} =
+          TerminalManager.create(
+            tm,
+            sh,
+            ["-c", "echo DATABASE_URL=$DATABASE_URL"],
+            nil,
+            [],
+            1_048_576
+          )
+
+        assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+
+        {:ok, result} = TerminalManager.output(tm, term_id)
+
+        refute result["output"] =~ "postgresql://secret:pass@db.example.com",
+               "DATABASE_URL leaked into terminal subprocess"
+      after
+        if original do
+          System.put_env("DATABASE_URL", original)
+        else
+          System.delete_env("DATABASE_URL")
+        end
+      end
+    end
+
+    test "agent-supplied env vars override allowlisted host vars", %{tm: tm} do
+      sh = System.find_executable("sh") || flunk("sh not found")
+
+      _original_path = System.get_env("PATH")
+
+      # Agent explicitly provides PATH
+      env = [%{"name" => "PATH", "value" => "/custom/path"}]
+
+      {:ok, term_id} =
+        TerminalManager.create(
+          tm,
+          sh,
+          ["-c", "echo $PATH"],
+          nil,
+          env,
+          1_048_576
+        )
+
+      assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+
+      {:ok, result} = TerminalManager.output(tm, term_id)
+
+      assert result["output"] =~ "/custom/path",
+             "Agent-supplied PATH should override host PATH"
+    end
+
+    test "agent-supplied sensitive env var is passed through", %{tm: tm} do
+      sh = System.find_executable("sh") || flunk("sh not found")
+
+      # Agent explicitly requests DATABASE_URL — it should be in subprocess
+      env = [%{"name" => "DATABASE_URL", "value" => "postgresql://agent:pass@localhost/test"}]
+
+      {:ok, term_id} =
+        TerminalManager.create(
+          tm,
+          sh,
+          ["-c", "echo $DATABASE_URL"],
+          nil,
+          env,
+          1_048_576
+        )
+
+      assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+
+      {:ok, result} = TerminalManager.output(tm, term_id)
+
+      assert result["output"] =~ "postgresql://agent:pass@localhost/test",
+             "Explicitly supplied agent env var should be passed through"
+    end
   end
 
   # -- stderr capture ----------------------------------------------------------

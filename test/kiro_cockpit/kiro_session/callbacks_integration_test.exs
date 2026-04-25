@@ -38,7 +38,18 @@ defmodule KiroCockpit.KiroSession.CallbacksIntegrationTest do
       auto_callbacks: auto_callbacks
     ]
 
-    merged_opts = Keyword.merge(base_opts, Keyword.delete(opts, :auto_callbacks))
+    callback_policy_opts =
+      if Keyword.has_key?(opts, :callback_policy) do
+        [callback_policy: Keyword.fetch!(opts, :callback_policy)]
+      else
+        []
+      end
+
+    merged_opts =
+      base_opts
+      |> Keyword.merge(callback_policy_opts)
+      |> Keyword.merge(Keyword.drop(opts, [:auto_callbacks, :callback_policy]))
+
     {:ok, session} = KiroSession.start_link(merged_opts)
     on_exit(fn -> safe_stop(session) end)
 
@@ -205,6 +216,108 @@ defmodule KiroCockpit.KiroSession.CallbacksIntegrationTest do
 
       state = KiroSession.state(session)
       assert state.auto_callbacks == false
+    end
+
+    test "includes callback_policy field" do
+      %{session: session} = start_session!("normal")
+
+      state = KiroSession.state(session)
+      assert Map.has_key?(state, :callback_policy)
+      assert state.callback_policy == :read_only
+    end
+
+    test "callback_policy is :read_only when explicitly set" do
+      %{session: session} = start_session!("normal", callback_policy: :read_only)
+
+      state = KiroSession.state(session)
+      assert state.callback_policy == :read_only
+    end
+  end
+
+  # -- Callback policy: read_only denies mutating callbacks (MUST FIX 2) ------
+
+  describe "callback_policy: :read_only denies mutating methods" do
+    setup context do
+      scenario = context[:scenario] || "callback"
+
+      elixir = System.find_executable("elixir") || flunk("elixir not on PATH")
+
+      ebin_dirs =
+        Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
+
+      args =
+        Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+          ["-e", @fake_agent_entry]
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          env: [{"FAKE_ACP_SCENARIO", scenario}],
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: true,
+          callback_policy: :read_only
+        )
+
+      on_exit(fn -> safe_stop(session) end)
+
+      {:ok, _} = KiroSession.initialize(session)
+      {:ok, sn_result} = KiroSession.new_session(session, File.cwd!())
+      session_id = sn_result["sessionId"]
+
+      %{session: session, session_id: session_id}
+    end
+
+    @tag scenario: "callback"
+    test "read-only session auto-handles fs/read_text_file and completes prompt",
+         %{session: session} do
+      # Ensure the file exists
+      File.write!("/tmp/kiro-fake.txt", "read-only policy test")
+
+      task =
+        Task.async(fn ->
+          KiroSession.prompt(session, "Read a file")
+        end)
+
+      # The fs/read_text_file should be auto-handled under :read_only
+      assert_receive {:acp_request, ^session, %{method: "fs/read_text_file"}}, 5_000
+
+      assert {:ok, _} = Task.await(task, 10_000)
+    end
+  end
+
+  # -- Callback policy: :all allows everything (backward compat) --------------
+
+  describe "callback_policy: :all allows all callback methods" do
+    test "full auto-callbacks with :all policy" do
+      elixir = System.find_executable("elixir") || flunk("elixir not on PATH")
+
+      ebin_dirs =
+        Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
+
+      args =
+        Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+          ["-e", @fake_agent_entry]
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          env: [{"FAKE_ACP_SCENARIO", "callback"}],
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: true,
+          callback_policy: :all
+        )
+
+      on_exit(fn -> safe_stop(session) end)
+
+      {:ok, _} = KiroSession.initialize(session)
+      {:ok, _} = KiroSession.new_session(session, File.cwd!())
+
+      state = KiroSession.state(session)
+      assert state.callback_policy == :all
     end
   end
 end
