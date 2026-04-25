@@ -19,12 +19,18 @@ __pycache__/
 /.fetch
 erl_crash.dump
 *.ez
+/priv/plts/*.plt
+/priv/plts/*.plt.hash
 
 # Phoenix assets/build artifacts
 /node_modules/
-/priv/static/assets/
+/priv/static/assets/app.css
+/priv/static/assets/app.js
 /priv/static/cache_manifest.json
 /assets/node_modules/
+
+# Generated assets (keep directory)
+!/priv/static/assets/.gitkeep
 
 # Environment and local config
 .env
