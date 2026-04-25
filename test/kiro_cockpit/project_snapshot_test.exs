@@ -39,8 +39,20 @@ defmodule KiroCockpit.ProjectSnapshotTest do
       excerpts_a = %{"a.conf" => "aaa", "b.conf" => "bbb"}
       excerpts_b = %{"b.conf" => "bbb", "a.conf" => "aaa"}
 
-      s1 = ProjectSnapshot.new("/tmp/proj", config_excerpts: excerpts_a)
-      s2 = ProjectSnapshot.new("/tmp/proj", config_excerpts: excerpts_b)
+      fingerprints_a = %{"lib/a.ex" => "file:size=1:mtime=1", "mix.exs" => "file:size=2:mtime=2"}
+      fingerprints_b = %{"mix.exs" => "file:size=2:mtime=2", "lib/a.ex" => "file:size=1:mtime=1"}
+
+      s1 =
+        ProjectSnapshot.new("/tmp/proj",
+          config_excerpts: excerpts_a,
+          file_fingerprints: fingerprints_a
+        )
+
+      s2 =
+        ProjectSnapshot.new("/tmp/proj",
+          config_excerpts: excerpts_b,
+          file_fingerprints: fingerprints_b
+        )
 
       assert s1.hash == s2.hash
     end
@@ -55,6 +67,12 @@ defmodule KiroCockpit.ProjectSnapshotTest do
       snapshot = ProjectSnapshot.new("/tmp/proj")
 
       assert snapshot.config_excerpts == %{}
+    end
+
+    test "defaults file_fingerprints to empty map" do
+      snapshot = ProjectSnapshot.new("/tmp/proj")
+
+      assert snapshot.file_fingerprints == %{}
     end
   end
 
@@ -79,6 +97,20 @@ defmodule KiroCockpit.ProjectSnapshotTest do
       refute s1.hash == s2.hash
     end
 
+    test "hash changes when file_fingerprints change" do
+      s1 =
+        ProjectSnapshot.new("/tmp/proj",
+          file_fingerprints: %{"lib/a.ex" => "file:size=1:mtime=1"}
+        )
+
+      s2 =
+        ProjectSnapshot.new("/tmp/proj",
+          file_fingerprints: %{"lib/a.ex" => "file:size=2:mtime=2"}
+        )
+
+      refute s1.hash == s2.hash
+    end
+
     test "hash changes when existing_plans change" do
       s1 = ProjectSnapshot.new("/tmp/proj", existing_plans: "plan1")
       s2 = ProjectSnapshot.new("/tmp/proj", existing_plans: "plan2")
@@ -86,11 +118,11 @@ defmodule KiroCockpit.ProjectSnapshotTest do
       refute s1.hash == s2.hash
     end
 
-    test "hash changes when session_summary changes" do
+    test "hash does not change when session_summary changes" do
       s1 = ProjectSnapshot.new("/tmp/proj", session_summary: "session1")
       s2 = ProjectSnapshot.new("/tmp/proj", session_summary: "session2")
 
-      refute s1.hash == s2.hash
+      assert s1.hash == s2.hash
     end
   end
 

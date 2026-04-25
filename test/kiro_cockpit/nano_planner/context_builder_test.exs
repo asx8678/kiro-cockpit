@@ -18,6 +18,10 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
     {:ok, project_dir: dir}
   end
 
+  defp touch!(path, second) do
+    File.touch!(path, {{2024, 1, 1}, {0, 0, second}})
+  end
+
   describe "build/1" do
     @tag :tmp_dir
     test "returns ok with a valid project directory", %{project_dir: dir} do
@@ -252,15 +256,69 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
     end
 
     @tag :tmp_dir
-    test "changed file content produces different hash", %{project_dir: dir} do
+    test "changed safe config file content produces different hash", %{project_dir: dir} do
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "mix.exs"), "version 1")
 
       assert {:ok, s1} = ContextBuilder.build(project_dir: dir)
 
       File.write!(Path.join(dir, "mix.exs"), "version 2")
+      touch!(Path.join(dir, "mix.exs"), 2)
 
       assert {:ok, s2} = ContextBuilder.build(project_dir: dir)
+      refute s1.hash == s2.hash
+    end
+
+    @tag :tmp_dir
+    test "changed relevant source file content produces different hash", %{project_dir: dir} do
+      source_path = Path.join([dir, "lib", "example.ex"])
+      File.mkdir_p!(Path.dirname(source_path))
+      File.write!(source_path, "defmodule Example do
+  def value, do: 1
+end
+")
+      touch!(source_path, 1)
+
+      assert {:ok, s1} = ContextBuilder.build(project_dir: dir)
+
+      File.write!(source_path, "defmodule Example do
+  def value, do: 2
+end
+")
+      touch!(source_path, 2)
+
+      assert {:ok, s2} = ContextBuilder.build(project_dir: dir)
+      refute s1.hash == s2.hash
+    end
+
+    @tag :tmp_dir
+    test "changing session summary does not change project snapshot hash", %{project_dir: dir} do
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "mix.exs"), "defmodule MixProject do end")
+
+      assert {:ok, s1} = ContextBuilder.build(project_dir: dir, session_summary: "session one")
+      assert {:ok, s2} = ContextBuilder.build(project_dir: dir, session_summary: "session two")
+
+      assert s1.hash == s2.hash
+    end
+
+    @tag :tmp_dir
+    test "changes beyond excerpt limit still change hash", %{project_dir: dir} do
+      readme_path = Path.join(dir, "README.md")
+      File.mkdir_p!(dir)
+      File.write!(readme_path, String.duplicate("a", 100) <> "one")
+      touch!(readme_path, 1)
+
+      assert {:ok, s1} =
+               ContextBuilder.build(project_dir: dir, max_file_chars_per_file: 100)
+
+      File.write!(readme_path, String.duplicate("a", 100) <> "two")
+      touch!(readme_path, 2)
+
+      assert {:ok, s2} =
+               ContextBuilder.build(project_dir: dir, max_file_chars_per_file: 100)
+
+      assert s1.config_excerpts["README.md"] == s2.config_excerpts["README.md"]
       refute s1.hash == s2.hash
     end
   end
@@ -310,15 +368,33 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
 
   describe "read_root_tree/2" do
     @tag :tmp_dir
-    test "produces a tree listing for a directory", %{project_dir: dir} do
-      File.mkdir_p!(dir)
-      File.write!(Path.join(dir, "mix.exs"), "content")
+    test "produces a shallow top-level listing for a directory", %{project_dir: dir} do
       File.mkdir_p!(Path.join(dir, "lib"))
+      File.write!(Path.join(dir, "mix.exs"), "content")
+      File.write!(Path.join([dir, "lib", "nested.ex"]), "defmodule Nested do end")
 
       tree = ContextBuilder.read_root_tree(dir, 200)
 
       assert tree =~ "mix.exs"
-      assert tree =~ "lib"
+      assert tree =~ "lib/"
+      refute tree =~ "nested.ex"
+    end
+
+    @tag :tmp_dir
+    test "omits noisy vendor and build directories from root listing", %{project_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "deps"))
+      File.mkdir_p!(Path.join(dir, "node_modules"))
+      File.mkdir_p!(Path.join(dir, "_build"))
+      File.mkdir_p!(Path.join(dir, ".git"))
+      File.write!(Path.join(dir, "mix.exs"), "content")
+
+      tree = ContextBuilder.read_root_tree(dir, 200)
+
+      assert tree =~ "mix.exs"
+      refute tree =~ "deps"
+      refute tree =~ "node_modules"
+      refute tree =~ "_build"
+      refute tree =~ ".git"
     end
 
     @tag :tmp_dir
@@ -433,6 +509,22 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
     end
 
     @tag :tmp_dir
+    test "does not follow symlinked ancestor directories for safe files", %{project_dir: dir} do
+      outside_dir =
+        Path.join(System.tmp_dir!(), "kiro_cb_outside_#{:erlang.unique_integer([:positive])}")
+
+      File.mkdir_p!(outside_dir)
+      File.write!(Path.join(outside_dir, "config.exs"), "secret outside config")
+      on_exit(fn -> File.rm_rf!(outside_dir) end)
+
+      assert :ok = File.ln_s(outside_dir, Path.join(dir, "config"))
+
+      excerpts = ContextBuilder.read_safe_files(dir, 6_000)
+
+      refute Map.has_key?(excerpts, Path.join("config", "config.exs"))
+    end
+
+    @tag :tmp_dir
     test "reads lib/*_web/router.ex glob", %{project_dir: dir} do
       web_dir = Path.join([dir, "lib", "my_app_web"])
       File.mkdir_p!(web_dir)
@@ -446,6 +538,28 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
 
       assert router_key != nil
       assert Map.get(excerpts, router_key) == "defmodule MyAppWeb.Router"
+    end
+
+    @tag :tmp_dir
+    test "does not follow symlinked ancestor directories for globbed safe files", %{
+      project_dir: dir
+    } do
+      outside_web_dir =
+        Path.join(System.tmp_dir!(), "kiro_cb_outside_web_#{:erlang.unique_integer([:positive])}")
+
+      File.mkdir_p!(Path.join(outside_web_dir, "my_app_web"))
+      File.write!(Path.join([outside_web_dir, "my_app_web", "router.ex"]), "outside router")
+      on_exit(fn -> File.rm_rf!(outside_web_dir) end)
+
+      assert :ok = File.ln_s(outside_web_dir, Path.join(dir, "lib"))
+
+      excerpts = ContextBuilder.read_safe_files(dir, 6_000)
+
+      router_key =
+        Map.keys(excerpts)
+        |> Enum.find(&String.ends_with?(&1, "router.ex"))
+
+      assert router_key == nil
     end
 
     @tag :tmp_dir

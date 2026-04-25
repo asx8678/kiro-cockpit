@@ -24,6 +24,8 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
   @default_max_tree_lines 200
   @default_max_file_chars_per_file 6_000
   @default_max_total_context_chars 40_000
+  @max_fingerprint_entries 1_000
+  @max_fingerprint_depth 8
 
   @safe_files ~w(
     README.md
@@ -43,6 +45,19 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
   @safe_dirs ~w(.kiro)
 
   @safe_globs ~w(lib/*_web/router.ex)
+
+  @ignored_entries MapSet.new(~w(
+    .git
+    _build
+    deps
+    node_modules
+    cover
+    coverage
+    .elixir_ls
+    .DS_Store
+  ))
+
+  @ignored_relative_dirs MapSet.new(~w(priv/static/cache))
 
   # Stack detection heuristics: {marker_file, stack_label}
   @stack_markers [
@@ -90,12 +105,14 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
       detected_stack = detect_stack(project_dir)
       config_excerpts = read_safe_files(project_dir, max_file_chars)
       existing_plans = read_kiro_plan(project_dir, max_file_chars)
+      file_fingerprints = read_file_fingerprints(project_dir)
 
       snapshot =
         ProjectSnapshot.new(project_dir,
           root_tree: root_tree,
           detected_stack: detected_stack,
           config_excerpts: config_excerpts,
+          file_fingerprints: file_fingerprints,
           existing_plans: existing_plans,
           session_summary: session_summary
         )
@@ -105,10 +122,12 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
   end
 
   @doc """
-  Lists files and directories under `dir` up to `max_lines` lines.
+  Lists top-level files and directories under `dir` up to `max_lines` lines.
 
-  Uses `File.ls!/1` recursively, producing a simple indented tree.
-  Returns a newline-joined string. Gracefully handles missing dirs.
+  Per plan2.md §8 this is intentionally shallow: NanoPlanner needs a compact
+  root overview, not an expensive recursive crawl. Known build/cache/vendor
+  directories are omitted. Returns a newline-joined string and gracefully handles
+  missing dirs.
   """
   @spec read_root_tree(String.t(), pos_integer()) :: String.t()
   def read_root_tree(dir, max_lines \\ @default_max_tree_lines) do
@@ -195,34 +214,119 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
 
   defp list_tree(dir) do
     if File.dir?(dir) do
-      lines = do_list_tree(dir, "", 0)
+      lines =
+        dir
+        |> list_visible_entries()
+        |> Enum.map(&format_root_entry(dir, &1))
+
       {:ok, lines}
     else
       {:error, :not_a_directory}
     end
   end
 
-  defp do_list_tree(dir, prefix, depth) do
+  defp list_visible_entries(dir) do
     case File.ls(dir) do
       {:ok, entries} ->
         entries
+        |> Enum.reject(&ignored_entry?/1)
         |> Enum.sort()
-        |> Enum.flat_map(&tree_entry(dir, prefix, depth, &1))
 
       {:error, _} ->
         []
     end
   end
 
-  defp tree_entry(dir, prefix, depth, entry) do
+  defp format_root_entry(dir, entry) do
     path = Path.join(dir, entry)
-    line = "#{prefix}#{entry}"
 
-    if File.dir?(path) and depth < 10 do
-      [line | do_list_tree(path, "#{prefix}  ", depth + 1)]
+    if directory_without_following_symlink?(path) do
+      "#{entry}/"
     else
-      [line]
+      entry
     end
+  end
+
+  defp read_file_fingerprints(project_dir) do
+    project_dir
+    |> collect_fingerprints("", 0, %{}, 0)
+    |> elem(0)
+  end
+
+  defp collect_fingerprints(_dir, _relative_dir, _depth, acc, count)
+       when count >= @max_fingerprint_entries do
+    {acc, count}
+  end
+
+  defp collect_fingerprints(_dir, _relative_dir, depth, acc, count)
+       when depth > @max_fingerprint_depth do
+    {acc, count}
+  end
+
+  defp collect_fingerprints(dir, relative_dir, depth, acc, count) do
+    dir
+    |> list_visible_entries()
+    |> Enum.reduce_while({acc, count}, fn entry, state ->
+      reduce_fingerprint_entry(dir, relative_dir, depth, entry, state)
+    end)
+  end
+
+  defp reduce_fingerprint_entry(_dir, _relative_dir, _depth, _entry, {acc, count})
+       when count >= @max_fingerprint_entries do
+    {:halt, {acc, count}}
+  end
+
+  defp reduce_fingerprint_entry(dir, relative_dir, depth, entry, {acc, count}) do
+    entry_path = Path.join(dir, entry)
+    relative_path = Path.join(relative_dir, entry)
+
+    if ignored_relative_path?(relative_path) do
+      {:cont, {acc, count}}
+    else
+      {:cont, fingerprint_entry(entry_path, relative_path, depth, acc, count)}
+    end
+  end
+
+  defp fingerprint_entry(path, relative_path, depth, acc, count) do
+    case File.lstat(path, time: :posix) do
+      {:ok, %File.Stat{type: :regular} = stat} ->
+        {Map.put(acc, relative_path, file_fingerprint(stat)), count + 1}
+
+      {:ok, %File.Stat{type: :symlink} = stat} ->
+        {Map.put(acc, relative_path, symlink_fingerprint(stat)), count + 1}
+
+      {:ok, %File.Stat{type: :directory}} ->
+        collect_fingerprints(path, relative_path, depth + 1, acc, count)
+
+      {:ok, _stat} ->
+        {acc, count}
+
+      {:error, _reason} ->
+        {acc, count}
+    end
+  end
+
+  defp file_fingerprint(%File.Stat{} = stat) do
+    "file:size=#{stat.size}:mtime=#{stat.mtime}"
+  end
+
+  defp symlink_fingerprint(%File.Stat{} = stat) do
+    "symlink:size=#{stat.size}:mtime=#{stat.mtime}"
+  end
+
+  defp directory_without_following_symlink?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} -> true
+      _ -> false
+    end
+  end
+
+  defp ignored_entry?(entry), do: MapSet.member?(@ignored_entries, entry)
+
+  defp ignored_relative_path?(relative_path) do
+    Enum.any?(@ignored_relative_dirs, fn ignored_dir ->
+      relative_path == ignored_dir or String.starts_with?(relative_path, "#{ignored_dir}/")
+    end)
   end
 
   defp collect_safe_paths(project_dir) do
@@ -230,7 +334,7 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
     top_level =
       @safe_files
       |> Enum.map(fn name -> Path.join(project_dir, name) end)
-      |> Enum.filter(&File.regular?/1)
+      |> Enum.filter(&safe_project_regular_file?(project_dir, &1))
 
     # 2. Files under safe directories (e.g. .kiro/*)
     dir_files =
@@ -238,7 +342,7 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
       |> Enum.flat_map(fn dir_name ->
         full_dir = Path.join(project_dir, dir_name)
 
-        if File.dir?(full_dir) do
+        if directory_without_following_symlink?(full_dir) do
           collect_dir_files(full_dir)
         else
           []
@@ -252,7 +356,7 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
         project_dir
         |> Path.join(glob)
         |> Path.wildcard()
-        |> Enum.filter(&File.regular?/1)
+        |> Enum.filter(&safe_project_regular_file?(project_dir, &1))
       end)
 
     # Deduplicate by resolved path
@@ -275,21 +379,56 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
   defp dir_entry(dir, entry) do
     path = Path.join(dir, entry)
 
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} -> [path]
+      {:ok, %File.Stat{type: :directory}} -> collect_dir_files(path)
+      _ -> []
+    end
+  end
+
+  defp safe_project_regular_file?(project_dir, path) do
+    path
+    |> Path.relative_to(project_dir)
+    |> safe_relative_regular_file?(project_dir)
+  end
+
+  defp safe_relative_regular_file?(relative_path, project_dir) do
+    path_parts = Path.split(relative_path)
+
     cond do
-      File.regular?(path) -> [path]
-      File.dir?(path) -> collect_dir_files(path)
-      true -> []
+      Path.type(relative_path) == :absolute -> false
+      Enum.any?(path_parts, &(&1 in [".", ".."])) -> false
+      path_parts == [] -> false
+      true -> regular_file_from_safe_parts?(project_dir, path_parts)
+    end
+  end
+
+  defp regular_file_from_safe_parts?(base_dir, [filename]) do
+    case File.lstat(Path.join(base_dir, filename)) do
+      {:ok, %File.Stat{type: :regular}} -> true
+      _ -> false
+    end
+  end
+
+  defp regular_file_from_safe_parts?(base_dir, [dir | rest]) do
+    case File.lstat(Path.join(base_dir, dir)) do
+      {:ok, %File.Stat{type: :directory}} ->
+        base_dir
+        |> Path.join(dir)
+        |> regular_file_from_safe_parts?(rest)
+
+      _ ->
+        false
     end
   end
 
   defp read_and_truncate(path, max_chars) do
-    case File.read(path) do
-      {:ok, content} ->
-        truncated = String.slice(content, 0, max_chars)
-        {:ok, truncated}
-
-      {:error, _} ->
-        :error
+    with {:ok, %File.Stat{type: :regular}} <- File.lstat(path),
+         {:ok, content} <- File.read(path) do
+      truncated = String.slice(content, 0, max_chars)
+      {:ok, truncated}
+    else
+      _ -> :error
     end
   end
 
