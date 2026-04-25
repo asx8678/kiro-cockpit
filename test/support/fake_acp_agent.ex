@@ -21,6 +21,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
   | `:long_turn` | `"long_turn"`| Prompt returns `end_turn` *before* final `session/update` with turn_end (for kiro-011)        |
   | `:callback`  | `"callback"` | Prompt triggers `fs/read_text_file` callback to client, waits for reply, then completes        |
   | `:error`     | `"error"`    | Prompt returns a `refusal` stopReason                                          |
+  | `:cancel`    | `"cancel"`   | Emits one chunk, then BLOCKS reading stdin until a `session/cancel` notification arrives, then emits `turn_end` (reason: `"cancelled"`) and resolves prompt with `stopReason: "cancelled"` (kiro-1rd) |
 
   The scenario is read once at startup and held for the process lifetime.
   Switching scenarios between runs is as simple as setting the env var.
@@ -67,7 +68,8 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
     "normal" => :normal,
     "long_turn" => :long_turn,
     "callback" => :callback,
-    "error" => :error
+    "error" => :error,
+    "cancel" => :cancel
   }
 
   @default_scenario :normal
@@ -368,6 +370,7 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
       :long_turn -> handle_prompt_long_turn(id, session_id, state)
       :callback -> handle_prompt_callback(id, session_id, state)
       :error -> handle_prompt_error(id, session_id, state)
+      :cancel -> handle_prompt_cancel(id, session_id, state)
     end
   end
 
@@ -522,6 +525,68 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
     state = %{state | pending_prompt_id: id, pending_session_id: session_id}
 
     {actions, state}
+  end
+
+  # Cancel: emit one chunk, then block reading stdin until we observe a
+  # `session/cancel` notification carrying our session_id. On cancel,
+  # emit a normalized turn_end and resolve the prompt with
+  # stopReason: "cancelled". This proves end-to-end that the client
+  # actually delivered the cancel notification (kiro-1rd).
+  defp handle_prompt_cancel(id, session_id, state) do
+    chunk =
+      notify("session/update", %{
+        "sessionId" => session_id,
+        "update" => %{
+          "sessionUpdate" => "agent_message_chunk",
+          "content" => [%{"type" => "text", "text" => "working..."}]
+        }
+      })
+
+    write(chunk)
+
+    case wait_for_cancel(session_id) do
+      :ok ->
+        actions = [
+          notify("session/update", %{
+            "sessionId" => session_id,
+            "update" => %{"sessionUpdate" => "turn_end", "reason" => "cancelled"}
+          }),
+          success_response(id, %{"stopReason" => "cancelled"})
+        ]
+
+        {actions, state}
+
+      :eof ->
+        # Stream closed before cancel arrived — reply with end_turn so the
+        # caller doesn't hang forever.
+        {[success_response(id, %{"stopReason" => "end_turn"})], state}
+    end
+  end
+
+  # Block reading stdin until a `session/cancel` for `expected_session_id`
+  # arrives. Other inbound messages are silently consumed (this scenario
+  # exists to prove cancel delivery, not to handle other traffic).
+  defp wait_for_cancel(expected_session_id) do
+    case IO.read(:stdio, :line) do
+      :eof ->
+        :eof
+
+      {:error, _} ->
+        :eof
+
+      data when is_binary(data) ->
+        case decode(data) do
+          {:ok,
+           %{
+             "method" => "session/cancel",
+             "params" => %{"sessionId" => ^expected_session_id}
+           }} ->
+            :ok
+
+          _other ->
+            wait_for_cancel(expected_session_id)
+        end
+    end
   end
 
   # Error/refusal: the agent refuses to complete the prompt.
