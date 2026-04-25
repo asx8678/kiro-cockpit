@@ -231,10 +231,11 @@ defmodule KiroCockpit.Test.Acp.FakeLifecycleAgent do
       }
     })
 
-    # 3. Wait briefly for the client's response (non-blocking read)
-    #    In a real agent, this would block. For the fake, we just proceed
-    #    after a small delay to allow the client to respond.
-    Process.sleep(100)
+    # 3. Wait for the client's response to our fs/read_text_file request.
+    #    This ensures the session must stay responsive (forwarding the
+    #    client's reply back through the port) while a prompt is in flight,
+    #    which is the deadlock-avoidance guarantee under test.
+    wait_for_response(@fs_read_id)
 
     # 4. Respond to the original prompt request
     write(%{
@@ -265,6 +266,35 @@ defmodule KiroCockpit.Test.Acp.FakeLifecycleAgent do
     })
 
     :ok
+  end
+
+  # -- Response waiting (deadlock regression) -------------------------------
+
+  # Reads stdin until a JSON-RPC response with the expected id arrives.
+  # This makes the fake agent block the prompt result on the client actually
+  # replying, which exercises the session's deadlock-avoidance guarantee.
+  @spec wait_for_response(integer() | binary()) :: :ok | :eof | :error
+  defp wait_for_response(expected_id) do
+    case IO.read(:stdio, :line) do
+      :eof ->
+        :eof
+
+      {:error, _} ->
+        :error
+
+      data when is_binary(data) ->
+        case decode(data) do
+          {:ok, %{"id" => ^expected_id}} ->
+            :ok
+
+          {:ok, _other_msg} ->
+            # Not our response — keep reading.
+            wait_for_response(expected_id)
+
+          :skip ->
+            wait_for_response(expected_id)
+        end
+    end
   end
 
   # -- IO -------------------------------------------------------------------

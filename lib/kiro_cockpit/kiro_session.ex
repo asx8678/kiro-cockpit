@@ -63,8 +63,16 @@ defmodule KiroCockpit.KiroSession do
 
   # -- Types ----------------------------------------------------------------
 
-  @typedoc "Current lifecycle phase."
-  @type phase :: :uninitialized | :initialized | :session_active
+  @typedoc """
+  Current lifecycle phase.
+
+  The `:transport_closed` phase is entered after the port subprocess exits
+  (clean or abnormal). All lifecycle calls (`initialize/2`, `new_session/3`,
+  `load_session/4`, `prompt/3`) return `{:error, :transport_closed}` in this
+  phase. The session remains alive so `state/1` still works and the subscriber
+  can inspect the final state, but no further ACP operations are possible.
+  """
+  @type phase :: :uninitialized | :initialized | :session_active | :transport_closed
 
   @typedoc """
   Summary of session state returned by `state/1`.
@@ -325,6 +333,34 @@ defmodule KiroCockpit.KiroSession do
     end
   end
 
+  # -- Transport-closed guard -----------------------------------------------
+
+  # After the port subprocess exits, the session transitions to
+  # `:transport_closed`. All lifecycle calls in this phase return
+  # `{:error, :transport_closed}` instead of crashing on `nil` port_process.
+  # The session remains alive so `state/1` still works.
+
+  @impl GenServer
+  def handle_call({:initialize, _opts}, _from, %{phase: :transport_closed} = state) do
+    {:reply, {:error, :transport_closed}, state}
+  end
+
+  def handle_call({:new_session, _cwd, _opts}, _from, %{phase: :transport_closed} = state) do
+    {:reply, {:error, :transport_closed}, state}
+  end
+
+  def handle_call(
+        {:load_session, _session_id, _cwd, _opts},
+        _from,
+        %{phase: :transport_closed} = state
+      ) do
+    {:reply, {:error, :transport_closed}, state}
+  end
+
+  def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, %{phase: :transport_closed} = state) do
+    {:reply, {:error, :transport_closed}, state}
+  end
+
   # -- initialize -----------------------------------------------------------
 
   @impl GenServer
@@ -571,7 +607,7 @@ defmodule KiroCockpit.KiroSession do
   @impl GenServer
   def handle_info({:acp_request, port_pid, msg}, %{port_process: port_pid} = state) do
     send(state.subscriber, {:acp_request, self(), msg})
-    persist_inbound(state, Map.put(msg, :message_type, "request"))
+    persist_inbound(state, msg)
     {:noreply, state}
   end
 
@@ -589,7 +625,7 @@ defmodule KiroCockpit.KiroSession do
     state = reply_pending_prompt(state, {:error, {:port_exited, status}})
     send(state.subscriber, {:acp_exit, self(), status})
 
-    {:noreply, %{state | phase: :uninitialized, port_process: nil, port_ref: nil}}
+    {:noreply, %{state | phase: :transport_closed, port_process: nil, port_ref: nil}}
   end
 
   # Prompt task completed successfully
@@ -621,7 +657,7 @@ defmodule KiroCockpit.KiroSession do
     state = reply_pending_prompt(state, {:error, {:port_exited, reason}})
     send(state.subscriber, {:acp_exit, self(), reason})
 
-    {:noreply, %{state | phase: :uninitialized, port_process: nil, port_ref: nil}}
+    {:noreply, %{state | phase: :transport_closed, port_process: nil, port_ref: nil}}
   end
 
   # Subscriber died
@@ -804,10 +840,29 @@ defmodule KiroCockpit.KiroSession do
     :ok
   end
 
-  # Inbound notifications: reconstruct a JSON-RPC notification envelope.
+  # Inbound request: reconstruct a JSON-RPC request envelope (with id)
+  # so EventStore classifies it as "request" and preserves rpc_id.
   @spec persist_inbound(t(), map()) :: :ok
   defp persist_inbound(%{persist_messages: false}, _msg), do: :ok
 
+  defp persist_inbound(state, %{id: id, method: method, params: params})
+       when not is_nil(id) do
+    payload = %{"jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params}
+
+    try do
+      EventStore.record_acp_message("agent_to_client", payload, session_id: state.session_id)
+    rescue
+      e ->
+        Logger.warning(fn ->
+          "KiroSession failed to persist inbound ACP request" <>
+            " (#{method}, id=#{inspect(id)}): #{Exception.message(e)}"
+        end)
+    end
+
+    :ok
+  end
+
+  # Inbound notifications: reconstruct a JSON-RPC notification envelope (no id).
   defp persist_inbound(state, %{method: method, params: params}) do
     payload = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
 
@@ -816,7 +871,7 @@ defmodule KiroCockpit.KiroSession do
     rescue
       e ->
         Logger.warning(fn ->
-          "KiroSession failed to persist inbound ACP message" <>
+          "KiroSession failed to persist inbound ACP notification" <>
             " (#{method}): #{Exception.message(e)}"
         end)
     end

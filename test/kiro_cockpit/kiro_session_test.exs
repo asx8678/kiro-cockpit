@@ -579,7 +579,7 @@ defmodule KiroCockpit.KiroSessionTest do
   # -- Port exit handling ---------------------------------------------------
 
   describe "port exit" do
-    test "clean exit transitions to :uninitialized and forwards to subscriber" do
+    test "clean exit transitions to :transport_closed and forwards to subscriber" do
       true_path = System.find_executable("true") || flunk("`true` not on PATH")
 
       {:ok, session} =
@@ -597,7 +597,62 @@ defmodule KiroCockpit.KiroSessionTest do
       assert_receive {:acp_exit, ^session, 0}, 3_000
 
       state = KiroSession.state(session)
-      assert state.phase == :uninitialized
+      assert state.phase == :transport_closed
+    end
+
+    test "lifecycle calls after port exit return {:error, :transport_closed} instead of crashing" do
+      # Regression: after acp_exit, calling initialize/2 must not crash
+      # via GenServer.call(nil, ...) — it should return a clean error.
+      true_path = System.find_executable("true") || flunk("`true` not on PATH")
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: true_path,
+          args: [],
+          subscriber: self(),
+          persist_messages: false
+        )
+
+      on_exit(fn -> safe_stop(session) end)
+
+      # Wait for the port to exit
+      assert_receive {:acp_exit, ^session, 0}, 3_000
+
+      # All lifecycle calls must return {:error, :transport_closed}, not crash
+      assert {:error, :transport_closed} = KiroSession.initialize(session)
+      assert {:error, :transport_closed} = KiroSession.new_session(session, "/tmp")
+      assert {:error, :transport_closed} = KiroSession.load_session(session, "sess_x", "/tmp")
+      assert {:error, :transport_closed} = KiroSession.prompt(session, "hello")
+    end
+
+    test "non-lifecycle calls after port exit still work" do
+      true_path = System.find_executable("true") || flunk("`true` not on PATH")
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: true_path,
+          args: [],
+          subscriber: self(),
+          persist_messages: false
+        )
+
+      on_exit(fn -> safe_stop(session) end)
+
+      assert_receive {:acp_exit, ^session, 0}, 3_000
+
+      # state/1 should still work — the session stays alive for introspection
+      state = KiroSession.state(session)
+      assert state.phase == :transport_closed
+
+      # respond/3 should return {:error, :transport_closed} cleanly
+      assert {:error, :transport_closed} = KiroSession.respond(session, 1, %{})
+
+      # respond_error/4 should return {:error, :transport_closed} cleanly
+      assert {:error, :transport_closed} =
+               KiroSession.respond_error(session, 1, -32_000, "err", nil)
+
+      # notify/3 should not crash (it's a cast, returns :ok immediately)
+      :ok = KiroSession.notify(session, "session/cancel", %{"sessionId" => "x"})
     end
   end
 
