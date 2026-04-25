@@ -117,6 +117,45 @@ defmodule KiroCockpit.TelemetryTest do
 
       assert T.filter_metadata(input) == [session_id: "s-1", plan_id: "p-1"]
     end
+
+    test "drops non-atom keys from a map without raising" do
+      # Common when an upstream caller hands us a JSON-decoded body
+      # verbatim. We must filter, not crash. (plan2.md §25.3 R8)
+      input = %{
+        "secret" => "sk-leak",
+        "session_id" => "not-the-atom-key",
+        :session_id => "s-1",
+        :plan_id => "p-1",
+        1 => :weird,
+        {:tuple, :key} => :also_weird
+      }
+
+      filtered = T.filter_metadata(input)
+
+      assert filtered == %{session_id: "s-1", plan_id: "p-1"}
+      refute Map.has_key?(filtered, "secret")
+      refute Map.has_key?(filtered, "session_id")
+      refute Map.has_key?(filtered, 1)
+    end
+
+    test "drops non-atom-keyed pairs from a list without raising" do
+      input = [
+        {:session_id, "s-1"},
+        {"secret", "sk-leak"},
+        {1, :weird},
+        {:plan_id, "p-1"}
+      ]
+
+      assert T.filter_metadata(input) == [session_id: "s-1", plan_id: "p-1"]
+    end
+
+    test "tolerates non-tuple junk elements in a list" do
+      # Defensive: a caller passing a plain list of atoms where a
+      # keyword list was expected must not crash the telemetry path.
+      input = [:foo, :bar, {:session_id, "s-1"}, "naked-string", 42]
+
+      assert T.filter_metadata(input) == [session_id: "s-1"]
+    end
   end
 
   describe "execute/3" do
@@ -250,6 +289,106 @@ defmodule KiroCockpit.TelemetryTest do
 
         assert Keyword.get(meta, :session_id) == "s-1"
         refute Keyword.has_key?(meta, :secret)
+      after
+        Logger.reset_metadata(previous)
+      end
+    end
+
+    test "replaces existing Logger metadata, wiping unsafe preexisting keys" do
+      # Core Shepherd ask: `Logger.metadata/1` *merges*, so unsafe keys
+      # set by earlier code (a stray `:secret`, a leaked `:user_input`)
+      # would survive a naive setter. `put_metadata/1` must reset.
+      previous = Logger.metadata()
+
+      try do
+        # Simulate an earlier handler that polluted process metadata
+        # with non-canonical keys.
+        Logger.reset_metadata(
+          secret: "sk-EARLIER-LEAK",
+          user_input: "please ignore",
+          request_id: "req-old"
+        )
+
+        T.put_metadata(session_id: "s-1", plan_id: "p-1")
+
+        meta = Logger.metadata()
+        assert Keyword.get(meta, :session_id) == "s-1"
+        assert Keyword.get(meta, :plan_id) == "p-1"
+
+        # Unsafe preexisting keys must be GONE — not merged through.
+        refute Keyword.has_key?(meta, :secret)
+        refute Keyword.has_key?(meta, :user_input)
+
+        # Even *canonical* preexisting keys are wiped, since the
+        # contract is replace, not merge. Callers that want layering
+        # use `with_metadata/2`.
+        refute Keyword.has_key?(meta, :request_id)
+      after
+        Logger.reset_metadata(previous)
+      end
+    end
+
+    test "drops non-atom keys from a map without raising (FunctionClauseError regression)" do
+      # Regression: a previous implementation used a single-clause
+      # anon fn `fn {k, v} when is_atom(k) -> {k, v} end` inside
+      # `Enum.map/2`, which raised `FunctionClauseError` on inputs like
+      # `%{"secret" => "leak"}`. This must not happen — we filter, we
+      # do not crash.
+      previous = Logger.metadata()
+
+      try do
+        Logger.reset_metadata([])
+
+        # No assert_raise wrapper — this call is the test. If it raises,
+        # the test fails.
+        :ok = T.put_metadata(%{"secret" => "leak", :session_id => "s-1"})
+
+        meta = Logger.metadata()
+        assert Keyword.get(meta, :session_id) == "s-1"
+        refute Keyword.has_key?(meta, :secret)
+        # Logger.metadata/0 is always atom-keyed, so a string key cannot
+        # have leaked through; we already proved that by reaching this
+        # line at all.
+      after
+        Logger.reset_metadata(previous)
+      end
+    end
+
+    test "drops non-atom-keyed and non-tuple list elements without raising" do
+      previous = Logger.metadata()
+
+      try do
+        Logger.reset_metadata([])
+
+        # Mixed bag: canonical pair, string-keyed pair, integer-keyed
+        # pair, and naked atoms/strings.
+        :ok =
+          T.put_metadata([
+            {:session_id, "s-1"},
+            {"secret", "sk-leak"},
+            {1, :weird},
+            :stray_atom,
+            "stray-string"
+          ])
+
+        meta = Logger.metadata()
+        assert Keyword.get(meta, :session_id) == "s-1"
+        refute Keyword.has_key?(meta, :secret)
+        refute Keyword.has_key?(meta, :stray_atom)
+      after
+        Logger.reset_metadata(previous)
+      end
+    end
+
+    test "empty input clears Logger metadata to a known-clean baseline" do
+      previous = Logger.metadata()
+
+      try do
+        Logger.reset_metadata(secret: "sk-EARLIER", request_id: "req-old")
+
+        :ok = T.put_metadata([])
+
+        assert Logger.metadata() == []
       after
         Logger.reset_metadata(previous)
       end

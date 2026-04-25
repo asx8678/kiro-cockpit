@@ -10,9 +10,17 @@ defmodule KiroCockpitWeb.Telemetry do
   session, and event-store contexts (`plan2.md` §25.3 R8). They define
   counter/summary shapes only — no events fire until those features land,
   at which point the metrics begin populating without further wiring.
+
+  Every domain `event_name:` is built through `KiroCockpit.Telemetry.event/3`
+  rather than written as a literal list. This routes the metric definition
+  through the closed-set validator, so a typo or near-duplicate (e.g.
+  `:tool_dispatch` vs `:tool_run_dispatch`) raises at supervisor init
+  instead of silently producing a metric that never receives events.
   """
   use Supervisor
   import Telemetry.Metrics
+
+  alias KiroCockpit.Telemetry, as: KCT
 
   def start_link(arg) do
     Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
@@ -66,56 +74,56 @@ defmodule KiroCockpitWeb.Telemetry do
       # ACP context (seed) — prompt/turn/update lifecycle for the Kiro
       # ACP client. Populated once `KiroCockpit.ACP.*` modules emit events.
       counter("kiro_cockpit.acp.prompt.stop.count",
-        event_name: [:kiro_cockpit, :acp, :prompt, :stop]
+        event_name: KCT.event(:acp, :prompt, :stop)
       ),
       summary("kiro_cockpit.acp.prompt.stop.duration",
-        event_name: [:kiro_cockpit, :acp, :prompt, :stop],
+        event_name: KCT.event(:acp, :prompt, :stop),
         measurement: :duration,
         unit: {:native, :millisecond}
       ),
       counter("kiro_cockpit.acp.prompt.exception.count",
-        event_name: [:kiro_cockpit, :acp, :prompt, :exception]
+        event_name: KCT.event(:acp, :prompt, :exception)
       ),
       counter("kiro_cockpit.acp.turn.stop.count",
-        event_name: [:kiro_cockpit, :acp, :turn, :stop]
+        event_name: KCT.event(:acp, :turn, :stop)
       ),
       summary("kiro_cockpit.acp.turn.stop.duration",
-        event_name: [:kiro_cockpit, :acp, :turn, :stop],
+        event_name: KCT.event(:acp, :turn, :stop),
         measurement: :duration,
         unit: {:native, :millisecond}
       ),
       counter("kiro_cockpit.acp.update.stop.count",
-        event_name: [:kiro_cockpit, :acp, :update, :stop]
+        event_name: KCT.event(:acp, :update, :stop)
       ),
       counter("kiro_cockpit.acp.callback.stop.count",
-        event_name: [:kiro_cockpit, :acp, :callback, :stop]
+        event_name: KCT.event(:acp, :callback, :stop)
       ),
 
       # Session context (seed) — cockpit session lifecycle.
       counter("kiro_cockpit.session.create.stop.count",
-        event_name: [:kiro_cockpit, :session, :create, :stop]
+        event_name: KCT.event(:session, :create, :stop)
       ),
       counter("kiro_cockpit.session.resume.stop.count",
-        event_name: [:kiro_cockpit, :session, :resume, :stop]
+        event_name: KCT.event(:session, :resume, :stop)
       ),
       counter("kiro_cockpit.session.archive.stop.count",
-        event_name: [:kiro_cockpit, :session, :archive, :stop]
+        event_name: KCT.event(:session, :archive, :stop)
       ),
 
       # EventStore context (seed) — raw ACP event persistence.
       counter("kiro_cockpit.event_store.append.stop.count",
-        event_name: [:kiro_cockpit, :event_store, :append, :stop]
+        event_name: KCT.event(:event_store, :append, :stop)
       ),
       summary("kiro_cockpit.event_store.append.stop.duration",
-        event_name: [:kiro_cockpit, :event_store, :append, :stop],
+        event_name: KCT.event(:event_store, :append, :stop),
         measurement: :duration,
         unit: {:native, :millisecond}
       ),
       counter("kiro_cockpit.event_store.read.stop.count",
-        event_name: [:kiro_cockpit, :event_store, :read, :stop]
+        event_name: KCT.event(:event_store, :read, :stop)
       ),
       summary("kiro_cockpit.event_store.read.stop.duration",
-        event_name: [:kiro_cockpit, :event_store, :read, :stop],
+        event_name: KCT.event(:event_store, :read, :stop),
         measurement: :duration,
         unit: {:native, :millisecond}
       ),

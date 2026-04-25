@@ -233,37 +233,66 @@ defmodule KiroCockpit.Telemetry do
   @doc """
   Filters arbitrary metadata down to the canonical correlation keys.
 
-  Accepts either a map or a keyword list and preserves the input shape.
-  Anything outside `metadata_keys/0` is dropped — the goal is to keep
-  free-form payloads (user input, raw structs, secrets) out of telemetry
-  meta and Logger metadata. The full redactor (plan2.md §22.6 / §25.6)
-  will plug in here when it lands.
+  Accepts either a map or a list and preserves the input shape. The
+  following are dropped silently, never raised on:
+
+    * keys outside `metadata_keys/0` (e.g. `:secret`, `:user_input`)
+    * non-atom keys (e.g. `\"secret\"`, `1`) — common when an upstream
+      caller hands us a JSON-decoded map verbatim
+    * list elements that are not `{atom, value}` 2-tuples — defensive
+      against a caller passing a plain list where a keyword was expected
+
+  The goal is to keep free-form payloads (user input, raw structs,
+  secrets, decoded HTTP bodies) out of telemetry meta and Logger
+  metadata regardless of shape. The full redactor (plan2.md §22.6 /
+  §25.6) will plug in here when it lands.
   """
   @spec filter_metadata(map()) :: map()
-  @spec filter_metadata(keyword()) :: keyword()
+  @spec filter_metadata(keyword() | list()) :: keyword()
   def filter_metadata(meta) when is_map(meta) do
-    Map.take(meta, @metadata_keys)
+    meta
+    |> Enum.filter(&canonical_pair?/1)
+    |> Map.new()
   end
 
   def filter_metadata(meta) when is_list(meta) do
-    Keyword.take(meta, @metadata_keys)
+    Enum.filter(meta, &canonical_pair?/1)
   end
 
-  @doc """
-  Sets Logger metadata to `meta`, dropping any keys outside the canonical
-  correlation set.
+  # Single source of truth for "is this a canonical correlation pair?".
+  # Non-atom keys and non-tuple list elements fall through to the
+  # catch-all clause and return false — never raises.
+  defp canonical_pair?({k, _v}) when is_atom(k), do: k in @metadata_keys
+  defp canonical_pair?(_), do: false
 
-  Unlike `Logger.metadata/1`, this never lets a stray `:user_input` or
-  `:secret` field smuggle itself into log output. Use it at the entry
-  points (Plug, ACP message handler, LiveView mount) once those features
-  land.
+  @doc """
+  Replaces Logger metadata with `meta`, dropping any keys outside the
+  canonical correlation set.
+
+  **Reset, not merge.** `Logger.metadata/1` *merges* a keyword list
+  into the current process metadata, so any unsafe key already set
+  by earlier code (a stray `:user_input` from a previous handler, a
+  leaked `:secret` from a misconfigured library) survives. This
+  function uses `Logger.reset_metadata/1`, which clears the process
+  metadata first and then applies the filtered keyword — giving you
+  a known-clean baseline of canonical correlation IDs and nothing
+  else. Use it at entry points (Plug, ACP message handler, LiveView
+  mount) where you own the full identity of the request.
+
+  Non-canonical and non-atom keys (e.g. `%{\"secret\" => \"leak\"}`,
+  `[{:debug_payload, _}, {1, :weird}]`) are filtered out silently —
+  this function never raises on input shape, only on input *type*
+  (it accepts only maps and lists).
+
+  Need merge semantics for scoped layering inside a unit of work?
+  Use `with_metadata/2`.
   """
   @spec put_metadata(keyword() | map()) :: :ok
   def put_metadata(meta) when is_list(meta) or is_map(meta) do
     meta
-    |> to_keyword()
     |> filter_metadata()
-    |> Logger.metadata()
+    |> to_keyword()
+    |> Logger.reset_metadata()
   end
 
   @doc """
@@ -278,7 +307,7 @@ defmodule KiroCockpit.Telemetry do
   @spec with_metadata(keyword() | map(), (-> result)) :: result when result: var
   def with_metadata(meta, fun) when (is_list(meta) or is_map(meta)) and is_function(fun, 0) do
     previous = Logger.metadata()
-    additions = meta |> to_keyword() |> filter_metadata()
+    additions = meta |> filter_metadata() |> to_keyword()
 
     try do
       Logger.metadata(additions)
@@ -288,11 +317,10 @@ defmodule KiroCockpit.Telemetry do
     end
   end
 
-  # Coerce maps to keyword lists for Logger; Logger.metadata/1 wants
-  # keyword lists, but call sites are friendlier when both shapes work.
+  # Coerce already-filtered metadata to a keyword list for the Logger
+  # API (which wants `[{atom, value}]`). Safe to call only *after*
+  # `filter_metadata/1`, which guarantees every key is an atom in
+  # `@metadata_keys` and every list element is a 2-tuple.
   defp to_keyword(meta) when is_list(meta), do: meta
-
-  defp to_keyword(meta) when is_map(meta) do
-    Enum.map(meta, fn {k, v} when is_atom(k) -> {k, v} end)
-  end
+  defp to_keyword(meta) when is_map(meta), do: Map.to_list(meta)
 end
