@@ -601,6 +601,17 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
                |> Task.await(5_000)
 
       assert KiroSession.state(session).turn_id == 2
+
+      # Drain the second prompt's trailing `chunk → turn_end` before the
+      # test exits. `Task.await` returns at the prompt RPC result, which
+      # in `long_turn` lands BEFORE the final chunk and `turn_end`. If we
+      # let `on_exit` stop the session here, the fake subprocess is still
+      # mid-write to its stdout pipe and crashes with `:epipe` after
+      # ExUnit has already declared the test done — leaking a late error
+      # to the next test's output. (Same drain pattern as the
+      # "multiple prompts continue the same monotonic sequence" test.)
+      events_b = collect_until_kind(session, [:turn_end], 2_000)
+      assert List.last(events_b).kind == :turn_end
     end
 
     test ":prompt_in_progress takes precedence over :turn_in_progress" do
