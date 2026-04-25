@@ -198,6 +198,19 @@ defmodule KiroCockpit.NanoPlanner.PlanSchema do
   @spec optional_keys() :: [atom()]
   def optional_keys, do: @optional_keys
 
+  @doc """
+  Formats validation errors into a concise human-readable string.
+  """
+  @spec format_validation_errors([validation_error()]) :: String.t()
+  def format_validation_errors(reasons) when is_list(reasons) do
+    reasons
+    |> Enum.map_join("; ", fn
+      {:missing_keys, keys} -> "missing required keys: #{inspect(keys)}"
+      {:invalid_phases, msg} -> "invalid phases: #{msg}"
+      {:invalid_permissions, perms} -> "invalid permissions: #{inspect(perms)}"
+    end)
+  end
+
   # ── Validation ──────────────────────────────────────────────────────
 
   defp check_required_keys(plan) do
@@ -408,14 +421,6 @@ defmodule KiroCockpit.NanoPlanner.PlanSchema do
   end
 
   defp format_errors(reasons) do
-    details =
-      reasons
-      |> Enum.map_join("; ", fn
-        {:missing_keys, keys} -> "missing required keys: #{inspect(keys)}"
-        {:invalid_phases, msg} -> "invalid phases: #{msg}"
-        {:invalid_permissions, perms} -> "invalid permissions: #{inspect(perms)}"
-      end)
-
-    "NanoPlanner output validation failed: #{details}"
+    "NanoPlanner output validation failed: #{format_validation_errors(reasons)}"
   end
 end

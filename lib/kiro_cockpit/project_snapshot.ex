@@ -23,8 +23,8 @@ defmodule KiroCockpit.ProjectSnapshot do
           root_tree: String.t(),
           detected_stack: [String.t()],
           config_excerpts: %{String.t() => String.t()},
-          existing_plans: String.t(),
-          session_summary: String.t(),
+          existing_plans: String.t() | nil,
+          session_summary: String.t() | nil,
           hash: String.t(),
           total_chars: non_neg_integer()
         }
