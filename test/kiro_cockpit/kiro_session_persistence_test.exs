@@ -1,7 +1,8 @@
 defmodule KiroCockpit.KiroSessionPersistenceTest do
   @moduledoc """
   Integration tests verifying that KiroSession correctly persists inbound
-  and outbound ACP messages to EventStore when `persist_messages: true`.
+  and outbound ACP messages to EventStore when `persist_messages: true,
+          auto_callbacks: false`.
 
   These tests exercise the full session lifecycle against a real subprocess
   (FakeLifecycleAgent for inbound flows; FakeAgent in `cancel` scenario
@@ -40,7 +41,8 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
           executable: elixir,
           args: args,
           subscriber: self(),
-          persist_messages: true
+          persist_messages: true,
+          auto_callbacks: false
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -146,7 +148,8 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
           args: cancel_args,
           env: [{"FAKE_ACP_SCENARIO", "cancel"}],
           subscriber: self(),
-          persist_messages: true
+          persist_messages: true,
+          auto_callbacks: false
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
