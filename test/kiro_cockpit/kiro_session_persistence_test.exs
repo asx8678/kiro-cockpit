@@ -1,19 +1,22 @@
 defmodule KiroCockpit.KiroSessionPersistenceTest do
   @moduledoc """
   Integration tests verifying that KiroSession correctly persists inbound
-  ACP messages to EventStore when `persist_messages: true`.
+  and outbound ACP messages to EventStore when `persist_messages: true`.
 
   These tests exercise the full session lifecycle against a real subprocess
-  (FakeLifecycleAgent) and then query EventStore to verify message_type and
-  rpc_id are recorded correctly.
+  (FakeLifecycleAgent for inbound flows; FakeAgent in `cancel` scenario
+  for outbound notification persistence) and then query EventStore to
+  verify `message_type` and `rpc_id` are recorded correctly.
   """
 
   use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.EventStore
   alias KiroCockpit.KiroSession
+  alias KiroCockpit.KiroSession.StreamEvent
 
   @fake_agent_entry ~s|KiroCockpit.Test.Acp.FakeLifecycleAgent.main()|
+  @fake_acp_agent_entry ~s|KiroCockpit.Test.Acp.FakeAgent.main()|
 
   setup do
     elixir_path = System.find_executable("elixir") || flunk("elixir not on PATH")
@@ -23,7 +26,11 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
 
     args = Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++ ["-e", @fake_agent_entry]
 
-    {:ok, %{elixir: elixir_path, args: args}}
+    cancel_args =
+      Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+        ["-e", @fake_acp_agent_entry]
+
+    {:ok, %{elixir: elixir_path, args: args, cancel_args: cancel_args}}
   end
 
   describe "inbound request persistence" do
@@ -126,6 +133,78 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
       assert payload["jsonrpc"] == "2.0"
       assert Map.has_key?(payload, "method")
       refute Map.has_key?(payload, "id")
+    end
+  end
+
+  # -- Cancel notification persistence (kiro-1rd Shepherd MUST fix) --------
+
+  describe "outbound cancel persistence" do
+    setup %{elixir: elixir, cancel_args: cancel_args} do
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: cancel_args,
+          env: [{"FAKE_ACP_SCENARIO", "cancel"}],
+          subscriber: self(),
+          persist_messages: true
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+
+      cwd = File.cwd!()
+      assert {:ok, result} = KiroSession.new_session(session, cwd)
+      session_id = result["sessionId"]
+
+      on_exit(fn -> safe_stop(session) end)
+      {:ok, %{session: session, session_id: session_id}}
+    end
+
+    test "persisted session/cancel is message_type \"notification\" with nil rpc_id",
+         %{session: session, session_id: session_id} do
+      # Issue a prompt; the cancel scenario emits one chunk and then
+      # blocks reading stdin until session/cancel arrives.
+      task = Task.async(fn -> KiroSession.prompt(session, "long-running") end)
+
+      # Wait for the initial chunk so the agent is in its blocking read.
+      assert_receive {:kiro_stream_event, ^session, %StreamEvent{kind: :agent_message_chunk}},
+                     2_000
+
+      # Trigger the cancel — this is what we're persisting.
+      assert :ok = KiroSession.cancel(session)
+
+      # Let the prompt complete so the session shuts down cleanly.
+      assert {:ok, %{"stopReason" => "cancelled"}} = Task.await(task, 5_000)
+
+      # Query the persisted outbound cancel.
+      cancels =
+        EventStore.list_acp_messages(session_id,
+          direction: "client_to_agent",
+          method: "session/cancel"
+        )
+
+      assert length(cancels) == 1, "expected exactly one persisted cancel"
+      cancel = hd(cancels)
+
+      # The MUST fix: notifications must be persisted as notifications,
+      # not as requests with a synthetic rpc_id.
+      assert cancel.message_type == "notification",
+             "session/cancel must be persisted as notification (got: #{inspect(cancel.message_type)})"
+
+      assert cancel.rpc_id == nil,
+             "notification rpc_id must be nil (got: #{inspect(cancel.rpc_id)})"
+
+      assert cancel.method == "session/cancel"
+      assert cancel.direction == "client_to_agent"
+
+      # The persisted envelope itself must be a JSON-RPC notification
+      # (no `id`).
+      payload = cancel.raw_payload
+      assert payload["jsonrpc"] == "2.0"
+      assert payload["method"] == "session/cancel"
+      assert payload["params"]["sessionId"] == session_id
+
+      refute Map.has_key?(payload, "id"),
+             "notification envelope must not have an `id` (got: #{inspect(payload)})"
     end
   end
 

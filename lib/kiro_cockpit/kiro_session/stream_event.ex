@@ -24,8 +24,11 @@ defmodule KiroCockpit.KiroSession.StreamEvent do
       `:agent_message_chunk | :agent_thought_chunk | :user_message_chunk |
        :tool_call | :tool_call_update | :plan | :current_mode_update |
        :config_option_update | :turn_end | :unknown`.
-    * `:type` — original `sessionUpdate` string from the wire payload, or
-      `nil` if the notification did not carry one.
+    * `:type` — original `sessionUpdate` **string** from the wire payload,
+      or `nil` if the notification did not carry one OR if the value was
+      malformed (non-string). Malformed payloads are still preserved
+      verbatim in `:raw`; we just don't pollute the public string-typed
+      field with junk values.
     * `:session_id` — the ACP `sessionId` extracted from `params`.
     * `:sequence` — monotonically increasing integer assigned by the owning
       `KiroSession` GenServer at the moment of receipt.
@@ -122,9 +125,13 @@ defmodule KiroCockpit.KiroSession.StreamEvent do
     {Map.get(@known, type, :unknown), type}
   end
 
-  defp classify(%{"update" => %{"sessionUpdate" => type}}) do
-    # sessionUpdate present but not a string — preserve as raw, mark unknown.
-    {:unknown, type}
+  defp classify(%{"update" => %{"sessionUpdate" => _malformed}}) do
+    # `sessionUpdate` present but not a string. We mark `:unknown` and
+    # store `nil` in the public `:type` field to honour the
+    # `String.t() | nil` contract; the malformed value is still
+    # preserved verbatim under `:raw["update"]["sessionUpdate"]` for
+    # debugging or replay.
+    {:unknown, nil}
   end
 
   defp classify(_params), do: {:unknown, nil}

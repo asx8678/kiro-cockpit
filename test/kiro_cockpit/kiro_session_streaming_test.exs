@@ -44,9 +44,10 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
     {:ok, sn_result} = KiroSession.new_session(session, File.cwd!())
     session_id = sn_result["sessionId"]
 
-    # Drain the post-session/new notification + its normalized stream event.
-    _ = drain_one_acp_notification(session)
-    _ = drain_one_stream_event(session)
+    # NOTE: FakeAgent's session/new does NOT emit a session/update
+    # notification (unlike FakeLifecycleAgent). Don't bother draining
+    # mailbox slots that won't be filled — that was costing us 2-4s per
+    # test setup against a non-existent drain (Shepherd SHOULD fix).
 
     %{session: session, session_id: session_id}
   end
@@ -57,36 +58,54 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
     :exit, _ -> :ok
   end
 
-  defp drain_one_acp_notification(session) do
-    receive do
-      {:acp_notification, ^session, _msg} -> :ok
-    after
-      2_000 -> :timeout
-    end
+  # -- Stream event collection helpers --------------------------------------
+  #
+  # All collectors are designed to terminate as soon as the agent goes
+  # quiet rather than blocking the full timeout. The deterministic
+  # FakeAgent finishes within tens of ms on a hot test box; sleeping for
+  # 1.5s per test was pure waste.
+
+  # Drain stream events until the mailbox is quiet for `quiet_window` ms
+  # (default 80). Bounded by `max_wait` (default 2_000).
+  defp drain_stream_events(session, opts \\ []) do
+    quiet_window = Keyword.get(opts, :quiet_window, 80)
+    max_wait = Keyword.get(opts, :max_wait, 2_000)
+    deadline = System.monotonic_time(:millisecond) + max_wait
+    do_drain_stream(session, deadline, quiet_window, [])
   end
 
-  defp drain_one_stream_event(session) do
-    receive do
-      {:kiro_stream_event, ^session, %StreamEvent{}} -> :ok
-    after
-      2_000 -> :timeout
-    end
-  end
-
-  # Collect all stream events for `session` for `timeout` ms, in arrival order.
-  defp collect_stream_events(session, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_collect_stream(session, deadline, [])
-  end
-
-  defp do_collect_stream(session, deadline, acc) do
+  defp do_drain_stream(session, deadline, quiet_window, acc) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+    wait = min(remaining, quiet_window)
 
     receive do
       {:kiro_stream_event, ^session, %StreamEvent{} = ev} ->
-        do_collect_stream(session, deadline, [ev | acc])
+        do_drain_stream(session, deadline, quiet_window, [ev | acc])
     after
-      remaining -> Enum.reverse(acc)
+      wait -> Enum.reverse(acc)
+    end
+  end
+
+  # Collect stream events up to and including the first event whose `kind`
+  # is in `terminal_kinds`. Returns the accumulated events in arrival
+  # order. If `timeout` elapses first, returns whatever arrived.
+  defp collect_until_kind(session, terminal_kinds, timeout)
+       when is_list(terminal_kinds) do
+    do_collect_until_kind(session, terminal_kinds, timeout, [])
+  end
+
+  defp do_collect_until_kind(session, terminal_kinds, timeout, acc) do
+    receive do
+      {:kiro_stream_event, ^session, %StreamEvent{kind: kind} = ev} ->
+        acc = [ev | acc]
+
+        if kind in terminal_kinds do
+          Enum.reverse(acc)
+        else
+          do_collect_until_kind(session, terminal_kinds, timeout, acc)
+        end
+    after
+      timeout -> Enum.reverse(acc)
     end
   end
 
@@ -110,9 +129,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       %{session: session, session_id: sid} = start_session!("normal")
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      events = collect_stream_events(session, 1_500)
-
       assert {:ok, _} = Task.await(task, 5_000)
+      events = drain_stream_events(session)
 
       assert events != []
       for ev <- events, do: assert(ev.session_id == sid)
@@ -122,9 +140,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       %{session: session} = start_session!("normal")
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      events = collect_stream_events(session, 1_500)
-
       assert {:ok, _} = Task.await(task, 5_000)
+      events = drain_stream_events(session)
 
       kinds = Enum.map(events, & &1.kind)
       assert :agent_message_chunk in kinds
@@ -136,7 +153,9 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
       assert {:ok, _} = Task.await(task, 5_000)
-      events = collect_stream_events(session, 1_500)
+      # long_turn scenario emits turn_end as the last event — wait for it
+      # explicitly rather than sleeping for a fixed window.
+      events = collect_until_kind(session, [:turn_end], 2_000)
 
       kinds = Enum.map(events, & &1.kind)
       assert :turn_end in kinds
@@ -149,17 +168,14 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
     test "sequence numbers are strictly monotonic and start from initial state" do
       %{session: session} = start_session!("normal")
 
-      # We've already drained one stream event from session/new (current_mode_update
-      # is NOT emitted by FakeAgent's session/new — but the long_turn / etc. paths
-      # don't either; FakeAgent's session/new returns no notification in scope).
-      # So the first prompt event should start fresh.
+      # FakeAgent's session/new emits no notification, so the stream
+      # sequence cursor starts at 0 here.
       initial_state = KiroSession.state(session)
       start_seq = initial_state.stream_sequence
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      events = collect_stream_events(session, 1_500)
-
       assert {:ok, _} = Task.await(task, 5_000)
+      events = drain_stream_events(session)
 
       assert length(events) >= 3, "expected at least 3 events, got #{inspect(events)}"
 
@@ -174,13 +190,25 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
     end
 
     test "multiple prompts continue the same monotonic sequence" do
-      %{session: session} = start_session!("normal")
+      # Use long_turn so each turn closes with a normalized :turn_end
+      # event, satisfying the active-turn guard before the second prompt
+      # is issued. (Active-turn guard is the kiro-1rd Shepherd MUST fix.)
+      %{session: session} = start_session!("long_turn")
 
-      _ = Task.async(fn -> KiroSession.prompt(session, "first") end) |> Task.await(5_000)
-      events_a = collect_stream_events(session, 800)
+      assert {:ok, _} =
+               Task.async(fn -> KiroSession.prompt(session, "first") end)
+               |> Task.await(5_000)
 
-      _ = Task.async(fn -> KiroSession.prompt(session, "second") end) |> Task.await(5_000)
-      events_b = collect_stream_events(session, 800)
+      events_a = collect_until_kind(session, [:turn_end], 2_000)
+      assert List.last(events_a).kind == :turn_end
+      assert KiroSession.state(session).turn_status == :complete
+
+      assert {:ok, _} =
+               Task.async(fn -> KiroSession.prompt(session, "second") end)
+               |> Task.await(5_000)
+
+      events_b = collect_until_kind(session, [:turn_end], 2_000)
+      assert List.last(events_b).kind == :turn_end
 
       all_seqs = Enum.map(events_a ++ events_b, & &1.sequence)
       assert all_seqs == Enum.sort(all_seqs)
@@ -193,7 +221,7 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
       assert {:ok, _} = Task.await(task, 5_000)
-      events = collect_stream_events(session, 1_500)
+      events = collect_until_kind(session, [:turn_end], 2_000)
 
       # Per FakeAgent long_turn: chunk → (prompt result lands here) → chunk → turn_end
       kinds = Enum.map(events, & &1.kind)
@@ -211,8 +239,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       %{session: session} = start_session!("normal", stream_buffer_limit: 2)
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      _events = collect_stream_events(session, 1_500)
       assert {:ok, _} = Task.await(task, 5_000)
+      _events = drain_stream_events(session)
 
       state = KiroSession.state(session)
       assert state.stream_buffer_limit == 2
@@ -234,10 +262,10 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       assert {:ok, _} = Task.await(task, 5_000)
 
       # Drain stream events; we don't care about their content here.
-      _ = collect_stream_events(session, 800)
+      _ = drain_stream_events(session)
 
       # Collect overflow markers.
-      markers = collect_overflow_markers(session, 200)
+      markers = collect_overflow_markers(session, 100)
 
       assert markers != [], "expected at least one overflow marker"
       assert Enum.all?(markers, &is_integer/1)
@@ -252,8 +280,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       %{session: session} = start_session!("normal")
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      _ = collect_stream_events(session, 1_500)
       assert {:ok, _} = Task.await(task, 5_000)
+      _ = drain_stream_events(session)
 
       state = KiroSession.state(session)
       assert state.stream_dropped_count == 0
@@ -311,15 +339,18 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       # Spawn the prompt; while it's flying the GenServer is :running.
       task = Task.async(fn -> KiroSession.prompt(session, "hi", timeout: :infinity) end)
 
-      # The state is observable while pending — long_turn keeps the prompt
-      # in flight until it emits its events.
-      Process.sleep(50)
+      # Wait for the very first stream event to land — that proves the
+      # prompt RPC has been sent and the agent is mid-turn (no fixed
+      # sleep needed).
+      assert_receive {:kiro_stream_event, ^session, %StreamEvent{}}, 2_000
+
       state = KiroSession.state(session)
       assert state.turn_status in [:running, :complete]
       assert state.turn_id == 1
 
       # Drain everything to completion to keep things tidy.
       _ = Task.await(task, 5_000)
+      _ = drain_stream_events(session)
     end
 
     test "prompt RPC result alone does NOT mark turn :complete (kiro-011 regression)" do
@@ -338,8 +369,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       assert {:ok, %{"stopReason" => "end_turn"}} = Task.await(task, 5_000)
 
       # Drain any in-flight stream events to ensure the GenServer has
-      # processed everything in its mailbox.
-      _ = collect_stream_events(session, 500)
+      # processed everything in its mailbox before we read state.
+      _ = drain_stream_events(session)
 
       state = KiroSession.state(session)
 
@@ -362,8 +393,7 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
       assert {:ok, %{"stopReason" => "end_turn"}} = Task.await(task, 5_000)
 
-      # Drain to ensure turn_end has been processed.
-      events = collect_stream_events(session, 1_500)
+      events = collect_until_kind(session, [:turn_end], 2_000)
       kinds = Enum.map(events, & &1.kind)
       assert :turn_end in kinds, "long_turn scenario must emit turn_end"
 
@@ -416,8 +446,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       # received and acted on session/cancel (it was blocked waiting for it).
       assert {:ok, %{"stopReason" => "cancelled"}} = Task.await(task, 5_000)
 
-      # And turn_end with reason cancelled flows through.
-      events = collect_stream_events(session, 1_500)
+      # turn_end with reason cancelled is the next stream event.
+      events = collect_until_kind(session, [:turn_end], 2_000)
       assert Enum.any?(events, fn e -> e.kind == :turn_end end)
 
       final = KiroSession.state(session)
@@ -472,8 +502,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       %{session: session} = start_session!("normal")
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      _ = collect_stream_events(session, 1_500)
       assert {:ok, _} = Task.await(task, 5_000)
+      _ = drain_stream_events(session)
 
       events = KiroSession.recent_stream_events(session)
       seqs = Enum.map(events, & &1.sequence)
@@ -484,8 +514,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       %{session: session} = start_session!("normal")
 
       task = Task.async(fn -> KiroSession.prompt(session, "hi") end)
-      _ = collect_stream_events(session, 1_500)
       assert {:ok, _} = Task.await(task, 5_000)
+      _ = drain_stream_events(session)
 
       limited = KiroSession.recent_stream_events(session, limit: 1)
       assert length(limited) == 1
@@ -497,6 +527,107 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
     test "returns [] for a session that has received no stream events" do
       %{session: session} = start_session!("normal")
       assert KiroSession.recent_stream_events(session) == []
+    end
+
+    test "rejects invalid :limit with {:error, {:invalid_option, _}} (does not crash)" do
+      # An invalid `:limit` is a caller bug, not a runtime fault. The
+      # GenServer must keep serving — it returns the structured error and
+      # accepts further calls. (Shepherd SHOULD fix.)
+      %{session: session} = start_session!("normal")
+
+      assert {:error, {:invalid_option, {:limit, :nope}}} =
+               KiroSession.recent_stream_events(session, limit: :nope)
+
+      assert {:error, {:invalid_option, {:limit, -1}}} =
+               KiroSession.recent_stream_events(session, limit: -1)
+
+      assert {:error, {:invalid_option, {:limit, "5"}}} =
+               KiroSession.recent_stream_events(session, limit: "5")
+
+      # Still alive and serving valid calls.
+      assert Process.alive?(session)
+      assert KiroSession.recent_stream_events(session) == []
+    end
+  end
+
+  # -- Active-turn prompt guard (kiro-1rd Shepherd MUST fix) ---------------
+
+  describe "active-turn prompt guard" do
+    test "rejects a second prompt while turn_status is :running (no turn_end yet)" do
+      # `normal` scenario sends a prompt RPC result with stopReason
+      # "end_turn" but NEVER emits a turn_end notification. After the
+      # first prompt's RPC returns, `pending_prompt` is cleared but
+      # `turn_status` stays :running. A second prompt issued at this
+      # point MUST be rejected with `{:error, :turn_in_progress}` —
+      # otherwise we'd start a new turn while the previous one is
+      # logically still in flight.
+      %{session: session} = start_session!("normal")
+
+      assert {:ok, %{"stopReason" => "end_turn"}} =
+               Task.async(fn -> KiroSession.prompt(session, "first") end)
+               |> Task.await(5_000)
+
+      # Drain to ensure the GenServer has processed everything; turn_status
+      # is still :running because no turn_end has been emitted.
+      _ = drain_stream_events(session)
+      assert KiroSession.state(session).turn_status == :running
+
+      assert {:error, :turn_in_progress} = KiroSession.prompt(session, "second")
+      assert {:error, :turn_in_progress} = KiroSession.prompt(session, "third")
+
+      # State unchanged — guard is purely declarative.
+      state = KiroSession.state(session)
+      assert state.turn_status == :running
+      assert state.turn_id == 1
+    end
+
+    test "a later prompt proceeds once turn_end has landed (long_turn)" do
+      # `long_turn` emits chunk → prompt result → chunk → turn_end. After
+      # the turn_end stream event arrives, `turn_status` flips to
+      # :complete and the next prompt is allowed.
+      %{session: session} = start_session!("long_turn")
+
+      assert {:ok, _} =
+               Task.async(fn -> KiroSession.prompt(session, "first") end)
+               |> Task.await(5_000)
+
+      events = collect_until_kind(session, [:turn_end], 2_000)
+      assert List.last(events).kind == :turn_end
+      assert KiroSession.state(session).turn_status == :complete
+
+      # Second prompt is allowed now.
+      assert {:ok, _} =
+               Task.async(fn -> KiroSession.prompt(session, "second") end)
+               |> Task.await(5_000)
+
+      assert KiroSession.state(session).turn_id == 2
+    end
+
+    test ":prompt_in_progress takes precedence over :turn_in_progress" do
+      # Sanity check: if there's still a pending RPC in flight, the
+      # GenServer reports `:prompt_in_progress`, not `:turn_in_progress`.
+      # The two error atoms are distinct and stable.
+      #
+      # The guard arm `turn_status in [:running, :cancel_requested]`
+      # collapses both running and cancel_requested into the same
+      # `:turn_in_progress` reply, but it only fires once the RPC has
+      # cleared (`pending_prompt: nil`). Cancel-during-RPC is naturally
+      # covered by the `:prompt_in_progress` clause at higher priority.
+      %{session: session} = start_session!("cancel")
+
+      task = Task.async(fn -> KiroSession.prompt(session, "first") end)
+
+      # The cancel scenario blocks reading stdin until session/cancel is
+      # received, so the prompt RPC is still in flight here.
+      assert_receive {:kiro_stream_event, ^session, %StreamEvent{kind: :agent_message_chunk}},
+                     2_000
+
+      assert {:error, :prompt_in_progress} = KiroSession.prompt(session, "second")
+
+      # Clean up.
+      assert :ok = KiroSession.cancel(session)
+      assert {:ok, _} = Task.await(task, 5_000)
+      _ = collect_until_kind(session, [:turn_end], 2_000)
     end
   end
 end

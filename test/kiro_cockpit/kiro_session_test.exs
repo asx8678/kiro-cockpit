@@ -413,15 +413,16 @@ defmodule KiroCockpit.KiroSessionTest do
           KiroSession.prompt(session, "First prompt", timeout: :infinity)
         end)
 
-      # Give the prompt a beat to land in pending state
-      Process.sleep(100)
+      # Wait for the first session/update notification — that's a precise
+      # signal that the prompt RPC has landed in `pending_prompt` (no
+      # fixed sleep).
+      assert_receive {:acp_notification, ^session, _}, 2_000
 
       # A second prompt should be rejected
       assert {:error, :prompt_in_progress} = KiroSession.prompt(session, "Second prompt")
 
-      # Clean up: drain the notification and request from the first prompt,
-      # then respond so the agent can complete.
-      assert_receive {:acp_notification, ^session, _}, 2_000
+      # Clean up: drain the request from the first prompt, then respond
+      # so the agent can complete.
       assert_receive {:acp_request, ^session, %{id: req_id}}, 2_000
       :ok = KiroSession.respond(session, req_id, %{"content" => "x"})
 

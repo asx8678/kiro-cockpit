@@ -56,7 +56,11 @@ defmodule KiroCockpit.KiroSession.StreamEventTest do
       assert event.type == "future_extension_we_dont_know"
     end
 
-    test "non-string sessionUpdate keeps :unknown and preserves raw type" do
+    test "non-string sessionUpdate keeps :unknown and stores nil type" do
+      # The public :type field is contractually `String.t() | nil`. A
+      # malformed (non-string) wire value normalizes to nil so the spec
+      # holds; the raw value is still preserved verbatim in :raw for
+      # debugging or replay.
       params = %{
         "sessionId" => "sess_x",
         "update" => %{"sessionUpdate" => 42}
@@ -64,7 +68,8 @@ defmodule KiroCockpit.KiroSession.StreamEventTest do
 
       event = StreamEvent.normalize(params, 0, DateTime.utc_now())
       assert event.kind == :unknown
-      assert event.type == 42
+      assert event.type == nil
+      assert event.raw["update"]["sessionUpdate"] == 42
     end
 
     test "missing :update field degrades to :unknown with type: nil" do

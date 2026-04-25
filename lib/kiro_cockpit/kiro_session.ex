@@ -301,6 +301,20 @@ defmodule KiroCockpit.KiroSession do
   `session/prompt` result (with `stopReason`). During the wait, KiroSession
   continues forwarding inbound notifications and requests to the subscriber.
 
+  ## Active-turn rejection (kiro-1rd)
+
+  A new prompt is rejected while the previous turn is still in flight:
+
+    * `{:error, :prompt_in_progress}` — the previous `session/prompt` RPC
+      has not returned yet (the request is on the wire).
+    * `{:error, :turn_in_progress}` — the prompt RPC has returned but the
+      normalized `:turn_end` stream event has not arrived yet, so
+      `turn_status` is still `:running` or `:cancel_requested`. Per
+      plan2.md §17 / §30.4 the turn is not complete on the prompt RPC
+      result alone — wait for `turn_end`.
+
+  Both errors are stable atoms; callers may pattern-match either.
+
   ## Parameters
 
     * `prompt_or_blocks` — a binary string or list of `%{"type" => ..., ...}` maps.
@@ -408,9 +422,13 @@ defmodule KiroCockpit.KiroSession do
 
   ## Options
 
-    * `:limit` — take the most-recent N events (default: all in buffer)
+    * `:limit` — take the most-recent N events (default: all in buffer).
+      Must be a non-negative integer; an invalid value returns
+      `{:error, {:invalid_option, {:limit, value}}}` rather than
+      crashing the GenServer.
   """
-  @spec recent_stream_events(GenServer.server(), keyword()) :: [StreamEvent.t()]
+  @spec recent_stream_events(GenServer.server(), keyword()) ::
+          [StreamEvent.t()] | {:error, {:invalid_option, {:limit, term()}}}
   def recent_stream_events(session, opts \\ []) when is_list(opts) do
     GenServer.call(session, {:recent_stream_events, opts}, 5_000)
   end
@@ -624,12 +642,16 @@ defmodule KiroCockpit.KiroSession do
 
   # -- session/prompt (async) -----------------------------------------------
 
+  # Happy path: session is active, no in-flight RPC, and the prior turn
+  # has been observed as fully complete (turn_end already landed) or
+  # there has been no turn at all (idle).
   @impl GenServer
   def handle_call(
         {:prompt, prompt_or_blocks, opts},
         from,
-        %{phase: :session_active, pending_prompt: nil} = state
-      ) do
+        %{phase: :session_active, pending_prompt: nil, turn_status: turn_status} = state
+      )
+      when turn_status in [:idle, :complete] do
     blocks = normalize_prompt(prompt_or_blocks)
     timeout = Keyword.get(opts, :timeout, @default_prompt_timeout)
 
@@ -668,9 +690,20 @@ defmodule KiroCockpit.KiroSession do
     {:noreply, state}
   end
 
+  # An RPC is currently on the wire — short-circuit fast.
   def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, %{pending_prompt: pp} = state)
       when not is_nil(pp) do
     {:reply, {:error, :prompt_in_progress}, state}
+  end
+
+  # Active-turn guard (kiro-1rd Shepherd MUST fix): the previous prompt's
+  # RPC result has returned (`pending_prompt: nil`) but no normalized
+  # `:turn_end` event has arrived, so the turn is still in flight from
+  # the runtime's perspective. Reject with a stable distinct atom so
+  # callers can tell this apart from `:prompt_in_progress`.
+  def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, %{turn_status: ts} = state)
+      when ts in [:running, :cancel_requested] do
+    {:reply, {:error, :turn_in_progress}, state}
   end
 
   def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, state) do
@@ -719,7 +752,11 @@ defmodule KiroCockpit.KiroSession do
     # Local state flips immediately so callers see :cancel_requested.
     params = %{"sessionId" => state.session_id}
     :ok = PortProcess.notify(state.port_process, "session/cancel", params)
-    persist_outbound(state, "session/cancel", params)
+    # `session/cancel` is an ACP notification — persist it as a
+    # notification envelope (no `id`) so EventStore classifies it as
+    # `message_type: "notification"` with `rpc_id: nil` instead of
+    # synthesising a fake request id.
+    persist_outbound_notification(state, "session/cancel", params)
 
     {:reply, :ok, %{state | turn_status: :cancel_requested}}
   end
@@ -736,15 +773,18 @@ defmodule KiroCockpit.KiroSession do
   # -- recent_stream_events -------------------------------------------------
 
   def handle_call({:recent_stream_events, opts}, _from, state) do
-    events = :queue.to_list(state.stream_buffer)
+    case fetch_events_limit(opts) do
+      {:ok, nil} ->
+        {:reply, :queue.to_list(state.stream_buffer), state}
 
-    events =
-      case Keyword.get(opts, :limit) do
-        nil -> events
-        n when is_integer(n) and n >= 0 -> Enum.take(events, -n)
-      end
+      {:ok, n} ->
+        {:reply, Enum.take(:queue.to_list(state.stream_buffer), -n), state}
 
-    {:reply, events, state}
+      {:error, reason} ->
+        # Invalid `:limit` is a caller bug, not a runtime fault. Surface
+        # it as a plain error tuple so the GenServer keeps serving.
+        {:reply, {:error, reason}, state}
+    end
   end
 
   # -- respond / respond_error / notify -------------------------------------
@@ -1047,6 +1087,21 @@ defmodule KiroCockpit.KiroSession do
     end
   end
 
+  # Caller-time validator for `recent_stream_events/2` :limit option.
+  # Invalid input is the caller's bug, not the GenServer's; we surface a
+  # plain error tuple instead of crashing the runtime.
+  @spec fetch_events_limit(keyword()) ::
+          {:ok, non_neg_integer() | nil}
+          | {:error, {:invalid_option, {:limit, term()}}}
+  defp fetch_events_limit(opts) do
+    case Keyword.fetch(opts, :limit) do
+      :error -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, n} when is_integer(n) and n >= 0 -> {:ok, n}
+      {:ok, other} -> {:error, {:invalid_option, {:limit, other}}}
+    end
+  end
+
   @spec call_timeout(keyword()) :: timeout()
   defp call_timeout(opts) do
     case Keyword.get(opts, :timeout, @default_request_timeout) do
@@ -1108,15 +1163,35 @@ defmodule KiroCockpit.KiroSession do
 
   # -- Best-effort EventStore persistence -----------------------------------
 
-  # Outbound: reconstruct a JSON-RPC request envelope for the raw_payload
-  # so EventStore classification works correctly. The id is a placeholder
-  # since we don't know what PortProcess assigned internally.
+  # Outbound request: reconstruct a JSON-RPC request envelope for the
+  # raw_payload so EventStore classification works correctly. The id is a
+  # placeholder since we don't know what PortProcess assigned internally;
+  # the rpc_id field is mostly useful as a non-nil indicator that this
+  # was a request.
   @spec persist_outbound(t(), String.t(), map()) :: :ok
   defp persist_outbound(%{persist_messages: false}, _method, _params), do: :ok
 
   defp persist_outbound(state, method, params) do
     payload = %{"jsonrpc" => "2.0", "id" => 0, "method" => method, "params" => params}
+    write_outbound(state, method, payload)
+  end
 
+  # Outbound notification: reconstruct a JSON-RPC notification envelope
+  # (no `id`) so EventStore classifies it as `message_type: "notification"`
+  # with `rpc_id: nil`. Used for fire-and-forget messages like
+  # `session/cancel` (kiro-1rd Shepherd MUST fix).
+  @spec persist_outbound_notification(t(), String.t(), map()) :: :ok
+  defp persist_outbound_notification(%{persist_messages: false}, _method, _params), do: :ok
+
+  defp persist_outbound_notification(state, method, params) do
+    payload = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+    write_outbound(state, method, payload)
+  end
+
+  # Shared writer for both outbound shapes — keeps the rescue block
+  # in one place and the message envelope concern at the call site.
+  @spec write_outbound(t(), String.t(), map()) :: :ok
+  defp write_outbound(state, method, payload) do
     try do
       EventStore.record_acp_message("client_to_agent", payload, session_id: state.session_id)
     rescue
