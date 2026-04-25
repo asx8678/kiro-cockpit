@@ -284,7 +284,7 @@ defmodule KiroCockpitWeb.CoreComponents do
 
   def focus_wrapper(assigns) do
     ~H"""
-    <div id={@id} phx-hook="FocusWrap" data-payload={Jason.encode!(%{focusable: true})}>
+    <div id={@id} phx-hook="FocusWrap">
       <span id={"#{@id}-start"} tabindex="0" aria-hidden="true" />
       {render_slot(@inner_block)}
       <span id={"#{@id}-end"} tabindex="0" aria-hidden="true" />

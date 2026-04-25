@@ -20,7 +20,7 @@ defmodule KiroCockpitWeb.Router do
     get "/", PageController, :home
   end
 
-  if Mix.env() in [:dev, :test] do
+  if Application.compile_env(:kiro_cockpit, :dev_routes, false) do
     import Phoenix.LiveDashboard.Router
 
     scope "/" do

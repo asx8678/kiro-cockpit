@@ -16,7 +16,7 @@ config :kiro_cockpit, KiroCockpitWeb.Endpoint,
 
 config :esbuild,
   version: "0.17.11",
-  kiro_cockpit: [
+  default: [
     args: ~w(
       js/app.js
       --bundle
@@ -31,7 +31,7 @@ config :esbuild,
 
 config :tailwind,
   version: "3.4.0",
-  kiro_cockpit: [
+  default: [
     args: ~w(
       --config=tailwind.config.js
       --input=css/app.css

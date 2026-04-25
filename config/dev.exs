@@ -1,5 +1,7 @@
 import Config
 
+config :kiro_cockpit, dev_routes: true
+
 config :kiro_cockpit, KiroCockpit.Repo,
   username: System.get_env("KIRO_DB_USER") || "postgres",
   password: System.get_env("KIRO_DB_PASS") || "postgres",
@@ -14,10 +16,11 @@ config :kiro_cockpit, KiroCockpitWeb.Endpoint,
   check_origin: false,
   code_reloader: true,
   debug_errors: true,
-  secret_key_base: "DEV_SECRET_KEY_BASE_32_BYTE_MINIMUM_LENGTH_",
+  secret_key_base:
+    "this_is_a_64_byte_development_secret_key_base_for_dev_use_only_12345678901234567890",
   watchers: [
-    esbuild: {Esbuild, :install_and_run, [:kiro_cockpit, ~w(--sourcemap=inline --watch)]},
-    tailwind: {Tailwind, :install_and_run, [:kiro_cockpit, ~w(--watch)]}
+    esbuild: {Esbuild, :install_and_run, [:default, ~w(--sourcemap=inline --watch)]},
+    tailwind: {Tailwind, :install_and_run, [:default, ~w(--watch)]}
   ],
   live_reload: [
     patterns: [

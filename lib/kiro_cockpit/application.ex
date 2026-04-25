@@ -17,20 +17,16 @@ defmodule KiroCockpit.Application do
 
   @impl true
   def start(_type, _args) do
-    children =
-      [
-        KiroCockpit.Repo,
-        {Phoenix.PubSub, name: KiroCockpit.PubSub},
-        KiroCockpitWeb.Telemetry,
-        KiroCockpitWeb.Endpoint
-      ] ++ env_children(Mix.env())
+    children = [
+      KiroCockpit.Repo,
+      {Phoenix.PubSub, name: KiroCockpit.PubSub},
+      KiroCockpitWeb.Telemetry,
+      KiroCockpitWeb.Endpoint
+    ]
 
     opts = [strategy: :one_for_one, name: KiroCockpit.Supervisor]
     Supervisor.start_link(children, opts)
   end
-
-  defp env_children(:dev), do: [{Phoenix.LiveReloader.Socket, []}]
-  defp env_children(_), do: []
 
   @impl true
   def config_change(changed, _new, removed) do

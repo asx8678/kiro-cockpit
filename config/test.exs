@@ -1,5 +1,7 @@
 import Config
 
+config :kiro_cockpit, dev_routes: true
+
 config :kiro_cockpit, KiroCockpit.Repo,
   username: System.get_env("KIRO_DB_USER") || "postgres",
   password: System.get_env("KIRO_DB_PASS") || "postgres",
@@ -11,7 +13,7 @@ config :kiro_cockpit, KiroCockpit.Repo,
 
 config :kiro_cockpit, KiroCockpitWeb.Endpoint,
   http: [ip: {127, 0, 0, 1}, port: 4002],
-  secret_key_base: "TEST_SECRET_KEY_BASE_32_BYTE_MINIMUM_LENGTH__",
+  secret_key_base: "this_is_a_64_byte_test_secret_key_base_for_test_use_only_1234567890123456",
   server: false
 
 config :logger, level: :warning

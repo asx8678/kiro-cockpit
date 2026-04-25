@@ -28,7 +28,7 @@ defmodule KiroCockpit.MixProject do
   def application do
     [
       mod: {KiroCockpit.Application, []},
-      extra_applications: [:logger, :runtime_tools, :os_mon]
+      extra_applications: [:logger, :runtime_tools]
     ]
   end
 
@@ -66,23 +66,11 @@ defmodule KiroCockpit.MixProject do
 
       # HTTP & API
       {:bandit, "~> 1.2"},
-      {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
-
-      # Security & Encryption
-      {:cloak, "~> 1.1"},
-      {:cloak_ecto, "~> 1.3"},
-
-      # Utilities
-      {:dns_cluster, "~> 0.1"},
-      {:gettext, "~> 0.24"},
 
       # Development & Testing
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:mox, "~> 1.0", only: :test},
-      {:stream_data, "~> 1.0", only: :test},
-      {:ex_doc, "~> 0.32", only: :dev, runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 

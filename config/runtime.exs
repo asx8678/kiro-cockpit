@@ -10,12 +10,18 @@ if config_env() == :prod do
 
   maybe_ipv6 = if System.get_env("ECTO_IPV6"), do: [:inet6], else: []
 
+  # SSL can be enabled via DATABASE_URL query params or by setting DATABASE_SSL=true
+  # SSL verification is NOT disabled by default - use only with valid certificates
+  ssl_config =
+    case System.get_env("DATABASE_SSL") do
+      "true" -> [ssl: true]
+      _ -> []
+    end
+
   config :kiro_cockpit, KiroCockpit.Repo,
-    ssl: true,
-    ssl_opts: [verify: :verify_none],
     url: database_url,
     pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
-    socket_options: maybe_ipv6
+    socket_options: maybe_ipv6 ++ ssl_config
 
   secret_key_base =
     System.get_env("SECRET_KEY_BASE") ||
@@ -33,7 +39,11 @@ if config_env() == :prod do
       ip: {0, 0, 0, 0, 0, 0, 0, 0},
       port: port
     ],
-    secret_key_base: secret_key_base
+    secret_key_base: secret_key_base,
+    cache_static_manifest: "priv/static/cache_manifest.json"
 
-  config :kiro_cockpit, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
+  # Enable the server conditionally via PHX_SERVER=true
+  if System.get_env("PHX_SERVER") == "true" do
+    config :kiro_cockpit, KiroCockpitWeb.Endpoint, server: true
+  end
 end
