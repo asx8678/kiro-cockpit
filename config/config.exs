@@ -40,9 +40,23 @@ config :tailwind,
     cd: Path.expand("../assets", __DIR__)
   ]
 
+# Logger console metadata mirrors `KiroCockpit.Telemetry.metadata_keys/0`
+# (Plan 3 hard rule R8 — `plan2.md` §25.3). Keep these lists in sync; Credo's
+# `MissedMetadataKeyInLoggerConfig` check enforces it. Add new correlation keys
+# in `KiroCockpit.Telemetry` first, then mirror them here.
 config :logger, :console,
   format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id]
+  metadata: [
+    :request_id,
+    :session_id,
+    :turn_id,
+    :plan_id,
+    :task_id,
+    :agent_id,
+    :permission_level,
+    :trace_id,
+    :span_id
+  ]
 
 config :phoenix, :json_library, Jason
 
