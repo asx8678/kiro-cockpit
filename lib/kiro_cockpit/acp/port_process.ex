@@ -565,8 +565,6 @@ defmodule KiroCockpit.Acp.PortProcess do
     end
   end
 
-  # Add a small buffer so the GenServer always has a chance to reply with
-  # `{:error, :timeout}` BEFORE the outer GenServer.call exits the caller.
   # Send the exact raw JSON-RPC map to the owner so it can persist the
   # true outbound payload (with the real assigned id) without reconstruction.
   @spec notify_outbound(state(), map()) :: :ok
@@ -575,6 +573,8 @@ defmodule KiroCockpit.Acp.PortProcess do
     :ok
   end
 
+  # Add a small buffer so the GenServer always has a chance to reply with
+  # `{:error, :timeout}` BEFORE the outer GenServer.call exits the caller.
   @spec call_timeout(timeout()) :: timeout()
   defp call_timeout(:infinity), do: :infinity
   defp call_timeout(timeout) when is_integer(timeout) and timeout >= 0, do: timeout + 1_000

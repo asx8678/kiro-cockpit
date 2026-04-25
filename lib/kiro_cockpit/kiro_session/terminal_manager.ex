@@ -453,7 +453,7 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
     end
   end
 
-  @spec build_env_list([map()]) :: list() | nil
+  @spec build_env_list([map()]) :: list()
   defp build_env_list([]), do: build_isolated_env()
 
   defp build_env_list(env) when is_list(env) do
