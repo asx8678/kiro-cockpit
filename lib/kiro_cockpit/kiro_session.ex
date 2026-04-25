@@ -88,7 +88,7 @@ defmodule KiroCockpit.KiroSession do
 
   require Logger
 
-  alias KiroCockpit.Acp.PortProcess
+  alias KiroCockpit.Acp.{JsonRpc, PortProcess}
   alias KiroCockpit.EventStore
   alias KiroCockpit.KiroSession.Callbacks
   alias KiroCockpit.KiroSession.StreamEvent
@@ -1030,10 +1030,14 @@ defmodule KiroCockpit.KiroSession do
 
         case result do
           {:ok, value} ->
-            PortProcess.respond(port_pid, id, value)
+            safe_respond(port_pid, id, fn ->
+              PortProcess.respond(port_pid, id, value)
+            end)
 
           {:error, code, message, data} ->
-            PortProcess.respond_error(port_pid, id, code, message, data)
+            safe_respond(port_pid, id, fn ->
+              PortProcess.respond_error(port_pid, id, code, message, data)
+            end)
         end
       rescue
         e ->
@@ -1042,13 +1046,25 @@ defmodule KiroCockpit.KiroSession do
           end)
 
           # Send a best-effort error response so the agent doesn't hang.
-          try do
+          safe_respond(port_pid, id, fn ->
             PortProcess.respond_error(port_pid, id, -32_000, "Internal error", nil)
-          catch
-            :exit, _ -> :ok
-          end
+          end)
       end
     end)
+
+    :ok
+  end
+
+  # Best-effort response: if the ACP port process has died, respond/3 or
+  # respond_error/5 may exit. We catch that to avoid a noisy Task crash —
+  # the port is already gone so there's nobody to tell anyway.
+  @spec safe_respond(pid(), JsonRpc.id(), (-> :ok)) :: :ok
+  defp safe_respond(_port_pid, _id, fun) do
+    try do
+      fun.()
+    catch
+      :exit, _ -> :ok
+    end
 
     :ok
   end

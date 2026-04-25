@@ -162,6 +162,74 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
       assert {:ok, %{"content" => _content}} =
                Callbacks.handle_request("fs/read_text_file", %{"path" => path}, nil)
     end
+
+    # -- line/limit validation --
+
+    test "rejects non-integer line parameter" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "fs/read_text_file",
+                 %{"path" => "/tmp/any.txt", "line" => "two"},
+                 nil
+               )
+
+      assert message =~ "'line' must be a positive integer"
+    end
+
+    test "rejects zero line parameter" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "fs/read_text_file",
+                 %{"path" => "/tmp/any.txt", "line" => 0},
+                 nil
+               )
+
+      assert message =~ "'line' must be a positive integer"
+    end
+
+    test "rejects negative line parameter" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "fs/read_text_file",
+                 %{"path" => "/tmp/any.txt", "line" => -1},
+                 nil
+               )
+
+      assert message =~ "'line' must be a positive integer"
+    end
+
+    test "rejects non-integer limit parameter" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "fs/read_text_file",
+                 %{"path" => "/tmp/any.txt", "limit" => 3.5},
+                 nil
+               )
+
+      assert message =~ "'limit' must be a positive integer"
+    end
+
+    test "rejects zero limit parameter" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "fs/read_text_file",
+                 %{"path" => "/tmp/any.txt", "limit" => 0},
+                 nil
+               )
+
+      assert message =~ "'limit' must be a positive integer"
+    end
+
+    test "rejects negative limit parameter" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "fs/read_text_file",
+                 %{"path" => "/tmp/any.txt", "limit" => -5},
+                 nil
+               )
+
+      assert message =~ "'limit' must be a positive integer"
+    end
   end
 
   # -- fs/write_text_file ----------------------------------------------------
@@ -259,6 +327,153 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
                Callbacks.handle_request("terminal/create", %{"command" => "echo"}, nil)
 
       assert message =~ "auto_callbacks disabled"
+    end
+
+    test "rejects non-list args" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "args" => "not-a-list"},
+                 nil
+               )
+
+      assert message =~ "args"
+    end
+
+    test "rejects args with non-string elements" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "args" => [1, 2]},
+                 nil
+               )
+
+      assert message =~ "args"
+    end
+
+    test "rejects non-list env" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "env" => "not-a-list"},
+                 nil
+               )
+
+      assert message =~ "env"
+    end
+
+    test "rejects env with non-map elements" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "env" => ["not-a-map"]},
+                 nil
+               )
+
+      assert message =~ "env"
+    end
+
+    test "rejects env entry missing 'name' key" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "env" => [%{"value" => "v"}]},
+                 nil
+               )
+
+      assert message =~ "env"
+    end
+
+    test "rejects env entry with non-binary name" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "env" => [%{"name" => 123, "value" => "v"}]},
+                 nil
+               )
+
+      assert message =~ "env"
+    end
+
+    test "rejects non-positive-integer outputByteLimit" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "outputByteLimit" => -1},
+                 nil
+               )
+
+      assert message =~ "outputByteLimit"
+    end
+
+    test "rejects zero outputByteLimit" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "outputByteLimit" => 0},
+                 nil
+               )
+
+      assert message =~ "outputByteLimit"
+    end
+
+    test "rejects string outputByteLimit" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "outputByteLimit" => "big"},
+                 nil
+               )
+
+      assert message =~ "outputByteLimit"
+    end
+
+    test "rejects non-absolute cwd" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "cwd" => "relative/path"},
+                 nil
+               )
+
+      assert message =~ "cwd"
+    end
+
+    test "rejects empty string cwd" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "cwd" => ""},
+                 nil
+               )
+
+      assert message =~ "cwd"
+    end
+
+    test "rejects non-existent cwd directory" do
+      assert {:error, -32_602, message, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "cwd" => "/tmp/nonexistent_dir_kiro_12345"},
+                 nil
+               )
+
+      assert message =~ "cwd" and message =~ "does not exist"
+    end
+
+    test "accepts valid cwd directory" do
+      # This should pass validation but fail at terminal_manager nil
+      # since we're passing nil. The cwd validation happens before the
+      # terminal_manager check.
+      tmp = System.tmp_dir!()
+
+      # Will fail with terminal not available, but that's AFTER cwd validation passes
+      assert {:error, -32_000, _, nil} =
+               Callbacks.handle_request(
+                 "terminal/create",
+                 %{"command" => "echo", "cwd" => tmp},
+                 nil
+               )
     end
   end
 

@@ -285,4 +285,59 @@ defmodule KiroCockpit.KiroSession.TerminalManagerTest do
       assert result["output"] =~ "hello_from_kiro"
     end
   end
+
+  # -- stderr capture ----------------------------------------------------------
+
+  describe "stderr capture" do
+    test "captures stderr output merged with stdout", %{tm: tm} do
+      sh = System.find_executable("sh") || flunk("sh not found")
+
+      {:ok, term_id} =
+        TerminalManager.create(
+          tm,
+          sh,
+          ["-c", "echo stdout_msg; echo stderr_msg >&2"],
+          nil,
+          [],
+          1_048_576
+        )
+
+      # Wait for the process to complete.
+      assert {:ok, _} = TerminalManager.wait_for_exit(tm, term_id, 5_000)
+
+      {:ok, result} = TerminalManager.output(tm, term_id)
+      # Both stdout and stderr should appear in the output buffer
+      assert result["output"] =~ "stdout_msg"
+      assert result["output"] =~ "stderr_msg"
+    end
+  end
+
+  # -- Concurrent wait_for_exit ------------------------------------------------
+
+  describe "concurrent wait_for_exit" do
+    test "rejects second concurrent wait_for_exit call", %{tm: tm} do
+      sleep = System.find_executable("sleep") || flunk("sleep not found")
+      {:ok, term_id} = TerminalManager.create(tm, sleep, ["30"], nil, [], 1_048_576)
+
+      # First wait — this will be deferred (process is running)
+      task1 =
+        Task.async(fn ->
+          TerminalManager.wait_for_exit(tm, term_id, 5_000)
+        end)
+
+      # Give the first call a moment to register
+      Process.sleep(50)
+
+      # Second wait — should be rejected immediately
+      assert {:error, -32_000, message, nil} =
+               TerminalManager.wait_for_exit(tm, term_id, 1_000)
+
+      assert message =~ "wait_for_exit call is already pending"
+
+      # Clean up — kill the terminal so task1 doesn't hang
+      TerminalManager.kill(tm, term_id)
+      Task.await(task1, 5_000)
+      TerminalManager.release(tm, term_id)
+    end
+  end
 end

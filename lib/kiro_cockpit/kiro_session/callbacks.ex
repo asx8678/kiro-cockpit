@@ -69,8 +69,10 @@ defmodule KiroCockpit.KiroSession.Callbacks do
 
   def handle_request("fs/read_text_file", params, _terminal_manager) do
     with {:ok, path} <- require_absolute_path(params, "path"),
+         {:ok, _line_val} <- validate_line_param(Map.get(params, "line")),
+         {:ok, _limit_val} <- validate_limit_param(Map.get(params, "limit")),
          {:ok, content} <- read_file_content(path),
-         {:ok, sliced} <- maybe_slice_lines(content, params) do
+         {:ok, sliced} <- maybe_slice_lines_validated(content, params) do
       {:ok, %{"content" => sliced}}
     end
   end
@@ -91,12 +93,12 @@ defmodule KiroCockpit.KiroSession.Callbacks do
 
   def handle_request("terminal/create", params, terminal_manager) do
     with {:ok, command} <- require_param(params, "command", "string"),
+         {:ok, args} <- validate_args(Map.get(params, "args", [])),
+         {:ok, env} <- validate_env(Map.get(params, "env", [])),
+         {:ok, output_byte_limit} <-
+           validate_output_byte_limit(Map.get(params, "outputByteLimit", 1_048_576)),
+         {:ok, cwd} <- validate_cwd_param(Map.get(params, "cwd")),
          {:ok, terminal_manager} <- require_terminal_manager(terminal_manager) do
-      args = Map.get(params, "args", [])
-      cwd = Map.get(params, "cwd")
-      env = Map.get(params, "env", [])
-      output_byte_limit = Map.get(params, "outputByteLimit", 1_048_576)
-
       case TerminalManager.create(terminal_manager, command, args, cwd, env, output_byte_limit) do
         {:ok, term_id} -> {:ok, %{"terminalId" => term_id}}
         {:error, code, message, data} -> {:error, code, message, data}
@@ -218,6 +220,74 @@ defmodule KiroCockpit.KiroSession.Callbacks do
     {:ok, name}
   end
 
+  # -- terminal/create parameter validation -----------------------------------
+
+  @spec validate_args(term()) :: {:ok, [String.t()]} | {:error, integer(), String.t(), nil}
+  defp validate_args(args) when is_list(args) do
+    if Enum.all?(args, &is_binary/1) do
+      {:ok, args}
+    else
+      {:error, @error_invalid_params, "Parameter 'args' must be a list of strings", nil}
+    end
+  end
+
+  defp validate_args(_args) do
+    {:error, @error_invalid_params, "Parameter 'args' must be a list of strings", nil}
+  end
+
+  @spec validate_env(term()) :: {:ok, [map()]} | {:error, integer(), String.t(), nil}
+  defp validate_env(env) when is_list(env) do
+    if Enum.all?(env, &valid_env_entry?/1) do
+      {:ok, env}
+    else
+      {:error, @error_invalid_params,
+       "Parameter 'env' must be a list of maps with binary 'name' and binary 'value'", nil}
+    end
+  end
+
+  defp validate_env(_env) do
+    {:error, @error_invalid_params,
+     "Parameter 'env' must be a list of maps with binary 'name' and binary 'value'", nil}
+  end
+
+  @spec valid_env_entry?(term()) :: boolean()
+  defp valid_env_entry?(%{"name" => name, "value" => value})
+       when is_binary(name) and is_binary(value),
+       do: true
+
+  defp valid_env_entry?(_), do: false
+
+  @spec validate_output_byte_limit(term()) ::
+          {:ok, pos_integer()} | {:error, integer(), String.t(), nil}
+  defp validate_output_byte_limit(limit) when is_integer(limit) and limit >= 1 do
+    {:ok, limit}
+  end
+
+  defp validate_output_byte_limit(limit) do
+    {:error, @error_invalid_params,
+     "Parameter 'outputByteLimit' must be a positive integer, got: #{inspect(limit)}", nil}
+  end
+
+  @spec validate_cwd_param(term()) ::
+          {:ok, String.t() | nil} | {:error, integer(), String.t(), nil}
+  defp validate_cwd_param(nil), do: {:ok, nil}
+
+  defp validate_cwd_param(cwd) when is_binary(cwd) and byte_size(cwd) > 0 do
+    if Path.type(cwd) == :absolute do
+      if File.dir?(cwd) do
+        {:ok, cwd}
+      else
+        {:error, @error_invalid_params, "Parameter 'cwd' directory does not exist: #{cwd}", nil}
+      end
+    else
+      {:error, @error_invalid_params, "Parameter 'cwd' must be an absolute path: #{cwd}", nil}
+    end
+  end
+
+  defp validate_cwd_param(_cwd) do
+    {:error, @error_invalid_params, "Parameter 'cwd' must be a non-empty absolute path", nil}
+  end
+
   @spec read_file_content(Path.t()) ::
           {:ok, binary()} | {:error, integer(), String.t(), nil}
   defp read_file_content(path) do
@@ -252,22 +322,57 @@ defmodule KiroCockpit.KiroSession.Callbacks do
     end
   end
 
-  @spec maybe_slice_lines(binary(), map()) :: {:ok, binary()}
-  defp maybe_slice_lines(content, params) do
+  # Variant that assumes line/limit have already been validated by the caller.
+  # Avoids redundant validation when the `with` chain checks params early.
+  @spec maybe_slice_lines_validated(binary(), map()) :: {:ok, binary()}
+  defp maybe_slice_lines_validated(content, params) do
     line = Map.get(params, "line")
     limit = Map.get(params, "limit")
 
     if line == nil and limit == nil do
       {:ok, content}
     else
-      # Split on newlines, preserving empty lines between.
-      # ACP line numbers are 1-based.
-      lines = split_lines(content)
-      start_idx = max(0, (line || 1) - 1)
-      end_idx = if limit != nil, do: start_idx + limit, else: length(lines)
-      sliced = Enum.slice(lines, start_idx, end_idx - start_idx)
-      {:ok, Enum.join(sliced, "\n")}
+      line_val = if line != nil, do: line, else: 1
+      slice_content(content, line_val, limit)
     end
+  end
+
+  @spec slice_content(binary(), pos_integer(), pos_integer() | nil) :: {:ok, binary()}
+  defp slice_content(content, line_val, limit_val) do
+    lines = split_lines(content)
+    start_idx = line_val - 1
+    end_idx = if limit_val != nil, do: start_idx + limit_val, else: length(lines)
+    sliced = Enum.slice(lines, start_idx, end_idx - start_idx)
+    {:ok, Enum.join(sliced, "\n")}
+  end
+
+  # Validate the `line` parameter: must be a positive integer (1-based).
+  # Returns `{:ok, 1}` when nil (default: start from line 1).
+  @spec validate_line_param(term()) :: {:ok, pos_integer()} | {:error, integer(), String.t(), nil}
+  defp validate_line_param(nil), do: {:ok, 1}
+
+  defp validate_line_param(line) when is_integer(line) and line >= 1 do
+    {:ok, line}
+  end
+
+  defp validate_line_param(line) do
+    {:error, @error_invalid_params,
+     "Parameter 'line' must be a positive integer (1-based), got: #{inspect(line)}", nil}
+  end
+
+  # Validate the `limit` parameter: must be a positive integer when present.
+  # Returns `{:ok, nil}` when nil (no limit — read to end of file).
+  @spec validate_limit_param(term()) ::
+          {:ok, pos_integer() | nil} | {:error, integer(), String.t(), nil}
+  defp validate_limit_param(nil), do: {:ok, nil}
+
+  defp validate_limit_param(limit) when is_integer(limit) and limit >= 1 do
+    {:ok, limit}
+  end
+
+  defp validate_limit_param(limit) do
+    {:error, @error_invalid_params,
+     "Parameter 'limit' must be a positive integer, got: #{inspect(limit)}", nil}
   end
 
   # Split content on newlines, preserving empty lines between delimiters

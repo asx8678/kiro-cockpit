@@ -247,6 +247,12 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
         result = format_exit_info(exit_status)
         {:reply, {:ok, result}, state}
 
+      {:ok, %{waiter: existing_waiter} = _terminal} when existing_waiter != nil ->
+        # A waiter already exists — reject to avoid overwriting and hanging the first caller.
+        {:reply,
+         {:error, -32_000, "A wait_for_exit call is already pending for this terminal", nil},
+         state}
+
       {:ok, terminal} ->
         # Still running — defer reply until exit_status arrives or timeout.
         wait_timer =
@@ -417,6 +423,7 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
         :exit_status,
         :use_stdio,
         :hide,
+        :stderr_to_stdout,
         {:args, args || []}
       ]
 
