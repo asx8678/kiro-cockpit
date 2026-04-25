@@ -45,6 +45,7 @@ defmodule KiroCockpit.MixProject do
       {:phoenix_live_view, "~> 1.0"},
       {:phoenix_live_dashboard, "~> 0.8"},
       {:floki, ">= 0.30.0", only: :test},
+      {:lazy_html, "~> 0.1.0", only: :test},
       {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:heroicons,
