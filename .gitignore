@@ -48,3 +48,6 @@ erl_crash.dump
 *.db
 *.db?*
 .beads-credential-key
+-e 
+# ExUnit tmp_dir artifacts
+tmp/
