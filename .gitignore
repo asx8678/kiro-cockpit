@@ -1,0 +1,38 @@
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Python
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Elixir/Phoenix build artifacts
+/_build/
+/deps/
+/cover/
+/.elixir_ls/
+/.fetch
+erl_crash.dump
+*.ez
+
+# Phoenix assets/build artifacts
+/node_modules/
+/priv/static/assets/
+/priv/static/cache_manifest.json
+/assets/node_modules/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+*.db?*
+.beads-credential-key
