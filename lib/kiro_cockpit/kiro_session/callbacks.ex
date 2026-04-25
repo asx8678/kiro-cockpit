@@ -97,9 +97,9 @@ defmodule KiroCockpit.KiroSession.Callbacks do
   @spec allowed_by_policy?(String.t(), callback_policy()) :: boolean()
   def allowed_by_policy?(method, policy) when is_binary(method) do
     case policy do
-      :read_only -> not mutating_method?(method)
-      :all -> true
-      :trusted -> true
+      :read_only -> method == "fs/read_text_file"
+      :all -> known_method?(method)
+      :trusted -> known_method?(method)
     end
   end
 
@@ -124,12 +124,17 @@ defmodule KiroCockpit.KiroSession.Callbacks do
   @doc """
   Clamp caller-supplied client capabilities so they cannot exceed policy.
 
-  Under `:read_only`, callers may further reduce capabilities (for example
-  disable fs read) but cannot advertise write or terminal support. Trusted
-  policies keep the caller-supplied map unchanged.
+  Atom-keyed caller maps are normalized to canonical JSON/string keys before
+  clamping so the encoded `initialize` payload cannot contain duplicate or
+  parser-dependent capability keys. Under `:read_only`, callers may further
+  reduce capabilities (for example disable fs read) but cannot advertise write
+  or terminal support. Trusted policies preserve requested values after key
+  normalization.
   """
   @spec clamp_capabilities_for_policy(map(), callback_policy()) :: map()
   def clamp_capabilities_for_policy(capabilities, :read_only) when is_map(capabilities) do
+    capabilities = normalize_capability_keys(capabilities)
+
     fs =
       capabilities
       |> Map.get("fs", %{})
@@ -146,7 +151,29 @@ defmodule KiroCockpit.KiroSession.Callbacks do
 
   def clamp_capabilities_for_policy(capabilities, policy)
       when is_map(capabilities) and policy in [:all, :trusted],
-      do: capabilities
+      do: normalize_capability_keys(capabilities)
+
+  defp normalize_capability_keys(value) when is_map(value) do
+    value
+    |> Enum.sort_by(fn {key, _value} -> key_precedence(key) end)
+    |> Enum.reduce(%{}, fn {key, child}, normalized ->
+      case normalize_capability_key(key) do
+        nil -> normalized
+        key -> Map.put(normalized, key, normalize_capability_keys(child))
+      end
+    end)
+  end
+
+  defp normalize_capability_keys(value), do: value
+
+  defp normalize_capability_key(key) when is_binary(key), do: key
+  defp normalize_capability_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp normalize_capability_key(_key), do: nil
+
+  # Preserve explicit JSON/string keys over equivalent atom keys in mixed maps.
+  defp key_precedence(key) when is_atom(key), do: {0, Atom.to_string(key)}
+  defp key_precedence(key) when is_binary(key), do: {1, key}
+  defp key_precedence(key), do: {2, inspect(key)}
 
   @doc """
   Returns a denied-method error tuple suitable for a JSON-RPC error response.

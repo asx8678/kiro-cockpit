@@ -714,7 +714,19 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
   @spec write(map()) :: :ok
   defp write(map) do
     line = Jason.encode!(map) <> "\n"
-    IO.binwrite(:standard_io, line)
+
+    try do
+      IO.binwrite(:standard_io, line)
+    rescue
+      error in ErlangError ->
+        case error.original do
+          reason when reason in [:terminated, :epipe] -> :ok
+          _other -> reraise(error, __STACKTRACE__)
+        end
+    catch
+      :exit, reason when reason in [:terminated, :epipe] -> :ok
+    end
+
     :ok
   end
 

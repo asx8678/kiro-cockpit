@@ -561,16 +561,22 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
       refute Callbacks.allowed_by_policy?("terminal/release", :read_only)
     end
 
-    test ":all allows everything" do
+    test ":read_only denies unknown methods" do
+      refute Callbacks.allowed_by_policy?("session/prompt", :read_only)
+    end
+
+    test ":all allows all known callback methods only" do
       assert Callbacks.allowed_by_policy?("fs/read_text_file", :all)
       assert Callbacks.allowed_by_policy?("fs/write_text_file", :all)
       assert Callbacks.allowed_by_policy?("terminal/create", :all)
+      refute Callbacks.allowed_by_policy?("session/prompt", :all)
     end
 
-    test ":trusted allows everything" do
+    test ":trusted allows all known callback methods only" do
       assert Callbacks.allowed_by_policy?("fs/read_text_file", :trusted)
       assert Callbacks.allowed_by_policy?("fs/write_text_file", :trusted)
       assert Callbacks.allowed_by_policy?("terminal/create", :trusted)
+      refute Callbacks.allowed_by_policy?("session/prompt", :trusted)
     end
   end
 
@@ -621,13 +627,46 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
       assert caps["terminal"] == false
     end
 
-    test ":all keeps caller capability overrides unchanged" do
-      requested = %{
+    test ":read_only normalizes atom-keyed caller capabilities before clamping" do
+      unsafe = %{
+        fs: %{readTextFile: true, writeTextFile: true},
+        terminal: true
+      }
+
+      caps = Callbacks.clamp_capabilities_for_policy(unsafe, :read_only)
+
+      assert caps == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => false},
+               "terminal" => false
+             }
+    end
+
+    test ":read_only prefers explicit string keys in mixed caller capabilities" do
+      unsafe = %{
+        :fs => %{readTextFile: false, writeTextFile: true},
         "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+        :terminal => true,
         "terminal" => true
       }
 
-      assert Callbacks.clamp_capabilities_for_policy(requested, :all) == requested
+      caps = Callbacks.clamp_capabilities_for_policy(unsafe, :read_only)
+
+      assert caps == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => false},
+               "terminal" => false
+             }
+    end
+
+    test ":all keeps caller capability values but normalizes keys" do
+      requested = %{
+        fs: %{readTextFile: true, writeTextFile: true},
+        terminal: true
+      }
+
+      assert Callbacks.clamp_capabilities_for_policy(requested, :all) == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+               "terminal" => true
+             }
     end
   end
 

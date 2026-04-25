@@ -266,6 +266,26 @@ defmodule KiroCockpit.KiroSession.CallbacksIntegrationTest do
       assert state.client_capabilities["fs"]["writeTextFile"] == false
       assert state.client_capabilities["terminal"] == false
     end
+
+    test "read-only policy normalizes atom-keyed initialize capability overrides" do
+      unsafe_caps = %{
+        fs: %{readTextFile: true, writeTextFile: true},
+        terminal: true
+      }
+
+      %{session: session} =
+        start_session!("normal",
+          callback_policy: :read_only,
+          initialize_opts: [client_capabilities: unsafe_caps]
+        )
+
+      state = KiroSession.state(session)
+
+      assert state.client_capabilities == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => false},
+               "terminal" => false
+             }
+    end
   end
 
   # -- Callback policy: read_only denies mutating callbacks (MUST FIX 2) ------
