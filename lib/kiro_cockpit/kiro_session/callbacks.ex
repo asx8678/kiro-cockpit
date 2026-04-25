@@ -1,0 +1,295 @@
+defmodule KiroCockpit.KiroSession.Callbacks do
+  @moduledoc """
+  ACP client callback handlers for `fs/*` and `terminal/*` methods.
+
+  Implements automatic handling of agent→client requests per
+  kiro-acp-instructions.md §9. This module is the dispatch boundary:
+  it validates parameters, executes file operations directly, and delegates
+  terminal operations to `TerminalManager`.
+
+  ## Error codes
+
+  JSON-RPC error codes used:
+
+    * `-32602` — Invalid params (missing/invalid path, non-absolute path, etc.)
+    * `-32000` — Operation error (file not found, read error, terminal not found, etc.)
+
+  ## Integration
+
+  `KiroSession` calls `handle_request/3` when `auto_callbacks` is enabled.
+  The subscriber still receives the raw `{:acp_request, ...}` for observability
+  but does NOT need to call `respond/3` for handled methods.
+
+  Terminal operations are dispatched to `TerminalManager` and may be
+  called from a Task to avoid blocking the KiroSession GenServer.
+  """
+
+  alias KiroCockpit.KiroSession.TerminalManager
+
+  # -- Error codes (JSON-RPC standard + custom range) -------------------------
+
+  @error_invalid_params -32_602
+  @error_operation -32_000
+
+  # -- Known methods ----------------------------------------------------------
+
+  @known_methods MapSet.new([
+                   "fs/read_text_file",
+                   "fs/write_text_file",
+                   "terminal/create",
+                   "terminal/output",
+                   "terminal/wait_for_exit",
+                   "terminal/kill",
+                   "terminal/release"
+                 ])
+
+  @doc """
+  Check if a method is auto-handled by this module.
+  """
+  @spec known_method?(String.t()) :: boolean()
+  def known_method?(method) when is_binary(method) do
+    MapSet.member?(@known_methods, method)
+  end
+
+  @doc """
+  Dispatch an agent→client callback request and return the result.
+
+  Returns `{:ok, result}` on success or `{:error, code, message, data}` on
+  failure. The caller is responsible for sending the appropriate JSON-RPC
+  response.
+
+  The `terminal_manager` argument is required for `terminal/*` methods
+  and ignored for `fs/*` methods.
+  """
+  @spec handle_request(String.t(), map(), GenServer.server() | nil) ::
+          {:ok, term()} | {:error, integer(), String.t(), term()}
+  def handle_request(method, params, terminal_manager \\ nil)
+
+  # -- fs/read_text_file ------------------------------------------------------
+
+  def handle_request("fs/read_text_file", params, _terminal_manager) do
+    with {:ok, path} <- require_absolute_path(params, "path"),
+         {:ok, content} <- read_file_content(path),
+         {:ok, sliced} <- maybe_slice_lines(content, params) do
+      {:ok, %{"content" => sliced}}
+    end
+  end
+
+  # -- fs/write_text_file -----------------------------------------------------
+
+  def handle_request("fs/write_text_file", params, _terminal_manager) do
+    with {:ok, path} <- require_absolute_path(params, "path"),
+         {:ok, content} <- require_content(params) do
+      case write_file(path, content) do
+        :ok -> {:ok, nil}
+        {:error, reason} -> {:error, @error_operation, "Write failed: #{reason}", nil}
+      end
+    end
+  end
+
+  # -- terminal/create --------------------------------------------------------
+
+  def handle_request("terminal/create", params, terminal_manager) do
+    with {:ok, command} <- require_param(params, "command", "string"),
+         {:ok, terminal_manager} <- require_terminal_manager(terminal_manager) do
+      args = Map.get(params, "args", [])
+      cwd = Map.get(params, "cwd")
+      env = Map.get(params, "env", [])
+      output_byte_limit = Map.get(params, "outputByteLimit", 1_048_576)
+
+      case TerminalManager.create(terminal_manager, command, args, cwd, env, output_byte_limit) do
+        {:ok, term_id} -> {:ok, %{"terminalId" => term_id}}
+        {:error, code, message, data} -> {:error, code, message, data}
+      end
+    end
+  end
+
+  # -- terminal/output --------------------------------------------------------
+
+  def handle_request("terminal/output", params, terminal_manager) do
+    with {:ok, term_id} <- require_terminal_id(params),
+         {:ok, terminal_manager} <- require_terminal_manager(terminal_manager) do
+      case TerminalManager.output(terminal_manager, term_id) do
+        {:ok, result} -> {:ok, result}
+        {:error, code, message, data} -> {:error, code, message, data}
+      end
+    end
+  end
+
+  # -- terminal/wait_for_exit -------------------------------------------------
+
+  def handle_request("terminal/wait_for_exit", params, terminal_manager) do
+    with {:ok, term_id} <- require_terminal_id(params),
+         {:ok, terminal_manager} <- require_terminal_manager(terminal_manager) do
+      case TerminalManager.wait_for_exit(terminal_manager, term_id) do
+        {:ok, result} -> {:ok, result}
+        {:error, code, message, data} -> {:error, code, message, data}
+      end
+    end
+  end
+
+  # -- terminal/kill ----------------------------------------------------------
+
+  def handle_request("terminal/kill", params, terminal_manager) do
+    with {:ok, term_id} <- require_terminal_id(params),
+         {:ok, terminal_manager} <- require_terminal_manager(terminal_manager) do
+      case TerminalManager.kill(terminal_manager, term_id) do
+        {:ok, nil} -> {:ok, nil}
+        {:error, code, message, data} -> {:error, code, message, data}
+      end
+    end
+  end
+
+  # -- terminal/release -------------------------------------------------------
+
+  def handle_request("terminal/release", params, terminal_manager) do
+    with {:ok, term_id} <- require_terminal_id(params),
+         {:ok, terminal_manager} <- require_terminal_manager(terminal_manager) do
+      case TerminalManager.release(terminal_manager, term_id) do
+        {:ok, nil} -> {:ok, nil}
+        {:error, code, message, data} -> {:error, code, message, data}
+      end
+    end
+  end
+
+  # -- Unknown method (should not be reached via KiroSession, but defensive) --
+
+  def handle_request(method, _params, _terminal_manager) do
+    {:error, -32_601, "Method not found: #{method}", nil}
+  end
+
+  # -- fs/* internals ---------------------------------------------------------
+
+  @spec require_absolute_path(map(), String.t()) ::
+          {:ok, String.t()} | {:error, integer(), String.t(), nil}
+  defp require_absolute_path(params, key) do
+    case Map.fetch(params, key) do
+      {:ok, path} when is_binary(path) and byte_size(path) > 0 ->
+        if Path.type(path) == :absolute do
+          {:ok, path}
+        else
+          {:error, @error_invalid_params, "Path must be absolute: #{path}", nil}
+        end
+
+      _ ->
+        {:error, @error_invalid_params, "Missing required parameter: #{key}", nil}
+    end
+  end
+
+  @spec require_content(map()) ::
+          {:ok, binary()} | {:error, integer(), String.t(), nil}
+  defp require_content(params) do
+    case Map.fetch(params, "content") do
+      {:ok, content} when is_binary(content) -> {:ok, content}
+      _ -> {:error, @error_invalid_params, "Missing required parameter: content", nil}
+    end
+  end
+
+  @spec require_param(map(), String.t(), String.t()) ::
+          {:ok, term()} | {:error, integer(), String.t(), nil}
+  defp require_param(params, key, type) do
+    case Map.fetch(params, key) do
+      {:ok, value} when type == "string" and is_binary(value) -> {:ok, value}
+      {:ok, value} when type == "list" and is_list(value) -> {:ok, value}
+      _ -> {:error, @error_invalid_params, "Missing or invalid parameter: #{key}", nil}
+    end
+  end
+
+  @spec require_terminal_id(map()) ::
+          {:ok, String.t()} | {:error, integer(), String.t(), nil}
+  defp require_terminal_id(params) do
+    case Map.fetch(params, "terminalId") do
+      {:ok, id} when is_binary(id) and byte_size(id) > 0 -> {:ok, id}
+      _ -> {:error, @error_invalid_params, "Missing required parameter: terminalId", nil}
+    end
+  end
+
+  @spec require_terminal_manager(GenServer.server() | nil) ::
+          {:ok, GenServer.server()} | {:error, integer(), String.t(), nil}
+  defp require_terminal_manager(nil) do
+    {:error, @error_operation, "Terminal not available (auto_callbacks disabled)", nil}
+  end
+
+  defp require_terminal_manager(pid) when is_pid(pid) do
+    {:ok, pid}
+  end
+
+  defp require_terminal_manager(name) do
+    {:ok, name}
+  end
+
+  @spec read_file_content(Path.t()) ::
+          {:ok, binary()} | {:error, integer(), String.t(), nil}
+  defp read_file_content(path) do
+    case File.read(path) do
+      {:ok, raw} ->
+        {:ok, decode_file_content(raw)}
+
+      {:error, :enoent} ->
+        {:error, @error_operation, "File not found: #{path}", nil}
+
+      {:error, :eacces} ->
+        {:error, @error_operation, "Permission denied: #{path}", nil}
+
+      {:error, reason} ->
+        {:error, @error_operation, "Read failed: #{inspect(reason)}", nil}
+    end
+  end
+
+  @spec decode_file_content(binary()) :: binary()
+  defp decode_file_content(raw) do
+    if String.valid?(raw) do
+      raw
+    else
+      # latin-1 is a lossless encoding for any byte sequence.
+      # Convert the raw binary to a latin-1 string then to UTF-8.
+      raw
+      |> :binary.bin_to_list()
+      |> Enum.map_join(fn
+        byte when byte < 128 -> <<byte>>
+        byte -> <<0xC2 + Bitwise.bsr(byte, 6), 0x80 + Bitwise.band(byte, 0x3F)>>
+      end)
+    end
+  end
+
+  @spec maybe_slice_lines(binary(), map()) :: {:ok, binary()}
+  defp maybe_slice_lines(content, params) do
+    line = Map.get(params, "line")
+    limit = Map.get(params, "limit")
+
+    if line == nil and limit == nil do
+      {:ok, content}
+    else
+      # Split on newlines, preserving empty lines between.
+      # ACP line numbers are 1-based.
+      lines = split_lines(content)
+      start_idx = max(0, (line || 1) - 1)
+      end_idx = if limit != nil, do: start_idx + limit, else: length(lines)
+      sliced = Enum.slice(lines, start_idx, end_idx - start_idx)
+      {:ok, Enum.join(sliced, "\n")}
+    end
+  end
+
+  # Split content on newlines, preserving empty lines between delimiters
+  # (equivalent to `String.split(content, "\n", include_empties: true)`
+  # but avoids a dialyzer contract warning on the `:include_empties` option).
+  @spec split_lines(binary()) :: [binary()]
+  defp split_lines(content) do
+    String.split(content, "\n")
+  end
+
+  @spec write_file(Path.t(), binary()) :: :ok | {:error, String.t()}
+  defp write_file(path, content) do
+    # Create parent directories if they don't exist (per ACP spec:
+    # "Create the file if it doesn't exist" — and parent creation is
+    # reasonable and documented).
+    parent = Path.dirname(path)
+
+    with :ok <- File.mkdir_p(parent),
+         :ok <- File.write(path, content) do
+      :ok
+    else
+      {:error, reason} -> {:error, inspect(reason)}
+    end
+  end
+end

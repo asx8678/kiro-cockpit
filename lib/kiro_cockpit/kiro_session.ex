@@ -17,9 +17,12 @@ defmodule KiroCockpit.KiroSession do
 
   Streaming normalization, back-pressure, and cancellation (kiro-1rd) live
   here. Client callback handling for `fs/*` / `terminal/*` (kiro-4ff) is
-  explicitly out of scope; this module forwards inbound requests verbatim
-  and the subscriber is responsible for responding via
-  `KiroCockpit.Acp.PortProcess.respond/3`.
+  integrated via the `:auto_callbacks` option (default `true`). When enabled,
+  known callback methods are automatically dispatched to
+  `KiroCockpit.KiroSession.Callbacks` and the JSON-RPC response is sent without
+  requiring the subscriber to call `respond/3`. The raw request is still
+  forwarded to the subscriber for observability/backward compatibility.
+  Unknown methods continue to require the subscriber to respond manually.
 
   ## Stream events (kiro-1rd)
 
@@ -87,7 +90,9 @@ defmodule KiroCockpit.KiroSession do
 
   alias KiroCockpit.Acp.PortProcess
   alias KiroCockpit.EventStore
+  alias KiroCockpit.KiroSession.Callbacks
   alias KiroCockpit.KiroSession.StreamEvent
+  alias KiroCockpit.KiroSession.TerminalManager
   alias KiroCockpit.Telemetry
 
   # ACP protocol defaults per kiro-acp-instructions.md
@@ -148,6 +153,7 @@ defmodule KiroCockpit.KiroSession do
           modes: map() | nil,
           config_options: [map()] | nil,
           protocol_version: pos_integer() | nil,
+          auto_callbacks: boolean(),
           turn_id: non_neg_integer(),
           turn_status: turn_status(),
           last_stop_reason: String.t() | nil,
@@ -178,6 +184,9 @@ defmodule KiroCockpit.KiroSession do
             client_info: nil,
             client_capabilities: nil,
             persist_messages: true,
+            # Auto callback handling (kiro-4ff) --------------------------
+            auto_callbacks: true,
+            terminal_manager: nil,
             # Stream normalization (kiro-1rd) -----------------------------
             stream_buffer: nil,
             stream_buffer_size: 0,
@@ -215,6 +224,12 @@ defmodule KiroCockpit.KiroSession do
       `{:kiro_stream_overflow, session_pid, total_dropped}` per drop.
     * `:persist_messages` — whether to persist raw inbound/outbound ACP
       messages to `EventStore` (default `true`).
+    * `:auto_callbacks` — whether to automatically handle known
+      client callback methods (`fs/*`, `terminal/*`) per
+      kiro-acp-instructions.md §9 (default `true`). When `true`,
+      inbound requests for known methods are both forwarded to the
+      subscriber (for observability) AND auto-replied. When `false`,
+      the subscriber is responsible for calling `respond/3`.
     * `:name` — GenServer registration name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -451,6 +466,7 @@ defmodule KiroCockpit.KiroSession do
          {:ok, subscriber} <- fetch_required(opts, :subscriber),
          {:ok, buffer_limit} <- fetch_buffer_limit(opts) do
       args = Keyword.get(opts, :args, @default_executable_args)
+      auto_callbacks = Keyword.get(opts, :auto_callbacks, true)
 
       port_opts =
         [executable: executable, args: args, owner: self()] ++ extra_port_opts(opts)
@@ -460,6 +476,11 @@ defmodule KiroCockpit.KiroSession do
           port_ref = Process.monitor(port_pid)
           sub_ref = Process.monitor(subscriber)
 
+          # Start TerminalManager if auto_callbacks is enabled.
+          # The TerminalManager is linked to this process; if it crashes,
+          # KiroSession also exits (which is acceptable for Stage-1).
+          terminal_manager = maybe_start_terminal_manager(auto_callbacks)
+
           state = %__MODULE__{
             port_process: port_pid,
             port_ref: port_ref,
@@ -468,6 +489,8 @@ defmodule KiroCockpit.KiroSession do
             executable: executable,
             args: args,
             persist_messages: Keyword.get(opts, :persist_messages, true),
+            auto_callbacks: auto_callbacks,
+            terminal_manager: terminal_manager,
             stream_buffer: :queue.new(),
             stream_buffer_limit: buffer_limit
           }
@@ -724,6 +747,7 @@ defmodule KiroCockpit.KiroSession do
       modes: state.modes,
       config_options: state.config_options,
       protocol_version: state.protocol_version,
+      auto_callbacks: state.auto_callbacks,
       turn_id: state.turn_id,
       turn_status: state.turn_status,
       last_stop_reason: state.last_stop_reason,
@@ -841,8 +865,11 @@ defmodule KiroCockpit.KiroSession do
 
   @impl GenServer
   def handle_info({:acp_request, port_pid, msg}, %{port_process: port_pid} = state) do
+    # Always forward to subscriber for observability/backward compatibility.
     send(state.subscriber, {:acp_request, self(), msg})
     persist_inbound(state, msg)
+    # Auto-handle known callback methods when enabled (kiro-4ff).
+    maybe_auto_handle_callback(state, port_pid, msg)
     {:noreply, state}
   end
 
@@ -939,10 +966,92 @@ defmodule KiroCockpit.KiroSession do
       PortProcess.stop(state.port_process, :normal, 2_000)
     end
 
+    # Clean up TerminalManager (kiro-4ff): kill all running terminal
+    # processes. TerminalManager.terminate/2 handles port cleanup.
+    if state.terminal_manager != nil and Process.alive?(state.terminal_manager) do
+      TerminalManager.stop(state.terminal_manager)
+    end
+
     :ok
   end
 
   # -- Internals ------------------------------------------------------------
+
+  # -- Auto callback handling (kiro-4ff) ------------------------------------
+
+  # When auto_callbacks is enabled and the inbound request method is known,
+  # dispatch to the callback handler and send the JSON-RPC response
+  # automatically. The subscriber still receives the raw request for
+  # observability but does NOT need to call respond/3.
+  #
+  # Unknown methods are NOT auto-handled — the subscriber must respond.
+  #
+  # Terminal methods are dispatched in a Task to avoid blocking the
+  # GenServer (terminal/wait_for_exit may block until the process exits).
+  @spec maybe_auto_handle_callback(t(), pid(), map()) :: :ok
+  defp maybe_auto_handle_callback(%{auto_callbacks: false}, _port_pid, _msg), do: :ok
+
+  defp maybe_auto_handle_callback(state, port_pid, %{id: id, method: method, params: params}) do
+    if Callbacks.known_method?(method) do
+      if String.starts_with?(method, "terminal/") do
+        handle_terminal_callback_async(state, port_pid, id, method, params)
+      else
+        handle_sync_callback(state, port_pid, id, method, params)
+      end
+    end
+
+    :ok
+  end
+
+  defp maybe_auto_handle_callback(_state, _port_pid, _msg), do: :ok
+
+  # fs/* methods are fast file operations — handle synchronously.
+  @spec handle_sync_callback(t(), pid(), integer() | binary(), String.t(), map()) :: :ok
+  defp handle_sync_callback(state, port_pid, id, method, params) do
+    case Callbacks.handle_request(method, params, state.terminal_manager) do
+      {:ok, result} ->
+        PortProcess.respond(port_pid, id, result)
+
+      {:error, code, message, data} ->
+        PortProcess.respond_error(port_pid, id, code, message, data)
+    end
+
+    :ok
+  end
+
+  # terminal/* methods may block (wait_for_exit) — handle async via Task.
+  @spec handle_terminal_callback_async(t(), pid(), integer() | binary(), String.t(), map()) :: :ok
+  defp handle_terminal_callback_async(state, port_pid, id, method, params) do
+    tm = state.terminal_manager
+
+    Task.start(fn ->
+      try do
+        result = Callbacks.handle_request(method, params, tm)
+
+        case result do
+          {:ok, value} ->
+            PortProcess.respond(port_pid, id, value)
+
+          {:error, code, message, data} ->
+            PortProcess.respond_error(port_pid, id, code, message, data)
+        end
+      rescue
+        e ->
+          Logger.warning(fn ->
+            "KiroSession terminal callback handler crashed: #{Exception.message(e)}"
+          end)
+
+          # Send a best-effort error response so the agent doesn't hang.
+          try do
+            PortProcess.respond_error(port_pid, id, -32_000, "Internal error", nil)
+          catch
+            :exit, _ -> :ok
+          end
+      end
+    end)
+
+    :ok
+  end
 
   @spec fetch_required(keyword(), atom()) :: {:ok, term()} | {:stop, term()}
   defp fetch_required(opts, key) do
@@ -951,6 +1060,14 @@ defmodule KiroCockpit.KiroSession do
       :error -> {:stop, {:invalid_option, key}}
     end
   end
+
+  @spec maybe_start_terminal_manager(boolean()) :: pid() | nil
+  defp maybe_start_terminal_manager(true) do
+    {:ok, tm} = TerminalManager.start_link()
+    tm
+  end
+
+  defp maybe_start_terminal_manager(false), do: nil
 
   @spec do_initialize(pid(), map(), pos_integer(), timeout()) ::
           {{:ok, map()}, map()} | {{:error, term()}, map()}
