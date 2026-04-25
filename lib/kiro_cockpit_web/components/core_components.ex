@@ -308,9 +308,13 @@ defmodule KiroCockpitWeb.CoreComponents do
     |> JS.pop_focus()
   end
 
+  attr :id, :string, required: true
+  attr :rest, :global
+  slot :inner_block, required: true
+
   def focus_wrapper(assigns) do
     ~H"""
-    <div id={@id} phx-hook="FocusWrap">
+    <div id={@id} phx-hook="Phoenix.FocusWrap" {@rest}>
       <span id={"#{@id}-start"} tabindex="0" aria-hidden="true" />
       {render_slot(@inner_block)}
       <span id={"#{@id}-end"} tabindex="0" aria-hidden="true" />
