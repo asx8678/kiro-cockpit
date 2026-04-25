@@ -15,11 +15,52 @@ defmodule KiroCockpit.KiroSession do
       {:acp_protocol_error, session_pid, reason, raw}
       {:acp_exit,       session_pid, status}
 
-  Streaming normalization, back-pressure, and cancellation (kiro-1rd) and
-  client callback handling for `fs/*` / `terminal/*` (kiro-4ff) are
-  explicitly out of scope. This module preserves and forwards raw inbound
-  messages; the subscriber is responsible for responding to agent requests
-  via `KiroCockpit.Acp.PortProcess.respond/3`.
+  Streaming normalization, back-pressure, and cancellation (kiro-1rd) live
+  here. Client callback handling for `fs/*` / `terminal/*` (kiro-4ff) is
+  explicitly out of scope; this module forwards inbound requests verbatim
+  and the subscriber is responsible for responding via
+  `KiroCockpit.Acp.PortProcess.respond/3`.
+
+  ## Stream events (kiro-1rd)
+
+  Every inbound `session/update` notification is normalized through
+  `KiroCockpit.KiroSession.StreamEvent.normalize/3` and pushed to the
+  subscriber as:
+
+      {:kiro_stream_event, session_pid, %KiroCockpit.KiroSession.StreamEvent{}}
+
+  The legacy `{:acp_notification, session_pid, msg}` is **also** sent for
+  backward compatibility. New code should subscribe to `:kiro_stream_event`;
+  raw `:acp_notification` will be deprecated when no callers remain.
+
+  Sequence numbers are monotonic per-session and assigned at receipt time,
+  so an ordered stream of events maps deterministically onto its source
+  ordering of `session/update` notifications.
+
+  A bounded recent-events buffer (`stream_buffer_limit`, default 256) is
+  kept in memory for inspection. Overflow drops the oldest event and
+  bumps `stream_dropped_count`; subscribers receive a one-shot marker
+  `{:kiro_stream_overflow, session_pid, total_dropped}` per drop.
+
+  ## Turn discipline (kiro-1rd)
+
+  A turn is **running** from the moment `prompt/3` is called until a
+  normalized `:turn_end` stream event arrives. The `session/prompt` RPC
+  result alone does **not** complete the turn — this is plan2.md §17 +
+  §30.4 gold-memory rule "Do not mark Kiro turns complete from
+  `session/prompt` response alone. Wait for `session/update` `turn_end`."
+
+  Inspect via `state/1`:
+
+    * `:turn_id` — increments per `prompt/3` call
+    * `:turn_status` — `:idle | :running | :cancel_requested | :complete`
+    * `:last_stop_reason` — recorded when prompt RPC result returns
+      (does NOT mark complete)
+
+  Cancellation (`cancel/2`) is **async per ACP spec**: it locally records
+  intent (`:cancel_requested`), fires a `session/cancel` notification, and
+  returns `:ok` immediately. The agent decides when to wrap up; the turn
+  isn't `:complete` until the matching `:turn_end` event lands.
 
   ## Lifecycle phases
 
@@ -46,6 +87,7 @@ defmodule KiroCockpit.KiroSession do
 
   alias KiroCockpit.Acp.PortProcess
   alias KiroCockpit.EventStore
+  alias KiroCockpit.KiroSession.StreamEvent
   alias KiroCockpit.Telemetry
 
   # ACP protocol defaults per kiro-acp-instructions.md
@@ -61,6 +103,10 @@ defmodule KiroCockpit.KiroSession do
   @default_request_timeout 30_000
   @default_prompt_timeout 300_000
 
+  # Default cap on the runtime-local recent-events ring. Tuned for
+  # introspection, not durability — storage owns truth, the runtime caches.
+  @default_stream_buffer_limit 256
+
   # -- Types ----------------------------------------------------------------
 
   @typedoc """
@@ -73,6 +119,18 @@ defmodule KiroCockpit.KiroSession do
   can inspect the final state, but no further ACP operations are possible.
   """
   @type phase :: :uninitialized | :initialized | :session_active | :transport_closed
+
+  @typedoc """
+  Turn lifecycle status.
+
+    * `:idle` — no turn has been started, or the previous turn completed.
+    * `:running` — `prompt/3` was called; awaiting normalized `turn_end`.
+    * `:cancel_requested` — `cancel/2` was called during a running turn;
+      the `session/cancel` notification has been sent. The turn stays in
+      this state until the agent wraps up and emits `turn_end`.
+    * `:complete` — a normalized `turn_end` event has arrived.
+  """
+  @type turn_status :: :idle | :running | :cancel_requested | :complete
 
   @typedoc """
   Summary of session state returned by `state/1`.
@@ -89,7 +147,14 @@ defmodule KiroCockpit.KiroSession do
           auth_methods: [map()] | nil,
           modes: map() | nil,
           config_options: [map()] | nil,
-          protocol_version: pos_integer() | nil
+          protocol_version: pos_integer() | nil,
+          turn_id: non_neg_integer(),
+          turn_status: turn_status(),
+          last_stop_reason: String.t() | nil,
+          stream_sequence: non_neg_integer(),
+          stream_buffer_size: non_neg_integer(),
+          stream_buffer_limit: pos_integer(),
+          stream_dropped_count: non_neg_integer()
         }
 
   # Internal state
@@ -112,7 +177,17 @@ defmodule KiroCockpit.KiroSession do
             args: nil,
             client_info: nil,
             client_capabilities: nil,
-            persist_messages: true
+            persist_messages: true,
+            # Stream normalization (kiro-1rd) -----------------------------
+            stream_buffer: nil,
+            stream_buffer_size: 0,
+            stream_buffer_limit: @default_stream_buffer_limit,
+            stream_dropped_count: 0,
+            stream_sequence: 0,
+            # Turn discipline (kiro-1rd) ----------------------------------
+            turn_id: 0,
+            turn_status: :idle,
+            last_stop_reason: nil
 
   @type t :: %__MODULE__{}
 
@@ -133,6 +208,13 @@ defmodule KiroCockpit.KiroSession do
     * `:cd` — working directory for the child process.
     * `:env` — environment variables for the child process.
     * `:max_line_bytes` — max line length for the port (default 4 MiB).
+    * `:stream_buffer_limit` — cap on the runtime-local recent-events ring
+      buffer (default `#{@default_stream_buffer_limit}`). Once the buffer
+      is full, the oldest event is evicted and `stream_dropped_count`
+      increments. The subscriber receives a one-shot
+      `{:kiro_stream_overflow, session_pid, total_dropped}` per drop.
+    * `:persist_messages` — whether to persist raw inbound/outbound ACP
+      messages to `EventStore` (default `true`).
     * `:name` — GenServer registration name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -219,6 +301,20 @@ defmodule KiroCockpit.KiroSession do
   `session/prompt` result (with `stopReason`). During the wait, KiroSession
   continues forwarding inbound notifications and requests to the subscriber.
 
+  ## Active-turn rejection (kiro-1rd)
+
+  A new prompt is rejected while the previous turn is still in flight:
+
+    * `{:error, :prompt_in_progress}` — the previous `session/prompt` RPC
+      has not returned yet (the request is on the wire).
+    * `{:error, :turn_in_progress}` — the prompt RPC has returned but the
+      normalized `:turn_end` stream event has not arrived yet, so
+      `turn_status` is still `:running` or `:cancel_requested`. Per
+      plan2.md §17 / §30.4 the turn is not complete on the prompt RPC
+      result alone — wait for `turn_end`.
+
+  Both errors are stable atoms; callers may pattern-match either.
+
   ## Parameters
 
     * `prompt_or_blocks` — a binary string or list of `%{"type" => ..., ...}` maps.
@@ -281,12 +377,60 @@ defmodule KiroCockpit.KiroSession do
   @doc """
   Send a JSON-RPC notification to the agent (fire-and-forget).
 
-  Useful for `session/cancel` and other notification methods. The
-  actual cancellation logic is kiro-1rd's concern; this is just plumbing.
+  This is a thin pass-through to `PortProcess.notify/3` and does not
+  update any local turn or stream state. Prefer `cancel/2` for cancellation
+  — it does the right thing with `turn_status`.
   """
   @spec notify(GenServer.server(), String.t(), map() | list() | nil) :: :ok
   def notify(session, method, params \\ %{}) when is_binary(method) do
     GenServer.cast(session, {:notify, method, params})
+  end
+
+  @doc """
+  Request cancellation of the active turn (kiro-1rd / kiro-acp-instructions §8).
+
+  Behavior depends on `turn_status`:
+
+    * `:running` — transitions to `:cancel_requested`, sends a
+      `session/cancel` notification with the active `sessionId`, and
+      returns `:ok`. The turn is **not** marked complete here —
+      cancellation is async per ACP: the agent must wrap up and emit a
+      `turn_end` (typically with `reason: "cancelled"`) before
+      `turn_status` becomes `:complete`.
+    * `:cancel_requested` — idempotent; returns `:ok` without sending another
+      notification.
+    * `:idle` or `:complete` — returns `{:error, :no_active_turn}`.
+    * Any phase other than `:session_active` — returns
+      `{:error, {:invalid_phase, phase}}`.
+
+  This is a synchronous `call` so the local state mutation is observable
+  immediately on return; the actual notification write is async to the
+  port.
+  """
+  @spec cancel(GenServer.server(), keyword()) :: :ok | {:error, term()}
+  def cancel(session, opts \\ []) when is_list(opts) do
+    GenServer.call(session, {:cancel, opts}, Keyword.get(opts, :timeout, 5_000))
+  end
+
+  @doc """
+  Returns the runtime-local buffer of recent normalized stream events,
+  oldest-first.
+
+  This is a **runtime cache**, not durable history (§10.2). The buffer is
+  bounded by `:stream_buffer_limit` — anything older than the cap has been
+  evicted. For full history, query `EventStore`.
+
+  ## Options
+
+    * `:limit` — take the most-recent N events (default: all in buffer).
+      Must be a non-negative integer; an invalid value returns
+      `{:error, {:invalid_option, {:limit, value}}}` rather than
+      crashing the GenServer.
+  """
+  @spec recent_stream_events(GenServer.server(), keyword()) ::
+          [StreamEvent.t()] | {:error, {:invalid_option, {:limit, term()}}}
+  def recent_stream_events(session, opts \\ []) when is_list(opts) do
+    GenServer.call(session, {:recent_stream_events, opts}, 5_000)
   end
 
   @doc """
@@ -304,7 +448,8 @@ defmodule KiroCockpit.KiroSession do
     Process.flag(:trap_exit, true)
 
     with {:ok, executable} <- fetch_required(opts, :executable),
-         {:ok, subscriber} <- fetch_required(opts, :subscriber) do
+         {:ok, subscriber} <- fetch_required(opts, :subscriber),
+         {:ok, buffer_limit} <- fetch_buffer_limit(opts) do
       args = Keyword.get(opts, :args, @default_executable_args)
 
       port_opts =
@@ -322,7 +467,9 @@ defmodule KiroCockpit.KiroSession do
             subscriber_ref: sub_ref,
             executable: executable,
             args: args,
-            persist_messages: Keyword.get(opts, :persist_messages, true)
+            persist_messages: Keyword.get(opts, :persist_messages, true),
+            stream_buffer: :queue.new(),
+            stream_buffer_limit: buffer_limit
           }
 
           {:ok, state}
@@ -495,12 +642,16 @@ defmodule KiroCockpit.KiroSession do
 
   # -- session/prompt (async) -----------------------------------------------
 
+  # Happy path: session is active, no in-flight RPC, and the prior turn
+  # has been observed as fully complete (turn_end already landed) or
+  # there has been no turn at all (idle).
   @impl GenServer
   def handle_call(
         {:prompt, prompt_or_blocks, opts},
         from,
-        %{phase: :session_active, pending_prompt: nil} = state
-      ) do
+        %{phase: :session_active, pending_prompt: nil, turn_status: turn_status} = state
+      )
+      when turn_status in [:idle, :complete] do
     blocks = normalize_prompt(prompt_or_blocks)
     timeout = Keyword.get(opts, :timeout, @default_prompt_timeout)
 
@@ -524,13 +675,35 @@ defmodule KiroCockpit.KiroSession do
 
     persist_outbound(state, "session/prompt", params)
 
-    state = %{state | pending_prompt: from, prompt_task_ref: task_ref}
+    # Turn discipline (kiro-1rd): mark the turn running. The prompt RPC
+    # result alone will NOT mark the turn complete — we wait for a
+    # normalized `:turn_end` stream event.
+    state = %{
+      state
+      | pending_prompt: from,
+        prompt_task_ref: task_ref,
+        turn_id: state.turn_id + 1,
+        turn_status: :running,
+        last_stop_reason: nil
+    }
+
     {:noreply, state}
   end
 
+  # An RPC is currently on the wire — short-circuit fast.
   def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, %{pending_prompt: pp} = state)
       when not is_nil(pp) do
     {:reply, {:error, :prompt_in_progress}, state}
+  end
+
+  # Active-turn guard (kiro-1rd Shepherd MUST fix): the previous prompt's
+  # RPC result has returned (`pending_prompt: nil`) but no normalized
+  # `:turn_end` event has arrived, so the turn is still in flight from
+  # the runtime's perspective. Reject with a stable distinct atom so
+  # callers can tell this apart from `:prompt_in_progress`.
+  def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, %{turn_status: ts} = state)
+      when ts in [:running, :cancel_requested] do
+    {:reply, {:error, :turn_in_progress}, state}
   end
 
   def handle_call({:prompt, _prompt_or_blocks, _opts}, _from, state) do
@@ -550,10 +723,68 @@ defmodule KiroCockpit.KiroSession do
       auth_methods: state.auth_methods,
       modes: state.modes,
       config_options: state.config_options,
-      protocol_version: state.protocol_version
+      protocol_version: state.protocol_version,
+      turn_id: state.turn_id,
+      turn_status: state.turn_status,
+      last_stop_reason: state.last_stop_reason,
+      stream_sequence: state.stream_sequence,
+      stream_buffer_size: state.stream_buffer_size,
+      stream_buffer_limit: state.stream_buffer_limit,
+      stream_dropped_count: state.stream_dropped_count
     }
 
     {:reply, summary, state}
+  end
+
+  # -- cancel ---------------------------------------------------------------
+
+  def handle_call({:cancel, _opts}, _from, %{phase: :transport_closed} = state) do
+    {:reply, {:error, :transport_closed}, state}
+  end
+
+  def handle_call({:cancel, _opts}, _from, %{phase: phase} = state)
+      when phase != :session_active do
+    {:reply, {:error, {:invalid_phase, phase}}, state}
+  end
+
+  def handle_call({:cancel, _opts}, _from, %{turn_status: :running} = state) do
+    # Send the ACP cancel notification — fire-and-forget per spec.
+    # Local state flips immediately so callers see :cancel_requested.
+    params = %{"sessionId" => state.session_id}
+    :ok = PortProcess.notify(state.port_process, "session/cancel", params)
+    # `session/cancel` is an ACP notification — persist it as a
+    # notification envelope (no `id`) so EventStore classifies it as
+    # `message_type: "notification"` with `rpc_id: nil` instead of
+    # synthesising a fake request id.
+    persist_outbound_notification(state, "session/cancel", params)
+
+    {:reply, :ok, %{state | turn_status: :cancel_requested}}
+  end
+
+  def handle_call({:cancel, _opts}, _from, %{turn_status: :cancel_requested} = state) do
+    # Idempotent.
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:cancel, _opts}, _from, state) do
+    {:reply, {:error, :no_active_turn}, state}
+  end
+
+  # -- recent_stream_events -------------------------------------------------
+
+  def handle_call({:recent_stream_events, opts}, _from, state) do
+    case fetch_events_limit(opts) do
+      {:ok, nil} ->
+        {:reply, :queue.to_list(state.stream_buffer), state}
+
+      {:ok, n} ->
+        {:reply, Enum.take(:queue.to_list(state.stream_buffer), -n), state}
+
+      {:error, reason} ->
+        # Invalid `:limit` is a caller bug, not a runtime fault. Surface
+        # it as a plain error tuple so the GenServer keeps serving.
+        {:reply, {:error, reason}, state}
+    end
   end
 
   # -- respond / respond_error / notify -------------------------------------
@@ -599,8 +830,12 @@ defmodule KiroCockpit.KiroSession do
 
   @impl GenServer
   def handle_info({:acp_notification, port_pid, msg}, %{port_process: port_pid} = state) do
+    # 1. Forward raw notification to subscriber (back-compat).
     send(state.subscriber, {:acp_notification, self(), msg})
+    # 2. Persist (best-effort) before any normalization side-effects.
     persist_inbound(state, msg)
+    # 3. Normalize and fan out to subscriber if it's a session/update.
+    state = maybe_emit_stream_event(state, msg)
     {:noreply, state}
   end
 
@@ -639,6 +874,12 @@ defmodule KiroCockpit.KiroSession do
       when not is_nil(from) do
     GenServer.reply(from, result)
     emit_prompt_telemetry(:stop, state.session_id)
+
+    # Turn discipline (kiro-1rd): record the prompt's stopReason for
+    # introspection but do NOT flip turn_status here. The turn isn't
+    # complete until the normalized :turn_end event arrives.
+    state = record_prompt_stop_reason(state, result)
+
     cleanup_prompt(state)
   end
 
@@ -686,7 +927,12 @@ defmodule KiroCockpit.KiroSession do
   end
 
   @impl GenServer
-  def terminate(_reason, state) do
+  def terminate(reason, state) do
+    # Crash dump (kiro-1rd / plan2.md §12.9): on abnormal stop, emit a
+    # structured snapshot before the process dies. Storage owns truth;
+    # this dump is the runtime's last word for debugging.
+    if abnormal?(reason), do: dump_crash(reason, state)
+
     state = reply_pending_prompt(state, {:error, :session_terminated})
 
     if is_pid(state.port_process) and Process.alive?(state.port_process) do
@@ -757,6 +1003,105 @@ defmodule KiroCockpit.KiroSession do
 
   defp normalize_prompt(blocks) when is_list(blocks), do: blocks
 
+  # -- Stream event normalization (kiro-1rd) -------------------------------
+
+  # Only `session/update` notifications normalize into stream events. Other
+  # methods (e.g. agent-initiated `_kiro.dev/...` if any are notifications)
+  # pass through the legacy raw forwarding path only.
+  @spec maybe_emit_stream_event(t(), map()) :: t()
+  defp maybe_emit_stream_event(state, %{method: "session/update", params: params})
+       when is_map(params) do
+    sequence = state.stream_sequence
+    occurred_at = DateTime.utc_now()
+    event = StreamEvent.normalize(params, sequence, occurred_at)
+
+    # Push to subscriber FIRST — ordering must follow inbound arrival.
+    send(state.subscriber, {:kiro_stream_event, self(), event})
+
+    state = enqueue_stream_event(state, event)
+    state = apply_turn_end_if_present(state, event)
+    %{state | stream_sequence: sequence + 1}
+  end
+
+  defp maybe_emit_stream_event(state, _msg), do: state
+
+  # Bounded enqueue: if at limit, drop oldest, bump dropped_count, and
+  # send a one-shot overflow marker to the subscriber. The PortProcess
+  # hot path is never blocked here — we just shrink the buffer.
+  @spec enqueue_stream_event(t(), StreamEvent.t()) :: t()
+  defp enqueue_stream_event(state, event) do
+    if state.stream_buffer_size >= state.stream_buffer_limit do
+      # Drop oldest. :queue.out/1 returns {{:value, item}, q} | {:empty, q}.
+      {_dropped, smaller} = :queue.out(state.stream_buffer)
+      dropped = state.stream_dropped_count + 1
+      send(state.subscriber, {:kiro_stream_overflow, self(), dropped})
+
+      %{
+        state
+        | stream_buffer: :queue.in(event, smaller),
+          stream_dropped_count: dropped
+      }
+    else
+      %{
+        state
+        | stream_buffer: :queue.in(event, state.stream_buffer),
+          stream_buffer_size: state.stream_buffer_size + 1
+      }
+    end
+  end
+
+  # Turn discipline: a normalized :turn_end stream event is the ONLY signal
+  # that flips :running / :cancel_requested → :complete.
+  @spec apply_turn_end_if_present(t(), StreamEvent.t()) :: t()
+  defp apply_turn_end_if_present(state, %StreamEvent{kind: :turn_end} = event)
+       when state.turn_status in [:running, :cancel_requested] do
+    reason = get_in(event.raw, ["update", "reason"])
+    last_stop_reason = state.last_stop_reason || reason
+
+    %{state | turn_status: :complete, last_stop_reason: last_stop_reason}
+  end
+
+  defp apply_turn_end_if_present(state, _event), do: state
+
+  # Record the prompt RPC's stopReason without flipping turn_status. Plan2
+  # §30.4 gold-memory rule: "Do not mark Kiro turns complete from
+  # session/prompt response alone."
+  @spec record_prompt_stop_reason(t(), term()) :: t()
+  defp record_prompt_stop_reason(state, {:ok, %{"stopReason" => reason}})
+       when is_binary(reason) do
+    %{state | last_stop_reason: reason}
+  end
+
+  defp record_prompt_stop_reason(state, _result), do: state
+
+  # Init-time validator: returns `{:stop, ...}` on bad input so start_link
+  # surfaces a clean `{:error, reason}` rather than crashing the parent.
+  @spec fetch_buffer_limit(keyword()) :: {:ok, pos_integer()} | {:stop, term()}
+  defp fetch_buffer_limit(opts) do
+    case Keyword.get(opts, :stream_buffer_limit, @default_stream_buffer_limit) do
+      n when is_integer(n) and n > 0 ->
+        {:ok, n}
+
+      other ->
+        {:stop, {:invalid_option, {:stream_buffer_limit, other}}}
+    end
+  end
+
+  # Caller-time validator for `recent_stream_events/2` :limit option.
+  # Invalid input is the caller's bug, not the GenServer's; we surface a
+  # plain error tuple instead of crashing the runtime.
+  @spec fetch_events_limit(keyword()) ::
+          {:ok, non_neg_integer() | nil}
+          | {:error, {:invalid_option, {:limit, term()}}}
+  defp fetch_events_limit(opts) do
+    case Keyword.fetch(opts, :limit) do
+      :error -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, n} when is_integer(n) and n >= 0 -> {:ok, n}
+      {:ok, other} -> {:error, {:invalid_option, {:limit, other}}}
+    end
+  end
+
   @spec call_timeout(keyword()) :: timeout()
   defp call_timeout(opts) do
     case Keyword.get(opts, :timeout, @default_request_timeout) do
@@ -818,15 +1163,35 @@ defmodule KiroCockpit.KiroSession do
 
   # -- Best-effort EventStore persistence -----------------------------------
 
-  # Outbound: reconstruct a JSON-RPC request envelope for the raw_payload
-  # so EventStore classification works correctly. The id is a placeholder
-  # since we don't know what PortProcess assigned internally.
+  # Outbound request: reconstruct a JSON-RPC request envelope for the
+  # raw_payload so EventStore classification works correctly. The id is a
+  # placeholder since we don't know what PortProcess assigned internally;
+  # the rpc_id field is mostly useful as a non-nil indicator that this
+  # was a request.
   @spec persist_outbound(t(), String.t(), map()) :: :ok
   defp persist_outbound(%{persist_messages: false}, _method, _params), do: :ok
 
   defp persist_outbound(state, method, params) do
     payload = %{"jsonrpc" => "2.0", "id" => 0, "method" => method, "params" => params}
+    write_outbound(state, method, payload)
+  end
 
+  # Outbound notification: reconstruct a JSON-RPC notification envelope
+  # (no `id`) so EventStore classifies it as `message_type: "notification"`
+  # with `rpc_id: nil`. Used for fire-and-forget messages like
+  # `session/cancel` (kiro-1rd Shepherd MUST fix).
+  @spec persist_outbound_notification(t(), String.t(), map()) :: :ok
+  defp persist_outbound_notification(%{persist_messages: false}, _method, _params), do: :ok
+
+  defp persist_outbound_notification(state, method, params) do
+    payload = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+    write_outbound(state, method, payload)
+  end
+
+  # Shared writer for both outbound shapes — keeps the rescue block
+  # in one place and the message envelope concern at the call site.
+  @spec write_outbound(t(), String.t(), map()) :: :ok
+  defp write_outbound(state, method, payload) do
     try do
       EventStore.record_acp_message("client_to_agent", payload, session_id: state.session_id)
     rescue
@@ -880,4 +1245,38 @@ defmodule KiroCockpit.KiroSession do
   end
 
   defp persist_inbound(_state, _msg), do: :ok
+
+  # -- Crash dump (§12.9) --------------------------------------------------
+
+  @spec abnormal?(term()) :: boolean()
+  defp abnormal?(:normal), do: false
+  defp abnormal?(:shutdown), do: false
+  defp abnormal?({:shutdown, _}), do: false
+  defp abnormal?(_), do: true
+
+  @spec dump_crash(term(), t()) :: :ok
+  defp dump_crash(reason, state) do
+    Logger.error(fn ->
+      "KiroSession abnormal terminate: " <>
+        inspect(
+          %{
+            reason: reason,
+            session_id: state.session_id,
+            phase: state.phase,
+            turn_id: state.turn_id,
+            turn_status: state.turn_status,
+            last_stop_reason: state.last_stop_reason,
+            pending_prompt: state.pending_prompt != nil,
+            stream_sequence: state.stream_sequence,
+            stream_buffer_size: state.stream_buffer_size,
+            stream_dropped_count: state.stream_dropped_count,
+            port_process: state.port_process
+          },
+          limit: :infinity,
+          printable_limit: 4_096
+        )
+    end)
+
+    :ok
+  end
 end
