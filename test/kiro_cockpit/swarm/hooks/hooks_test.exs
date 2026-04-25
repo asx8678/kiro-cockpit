@@ -30,8 +30,41 @@ defmodule KiroCockpit.Swarm.HooksTest do
       assert result.messages |> Enum.any?(&String.contains?(&1, "Create or activate a task"))
     end
 
+    test "blocks wrapper actions with write permission when no active task exists" do
+      event =
+        Event.new(:kiro_session_prompt,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: PlanMode.new()}
+
+      assert TaskEnforcementHook.filter(event)
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :block, reason: "No active task"} = result
+    end
+
     test "allows read-only actions in planning mode without active task" do
       event = Event.new(:read, session_id: "sess_1", agent_id: "agent_1")
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "allows wrapper read-only actions in planning mode without active task" do
+      event =
+        Event.new(:kiro_session_prompt,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          permission_level: :read
+        )
+
       {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
       ctx = %{plan_mode: plan_mode}
 
@@ -133,6 +166,30 @@ defmodule KiroCockpit.Swarm.HooksTest do
       assert %HookResult{decision: :block, reason: "File out of scope"} = result
     end
 
+    test "checks file scope from string payload keys" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "sess_1",
+          owner_id: "agent_1",
+          content: "Test task",
+          category: "acting",
+          files_scope: ["lib/allowed/"]
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+
+      event =
+        Event.new(:write,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          payload: %{"target_path" => "lib/forbidden/file.ex"}
+        )
+
+      result = TaskEnforcementHook.on_event(event, %{plan_mode: PlanMode.new()})
+
+      assert %HookResult{decision: :block, reason: "File out of scope"} = result
+    end
+
     test "allows write actions when file is in scope" do
       # Create an acting task with file scope
       {:ok, task} =
@@ -214,6 +271,18 @@ defmodule KiroCockpit.Swarm.HooksTest do
 
       assert %HookResult{decision: :modify} = result
       assert result.messages |> Enum.any?(&String.contains?(&1, "plan mode"))
+    end
+
+    test "does not describe mutating wrapper action as allowed in plan mode" do
+      event = Event.new(:kiro_session_prompt, permission_level: :write)
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+      ctx = %{plan_mode: plan_mode, first_action_shown: false}
+
+      result = PlanModeFirstActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :modify} = result
+      assert Enum.any?(result.messages, &String.contains?(&1, "Mutating actions are blocked"))
+      refute Enum.any?(result.messages, &String.contains?(&1, "allowed for discovery purposes"))
     end
 
     test "does not inject guidance when first action already shown" do

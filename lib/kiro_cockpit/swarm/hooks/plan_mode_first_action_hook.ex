@@ -13,6 +13,8 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
 
   alias KiroCockpit.Swarm.{Event, HookResult, PlanMode}
 
+  @permissions [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+
   @impl true
   def name, do: :plan_mode_first_action
 
@@ -20,9 +22,10 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
   def priority, do: 96
 
   @impl true
-  def filter(%Event{action_name: action}) do
-    # Apply to all actions that could be the first action in plan mode
-    action in [:read, :shell_read, :write, :shell_write, :terminal, :external, :destructive]
+  def filter(%Event{} = event) do
+    # Apply to wrapper/tool actions that carry a permission level, plus direct
+    # permission-shaped action names used by foundation tests.
+    permission_for_event(event) in @permissions
   end
 
   @impl true
@@ -31,7 +34,7 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
     first_action_shown = Map.get(ctx, :first_action_shown, false)
 
     if PlanMode.planning_locked?(plan_mode) and not first_action_shown do
-      guidance = build_guidance(event.action_name, plan_mode)
+      guidance = build_guidance(event, plan_mode)
       # Mark that we've shown the first action guidance
       _updated_ctx = Map.put(ctx, :first_action_shown, true)
       HookResult.modify(event, [guidance], hook_metadata: %{first_action_shown: true})
@@ -40,24 +43,48 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
     end
   end
 
-  defp build_guidance(action, plan_mode) do
+  defp build_guidance(event, plan_mode) do
+    action = event.action_name
+    permission = permission_for_event(event)
+    permission_guidance = permission_guidance(permission)
+
     case plan_mode.state do
       :planning ->
         "You are in plan mode (planning). " <>
           "Focus on read-only discovery: explore the codebase, understand the project structure, " <>
-          "and gather information. " <>
-          "Avoid making changes until the plan is approved. " <>
-          "Action '#{action}' is allowed for discovery purposes."
+          "and gather information. Avoid making changes until the plan is approved. " <>
+          "Action '#{action}' requested #{permission_label(permission)}. #{permission_guidance}"
 
       :waiting_for_approval ->
         "You are in plan mode (waiting for approval). " <>
-          "The plan draft is ready for review. " <>
-          "You can continue read-only discovery while waiting. " <>
-          "Action '#{action}' is allowed for discovery purposes. " <>
+          "The plan draft is ready for review. You can continue read-only discovery while waiting. " <>
+          "Action '#{action}' requested #{permission_label(permission)}. #{permission_guidance} " <>
           "Once approved, you can proceed with implementation."
 
       _ ->
         "Action '#{action}' detected."
     end
   end
+
+  defp permission_guidance(permission) when permission in [:read, :shell_read] do
+    "This read-only action is allowed for discovery purposes."
+  end
+
+  defp permission_guidance(_permission) do
+    "Mutating actions are blocked in plan mode until the plan is approved."
+  end
+
+  defp permission_label(nil), do: "no explicit permission"
+  defp permission_label(permission), do: "#{permission} permission"
+
+  defp permission_for_event(%Event{permission_level: permission})
+       when permission in @permissions do
+    permission
+  end
+
+  defp permission_for_event(%Event{action_name: action}) when action in @permissions do
+    action
+  end
+
+  defp permission_for_event(_event), do: nil
 end

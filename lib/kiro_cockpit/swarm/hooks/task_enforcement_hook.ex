@@ -17,6 +17,8 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   alias KiroCockpit.Swarm.{Event, HookResult, PlanMode}
   alias KiroCockpit.Swarm.Tasks.{TaskManager, TaskScope}
 
+  @permissions [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+
   @impl true
   def name, do: :task_enforcement
 
@@ -24,10 +26,10 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   def priority, do: 95
 
   @impl true
-  def filter(%Event{action_name: action}) do
-    # Apply to all actions except exempt ones (handled by other hooks)
-    # This hook runs for all actions that need task enforcement
-    action in [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+  def filter(%Event{} = event) do
+    # Apply to wrapper/tool actions that carry a permission level, plus the
+    # direct permission-shaped action names used by foundation tests.
+    permission_for_event(event) in @permissions
   end
 
   @impl true
@@ -46,10 +48,11 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   defp check_active_task_requirement(event, ctx) do
     plan_mode = Map.get(ctx, :plan_mode) || PlanMode.new()
     active_task = get_active_task(event)
+    permission = permission_for_event(event)
 
     cond do
       # Exempt: read-only actions in planning/waiting mode (no task required)
-      read_only_action?(event.action_name) and PlanMode.planning_locked?(plan_mode) ->
+      read_only_permission?(permission) and PlanMode.planning_locked?(plan_mode) ->
         :ok
 
       # Active task exists - continue to category check
@@ -61,9 +64,6 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
         {:blocked, "No active task",
          "Create or activate a task before performing this action. " <>
            "Use `task create` or `task activate` to start a task."}
-
-      true ->
-        :ok
     end
   end
 
@@ -72,7 +72,7 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     active_task = get_active_task(event)
 
     if active_task do
-      permission = action_to_permission(event.action_name)
+      permission = permission_for_event(event)
 
       case TaskScope.permission_allowed?(active_task, permission) do
         {:ok, :allowed} ->
@@ -110,8 +110,7 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
           {:cont, :ok}
 
         {:error, :out_of_scope} ->
-          {:halt,
-           {:blocked, "File out of scope", "File '#{path}' is outside task's file scope."}}
+          {:halt, {:blocked, "File out of scope", "File '#{path}' is outside task's file scope."}}
       end
     end)
   end
@@ -126,17 +125,19 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     end
   end
 
-  defp read_only_action?(action) when action in [:read, :shell_read], do: true
-  defp read_only_action?(_), do: false
+  defp read_only_permission?(permission) when permission in [:read, :shell_read], do: true
+  defp read_only_permission?(_permission), do: false
 
-  defp action_to_permission(:read), do: :read
-  defp action_to_permission(:write), do: :write
-  defp action_to_permission(:shell_read), do: :shell_read
-  defp action_to_permission(:shell_write), do: :shell_write
-  defp action_to_permission(:terminal), do: :terminal
-  defp action_to_permission(:external), do: :external
-  defp action_to_permission(:destructive), do: :destructive
-  defp action_to_permission(_), do: :read
+  defp permission_for_event(%Event{permission_level: permission})
+       when permission in @permissions do
+    permission
+  end
+
+  defp permission_for_event(%Event{action_name: action}) when action in @permissions do
+    action
+  end
+
+  defp permission_for_event(_event), do: nil
 
   defp extract_target_paths(event) do
     # Look for target paths in payload or metadata
@@ -147,7 +148,7 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
 
   defp extract_paths_from_map(map) do
     Enum.flat_map([:target_path, :paths, :file, :files], fn key ->
-      case Map.get(map, key) do
+      case Map.get(map, key) || Map.get(map, Atom.to_string(key)) do
         path when is_binary(path) -> [path]
         list when is_list(list) -> Enum.filter(list, &is_binary/1)
         _ -> []
