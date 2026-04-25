@@ -6,11 +6,15 @@ defmodule KiroCockpit.Plans do
   import Ecto.Query
 
   alias Ecto.Multi
+  alias KiroCockpit.Plans.{Plan, PlanEvent, PlanStep}
   alias KiroCockpit.Repo
-  alias KiroCockpit.Plans.{Plan, PlanStep, PlanEvent}
 
   @type plan_id :: Ecto.UUID.t()
   @type session_id :: String.t()
+
+  @multi_new &Multi.new/0
+  @spec new_multi() :: Multi.t()
+  defp new_multi, do: @multi_new.()
 
   @doc """
   Creates a new draft plan with steps and a creation event.
@@ -32,7 +36,7 @@ defmodule KiroCockpit.Plans do
       project_snapshot_hash: Keyword.get(opts, :project_snapshot_hash, "")
     }
 
-    Multi.new()
+    new_multi()
     |> Multi.insert(:plan, Plan.changeset(%Plan{}, plan_attrs))
     |> Multi.run(:steps, fn repo, %{plan: plan} ->
       # Insert each step, associating with the plan
@@ -113,7 +117,7 @@ defmodule KiroCockpit.Plans do
     if plan.status != "draft" do
       {:error, :invalid_transition}
     else
-      Multi.new()
+      new_multi()
       |> Multi.update(
         :plan,
         Plan.changeset(plan, %{status: "approved", approved_at: DateTime.utc_now()})
@@ -147,7 +151,7 @@ defmodule KiroCockpit.Plans do
     if plan.status in ["rejected", "superseded", "failed", "completed"] do
       {:error, :invalid_transition}
     else
-      Multi.new()
+      new_multi()
       |> Multi.update(:plan, Plan.changeset(plan, %{status: "rejected"}))
       |> Multi.run(:event, fn repo, %{plan: plan} ->
         event_attrs = %{
@@ -180,7 +184,7 @@ defmodule KiroCockpit.Plans do
     # The old plan's steps may be used as a starting point; but we'll just create empty steps.
     # The caller (NanoPlanner) will generate new steps.
     # We'll also mark old plan as superseded.
-    Multi.new()
+    new_multi()
     |> Multi.update(:old_plan, Plan.changeset(old_plan, %{status: "superseded"}))
     |> Multi.run(:new_plan, fn repo, %{old_plan: old_plan} ->
       new_plan_attrs = %{
@@ -227,10 +231,8 @@ defmodule KiroCockpit.Plans do
     plan = Repo.get!(Plan, plan_id)
 
     # Guard: only allow status transitions used for running, completed, failed, superseded
-    unless status in ["running", "completed", "failed", "superseded"] do
-      {:error, :invalid_transition}
-    else
-      Multi.new()
+    if status in ["running", "completed", "failed", "superseded"] do
+      new_multi()
       |> Multi.update(:plan, Plan.changeset(plan, %{status: status}))
       |> Multi.run(:event, fn repo, %{plan: plan} ->
         event_attrs = %{
@@ -247,6 +249,8 @@ defmodule KiroCockpit.Plans do
         {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
         {:error, _failed_step, reason, _changes} -> {:error, reason}
       end
+    else
+      {:error, :invalid_transition}
     end
   end
 
