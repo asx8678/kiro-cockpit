@@ -77,9 +77,10 @@ defmodule KiroCockpit.Plans do
   """
   @spec get_plan(plan_id) :: Plan.t() | nil
   def get_plan(plan_id) do
-    Plan
-    |> Repo.get(plan_id)
-    |> Repo.preload([:plan_steps, :plan_events])
+    case Repo.get(Plan, plan_id) do
+      nil -> nil
+      plan -> Repo.preload(plan, [:plan_steps, :plan_events])
+    end
   end
 
   @doc """
@@ -109,25 +110,29 @@ defmodule KiroCockpit.Plans do
   def approve_plan(plan_id) do
     plan = Repo.get!(Plan, plan_id)
 
-    Multi.new()
-    |> Multi.update(
-      :plan,
-      Plan.changeset(plan, %{status: "approved", approved_at: DateTime.utc_now()})
-    )
-    |> Multi.run(:event, fn repo, %{plan: plan} ->
-      event_attrs = %{
-        plan_id: plan.id,
-        event_type: "approved",
-        payload: %{},
-        created_at: DateTime.utc_now()
-      }
+    if plan.status != "draft" do
+      {:error, :invalid_transition}
+    else
+      Multi.new()
+      |> Multi.update(
+        :plan,
+        Plan.changeset(plan, %{status: "approved", approved_at: DateTime.utc_now()})
+      )
+      |> Multi.run(:event, fn repo, %{plan: plan} ->
+        event_attrs = %{
+          plan_id: plan.id,
+          event_type: "approved",
+          payload: %{},
+          created_at: DateTime.utc_now()
+        }
 
-      repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-    end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
-      {:error, _failed_step, reason, _changes} -> {:error, reason}
+        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
+        {:error, _failed_step, reason, _changes} -> {:error, reason}
+      end
     end
   end
 
@@ -139,22 +144,26 @@ defmodule KiroCockpit.Plans do
   def reject_plan(plan_id, reason \\ nil) do
     plan = Repo.get!(Plan, plan_id)
 
-    Multi.new()
-    |> Multi.update(:plan, Plan.changeset(plan, %{status: "rejected"}))
-    |> Multi.run(:event, fn repo, %{plan: plan} ->
-      event_attrs = %{
-        plan_id: plan.id,
-        event_type: "rejected",
-        payload: if(reason, do: %{"reason" => reason}, else: %{}),
-        created_at: DateTime.utc_now()
-      }
+    if plan.status in ["rejected", "superseded", "failed", "completed"] do
+      {:error, :invalid_transition}
+    else
+      Multi.new()
+      |> Multi.update(:plan, Plan.changeset(plan, %{status: "rejected"}))
+      |> Multi.run(:event, fn repo, %{plan: plan} ->
+        event_attrs = %{
+          plan_id: plan.id,
+          event_type: "rejected",
+          payload: if(reason, do: %{"reason" => reason}, else: %{}),
+          created_at: DateTime.utc_now()
+        }
 
-      repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-    end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
-      {:error, _failed_step, reason, _changes} -> {:error, reason}
+        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
+        {:error, _failed_step, reason, _changes} -> {:error, reason}
+      end
     end
   end
 
@@ -217,22 +226,27 @@ defmodule KiroCockpit.Plans do
   def update_status(plan_id, status, payload \\ %{}) do
     plan = Repo.get!(Plan, plan_id)
 
-    Multi.new()
-    |> Multi.update(:plan, Plan.changeset(plan, %{status: status}))
-    |> Multi.run(:event, fn repo, %{plan: plan} ->
-      event_attrs = %{
-        plan_id: plan.id,
-        event_type: status,
-        payload: payload,
-        created_at: DateTime.utc_now()
-      }
+    # Guard: only allow status transitions used for running, completed, failed, superseded
+    unless status in ["running", "completed", "failed", "superseded"] do
+      {:error, :invalid_transition}
+    else
+      Multi.new()
+      |> Multi.update(:plan, Plan.changeset(plan, %{status: status}))
+      |> Multi.run(:event, fn repo, %{plan: plan} ->
+        event_attrs = %{
+          plan_id: plan.id,
+          event_type: status,
+          payload: payload,
+          created_at: DateTime.utc_now()
+        }
 
-      repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
-    end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
-      {:error, _failed_step, reason, _changes} -> {:error, reason}
+        repo.insert(PlanEvent.changeset(%PlanEvent{}, event_attrs))
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{plan: plan}} -> {:ok, Repo.preload(plan, [:plan_steps, :plan_events])}
+        {:error, _failed_step, reason, _changes} -> {:error, reason}
+      end
     end
   end
 
@@ -241,6 +255,9 @@ defmodule KiroCockpit.Plans do
   """
   @spec stale_plan_hash(plan_id) :: String.t() | nil
   def stale_plan_hash(plan_id) do
-    Repo.get(Plan, plan_id, select: [:project_snapshot_hash]) |> Map.get(:project_snapshot_hash)
+    case Repo.get(Plan, plan_id, select: [:project_snapshot_hash]) do
+      nil -> nil
+      plan -> plan.project_snapshot_hash
+    end
   end
 end

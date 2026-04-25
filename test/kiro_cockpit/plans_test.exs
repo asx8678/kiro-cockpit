@@ -81,13 +81,17 @@ defmodule KiroCockpit.PlansTest do
       assert length(fetched.plan_steps) == 0
       assert length(fetched.plan_events) == 1
     end
+
+    test "returns nil for missing plan" do
+      assert nil == Plans.get_plan(Ecto.UUID.generate())
+    end
   end
 
   describe "list_plans/2" do
     test "lists plans for a session" do
       session_id = "sess_test789"
-      {:ok, plan1} = Plans.create_plan(session_id, "request1", :nano, [], default_opts())
-      {:ok, plan2} = Plans.create_plan(session_id, "request2", :nano_deep, [], default_opts())
+      {:ok, _plan1} = Plans.create_plan(session_id, "request1", :nano, [], default_opts())
+      {:ok, _plan2} = Plans.create_plan(session_id, "request2", :nano_deep, [], default_opts())
 
       # Different session
       {:ok, _} = Plans.create_plan("other_session", "request3", :nano, [], default_opts())
@@ -117,8 +121,14 @@ defmodule KiroCockpit.PlansTest do
     test "fails to approve a non-draft plan" do
       {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
       {:ok, _} = Plans.approve_plan(plan.id)
-      # Already approved, approve again? Should still work? The status check is not enforced.
-      # But we can test that status stays approved.
+      # Already approved, approve again should fail
+      assert {:error, :invalid_transition} = Plans.approve_plan(plan.id)
+    end
+
+    test "fails to approve a rejected plan" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      {:ok, _} = Plans.reject_plan(plan.id)
+      assert {:error, :invalid_transition} = Plans.approve_plan(plan.id)
     end
   end
 
@@ -130,6 +140,13 @@ defmodule KiroCockpit.PlansTest do
       assert length(rejected_plan.plan_events) == 2
       event = Enum.find(rejected_plan.plan_events, &(&1.event_type == "rejected"))
       assert event.payload == %{"reason" => "user cancelled"}
+    end
+
+    test "fails to reject a terminal plan" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      {:ok, _} = Plans.reject_plan(plan.id)
+      # plan is now rejected (terminal)
+      assert {:error, :invalid_transition} = Plans.reject_plan(plan.id)
     end
   end
 
@@ -168,6 +185,11 @@ defmodule KiroCockpit.PlansTest do
       assert failed_plan.status == "failed"
       event = Enum.find(failed_plan.plan_events, &(&1.event_type == "failed"))
       assert event.payload == %{"error" => "oops"}
+    end
+
+    test "fails to transition to invalid status" do
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
+      assert {:error, :invalid_transition} = Plans.update_status(plan.id, "draft")
     end
   end
 
@@ -273,6 +295,10 @@ defmodule KiroCockpit.PlansTest do
         )
 
       assert Plans.stale_plan_hash(plan.id) == "abc123"
+    end
+
+    test "returns nil for missing plan" do
+      assert nil == Plans.stale_plan_hash(Ecto.UUID.generate())
     end
   end
 end
