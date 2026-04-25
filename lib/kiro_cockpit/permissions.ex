@@ -29,6 +29,19 @@ defmodule KiroCockpit.Permissions do
 
   @escalation_order [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
 
+  # Explicit string→atom mapping so arbitrary LLM strings never pollute the atom table.
+  @string_to_permission %{
+    "read" => :read,
+    "write" => :write,
+    "shell_read" => :shell_read,
+    "shell_write" => :shell_write,
+    "terminal" => :terminal,
+    "external" => :external,
+    "destructive" => :destructive,
+    "shell" => :shell_write,
+    "shell_readonly" => :shell_read
+  }
+
   @type permission ::
           :read | :write | :shell_read | :shell_write | :terminal | :external | :destructive
   @type policy :: :read_only | :auto_allow_readonly | :auto_allow_all
@@ -69,22 +82,9 @@ defmodule KiroCockpit.Permissions do
   def normalize_permission(perm) when perm in @escalation_order, do: perm
 
   def normalize_permission(perm) when is_binary(perm) do
-    case String.downcase(perm) do
-      "shell" ->
-        :shell_write
-
-      "shell_readonly" ->
-        :shell_read
-
-      "shell_read" ->
-        :shell_read
-
-      "shell_write" ->
-        :shell_write
-
-      other ->
-        maybe_atom = String.to_atom(other)
-        if maybe_atom in @escalation_order, do: maybe_atom, else: :read
+    case Map.get(@string_to_permission, String.downcase(perm)) do
+      nil -> :read
+      atom -> atom
     end
   end
 
@@ -319,7 +319,9 @@ defmodule KiroCockpit.Permissions do
   end
 
   defp normalize_hash_value(v) when is_atom(v), do: to_string(v)
-  defp normalize_hash_value(v) when is_binary(v), do: String.downcase(v)
+  # Preserve original string case so hash-sensitive values (e.g. commit SHAs,
+  # file paths on case-sensitive filesystems) produce distinct hashes.
+  defp normalize_hash_value(v) when is_binary(v), do: v
   defp normalize_hash_value(v) when is_number(v), do: v
   defp normalize_hash_value(v), do: inspect(v)
 
@@ -375,6 +377,7 @@ defmodule KiroCockpit.Permissions do
   # ── Key normalization helper ─────────────────────────────────────────
 
   defp get_field(map, key) when is_map(map) do
-    Map.get(map, key) || Map.get(map, to_string(key))
+    # Use Map.get/3 default instead of || to preserve false values.
+    Map.get(map, key, Map.get(map, to_string(key)))
   end
 end

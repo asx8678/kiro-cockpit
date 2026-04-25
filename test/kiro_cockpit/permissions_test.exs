@@ -73,9 +73,24 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.normalize_permission(:banana) == :read
     end
 
+    test "normalizes string 'shell_read' to :shell_read" do
+      assert Permissions.normalize_permission("shell_read") == :shell_read
+    end
+
+    test "normalizes string 'shell_write' to :shell_write" do
+      assert Permissions.normalize_permission("shell_write") == :shell_write
+    end
+
     test "case-insensitive for strings" do
       assert Permissions.normalize_permission("Write") == :write
       assert Permissions.normalize_permission("READ") == :read
+      assert Permissions.normalize_permission("Shell_Read") == :shell_read
+      assert Permissions.normalize_permission("SHELL_WRITE") == :shell_write
+    end
+
+    test "arbitrary LLM string does not create atoms" do
+      # Verifies no atom table pollution — unknown strings fall back to :read
+      assert Permissions.normalize_permission("totally_made_up_permission") == :read
     end
   end
 
@@ -475,6 +490,12 @@ defmodule KiroCockpit.PermissionsTest do
       hash1 = Permissions.compute_snapshot_hash(%{})
       hash2 = Permissions.compute_snapshot_hash(%{})
       assert hash1 == hash2
+    end
+
+    test "preserves string case — different hashes for different casing" do
+      hash1 = Permissions.compute_snapshot_hash(%{ref: "AbC123"})
+      hash2 = Permissions.compute_snapshot_hash(%{ref: "abc123"})
+      refute hash1 == hash2
     end
   end
 
