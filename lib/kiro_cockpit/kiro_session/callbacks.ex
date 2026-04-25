@@ -30,6 +30,7 @@ defmodule KiroCockpit.KiroSession.Callbacks do
 
   @error_invalid_params -32_602
   @error_operation -32_000
+  @error_method_not_allowed -32_000
 
   # -- Known methods ----------------------------------------------------------
 
@@ -45,12 +46,144 @@ defmodule KiroCockpit.KiroSession.Callbacks do
 
   @known_methods MapSet.new(@known_method_list)
 
+  # -- Mutating methods (denied under :read_only policy) ----------------------
+
+  @mutating_methods MapSet.new([
+                      "fs/write_text_file",
+                      "terminal/create",
+                      "terminal/output",
+                      "terminal/wait_for_exit",
+                      "terminal/kill",
+                      "terminal/release"
+                    ])
+
+  # -- Callback policy --------------------------------------------------------
+
+  @typedoc """
+  Callback policy controlling which ACP client methods are auto-handled.
+
+    * `:read_only` — only `fs/read_text_file` is allowed and auto-handled.
+      Mutating methods (`fs/write_text_file`, `terminal/*`) are denied
+      with a JSON-RPC error response. This is the safe default.
+    * `:all` / `:trusted` — all known methods are allowed and auto-handled.
+      Use for trusted/approved execution contexts.
+  """
+  @type callback_policy :: :read_only | :all | :trusted
+
   @doc """
   Check if a method is auto-handled by this module.
   """
   @spec known_method?(String.t()) :: boolean()
   def known_method?(method) when is_binary(method) do
     MapSet.member?(@known_methods, method)
+  end
+
+  @doc """
+  Check if a method is a mutating (write/terminal) callback.
+
+  Mutating methods are denied under the `:read_only` callback policy.
+  """
+  @spec mutating_method?(String.t()) :: boolean()
+  def mutating_method?(method) when is_binary(method) do
+    MapSet.member?(@mutating_methods, method)
+  end
+
+  @doc """
+  Check if a method is allowed under the given callback policy.
+
+    * `:read_only` — only `fs/read_text_file` is allowed.
+    * `:all` / `:trusted` — all known methods are allowed.
+  """
+  @spec allowed_by_policy?(String.t(), callback_policy()) :: boolean()
+  def allowed_by_policy?(method, policy) when is_binary(method) do
+    case policy do
+      :read_only -> method == "fs/read_text_file"
+      :all -> known_method?(method)
+      :trusted -> known_method?(method)
+    end
+  end
+
+  @doc """
+  Returns the client capabilities map for a given callback policy.
+
+  These are advertised to the agent during `initialize`.
+  """
+  @spec capabilities_for_policy(callback_policy()) :: map()
+  def capabilities_for_policy(:read_only) do
+    %{"fs" => %{"readTextFile" => true, "writeTextFile" => false}, "terminal" => false}
+  end
+
+  def capabilities_for_policy(:all) do
+    %{"fs" => %{"readTextFile" => true, "writeTextFile" => true}, "terminal" => true}
+  end
+
+  def capabilities_for_policy(:trusted) do
+    %{"fs" => %{"readTextFile" => true, "writeTextFile" => true}, "terminal" => true}
+  end
+
+  @doc """
+  Clamp caller-supplied client capabilities so they cannot exceed policy.
+
+  Atom-keyed caller maps are normalized to canonical JSON/string keys before
+  clamping so the encoded `initialize` payload cannot contain duplicate or
+  parser-dependent capability keys. Under `:read_only`, callers may further
+  reduce capabilities (for example disable fs read) but cannot advertise write
+  or terminal support. Trusted policies preserve requested values after key
+  normalization.
+  """
+  @spec clamp_capabilities_for_policy(map(), callback_policy()) :: map()
+  def clamp_capabilities_for_policy(capabilities, :read_only) when is_map(capabilities) do
+    capabilities = normalize_capability_keys(capabilities)
+
+    fs =
+      capabilities
+      |> Map.get("fs", %{})
+      |> case do
+        fs when is_map(fs) -> fs
+        _other -> %{}
+      end
+      |> Map.put("writeTextFile", false)
+
+    capabilities
+    |> Map.put("fs", fs)
+    |> Map.put("terminal", false)
+  end
+
+  def clamp_capabilities_for_policy(capabilities, policy)
+      when is_map(capabilities) and policy in [:all, :trusted],
+      do: normalize_capability_keys(capabilities)
+
+  defp normalize_capability_keys(value) when is_map(value) do
+    value
+    |> Enum.sort_by(fn {key, _value} -> key_precedence(key) end)
+    |> Enum.reduce(%{}, fn {key, child}, normalized ->
+      case normalize_capability_key(key) do
+        nil -> normalized
+        key -> Map.put(normalized, key, normalize_capability_keys(child))
+      end
+    end)
+  end
+
+  defp normalize_capability_keys(value), do: value
+
+  defp normalize_capability_key(key) when is_binary(key), do: key
+  defp normalize_capability_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp normalize_capability_key(_key), do: nil
+
+  # Preserve explicit JSON/string keys over equivalent atom keys in mixed maps.
+  defp key_precedence(key) when is_atom(key), do: {0, Atom.to_string(key)}
+  defp key_precedence(key) when is_binary(key), do: {1, key}
+  defp key_precedence(key), do: {2, inspect(key)}
+
+  @doc """
+  Returns a denied-method error tuple suitable for a JSON-RPC error response.
+
+  Used when a known mutating callback is requested under a `:read_only` policy.
+  """
+  @spec denied_error(String.t()) :: {:error, integer(), String.t(), nil}
+  def denied_error(method) do
+    {:error, @error_method_not_allowed,
+     "Callback method not allowed under current policy: #{method}", nil}
   end
 
   @doc """

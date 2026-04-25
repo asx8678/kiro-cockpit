@@ -100,10 +100,7 @@ defmodule KiroCockpit.KiroSession do
   @default_client_name "kiro-cockpit"
   @default_client_title "Kiro Cockpit"
   @default_client_version "0.1.0"
-  @default_client_capabilities %{
-    "fs" => %{"readTextFile" => true, "writeTextFile" => true},
-    "terminal" => true
-  }
+  @default_callback_policy :read_only
   @default_executable_args ["acp"]
   @default_request_timeout 30_000
   @default_prompt_timeout 300_000
@@ -186,6 +183,7 @@ defmodule KiroCockpit.KiroSession do
             persist_messages: true,
             # Auto callback handling (kiro-4ff) --------------------------
             auto_callbacks: true,
+            callback_policy: @default_callback_policy,
             terminal_manager: nil,
             # Stream normalization (kiro-1rd) -----------------------------
             stream_buffer: nil,
@@ -230,6 +228,15 @@ defmodule KiroCockpit.KiroSession do
       inbound requests for known methods are both forwarded to the
       subscriber (for observability) AND auto-replied. When `false`,
       the subscriber is responsible for calling `respond/3`.
+    * `:callback_policy` — which callback methods are allowed when
+      `auto_callbacks` is `true` (default `:read_only`). Options:
+        * `:read_only` — only `fs/read_text_file` is auto-handled.
+          Mutating methods (`fs/write_text_file`, `terminal/*`) are
+          auto-denied with a JSON-RPC error while still forwarded to
+          the subscriber for observability.
+        * `:all` / `:trusted` — all known methods are allowed and
+          auto-handled (previous default behavior). Use for
+          trusted/approved execution contexts.
     * `:name` — GenServer registration name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -467,6 +474,7 @@ defmodule KiroCockpit.KiroSession do
          {:ok, buffer_limit} <- fetch_buffer_limit(opts) do
       args = Keyword.get(opts, :args, @default_executable_args)
       auto_callbacks = Keyword.get(opts, :auto_callbacks, true)
+      callback_policy = Keyword.get(opts, :callback_policy, @default_callback_policy)
 
       port_opts =
         [executable: executable, args: args, owner: self()] ++ extra_port_opts(opts)
@@ -479,7 +487,7 @@ defmodule KiroCockpit.KiroSession do
           # Start TerminalManager if auto_callbacks is enabled.
           # The TerminalManager is linked to this process; if it crashes,
           # KiroSession also exits (which is acceptable for Stage-1).
-          terminal_manager = maybe_start_terminal_manager(auto_callbacks)
+          terminal_manager = maybe_start_terminal_manager(auto_callbacks, callback_policy)
 
           state = %__MODULE__{
             port_process: port_pid,
@@ -490,6 +498,7 @@ defmodule KiroCockpit.KiroSession do
             args: args,
             persist_messages: Keyword.get(opts, :persist_messages, true),
             auto_callbacks: auto_callbacks,
+            callback_policy: callback_policy,
             terminal_manager: terminal_manager,
             stream_buffer: :queue.new(),
             stream_buffer_limit: buffer_limit
@@ -537,7 +546,20 @@ defmodule KiroCockpit.KiroSession do
   def handle_call({:initialize, opts}, _from, %{phase: :uninitialized} = state) do
     protocol_version = Keyword.get(opts, :protocol_version, @default_protocol_version)
     client_info = Keyword.get(opts, :client_info, build_default_client_info())
-    client_capabilities = Keyword.get(opts, :client_capabilities, @default_client_capabilities)
+
+    requested_client_capabilities =
+      Keyword.get(
+        opts,
+        :client_capabilities,
+        Callbacks.capabilities_for_policy(state.callback_policy)
+      )
+
+    client_capabilities =
+      Callbacks.clamp_capabilities_for_policy(
+        requested_client_capabilities,
+        state.callback_policy
+      )
+
     timeout = Keyword.get(opts, :timeout, @default_request_timeout)
 
     params = %{
@@ -564,7 +586,6 @@ defmodule KiroCockpit.KiroSession do
             auth_methods: Map.get(response, "authMethods", [])
         }
 
-        persist_outbound(state, "initialize", params)
         {:reply, {:ok, response}, state}
 
       {:error, reason} ->
@@ -609,7 +630,6 @@ defmodule KiroCockpit.KiroSession do
             config_options: Map.get(response, "configOptions")
         }
 
-        persist_outbound(state, "session/new", params)
         {:reply, {:ok, response}, state}
 
       {:error, reason} ->
@@ -651,7 +671,6 @@ defmodule KiroCockpit.KiroSession do
             cwd: cwd
         }
 
-        persist_outbound(state, "session/load", params)
         {:reply, {:ok, nil}, state}
 
       {:error, reason} ->
@@ -695,8 +714,6 @@ defmodule KiroCockpit.KiroSession do
       end)
 
     task_ref = Process.monitor(task_pid)
-
-    persist_outbound(state, "session/prompt", params)
 
     # Turn discipline (kiro-1rd): mark the turn running. The prompt RPC
     # result alone will NOT mark the turn complete — we wait for a
@@ -747,7 +764,9 @@ defmodule KiroCockpit.KiroSession do
       modes: state.modes,
       config_options: state.config_options,
       protocol_version: state.protocol_version,
+      client_capabilities: state.client_capabilities,
       auto_callbacks: state.auto_callbacks,
+      callback_policy: state.callback_policy,
       turn_id: state.turn_id,
       turn_status: state.turn_status,
       last_stop_reason: state.last_stop_reason,
@@ -776,11 +795,6 @@ defmodule KiroCockpit.KiroSession do
     # Local state flips immediately so callers see :cancel_requested.
     params = %{"sessionId" => state.session_id}
     :ok = PortProcess.notify(state.port_process, "session/cancel", params)
-    # `session/cancel` is an ACP notification — persist it as a
-    # notification envelope (no `id`) so EventStore classifies it as
-    # `message_type: "notification"` with `rpc_id: nil` instead of
-    # synthesising a fake request id.
-    persist_outbound_notification(state, "session/cancel", params)
 
     {:reply, :ok, %{state | turn_status: :cancel_requested}}
   end
@@ -851,6 +865,14 @@ defmodule KiroCockpit.KiroSession do
   end
 
   # -- Inbound message forwarding -------------------------------------------
+
+  @impl GenServer
+  def handle_info({:acp_outbound, port_pid, payload}, %{port_process: port_pid} = state) do
+    # Exact raw outbound JSON-RPC payload from PortProcess — persist the
+    # true wire map (including the real assigned id) without reconstruction.
+    persist_raw_outbound(state, payload)
+    {:noreply, state}
+  end
 
   @impl GenServer
   def handle_info({:acp_notification, port_pid, msg}, %{port_process: port_pid} = state) do
@@ -938,6 +960,8 @@ defmodule KiroCockpit.KiroSession do
 
   # Ignore stale messages from unknown port pids
   @impl GenServer
+  def handle_info({:acp_outbound, _port_pid, _payload}, state), do: {:noreply, state}
+
   def handle_info({:acp_notification, _port_pid, _msg}, state), do: {:noreply, state}
 
   def handle_info({:acp_request, _port_pid, _msg}, state), do: {:noreply, state}
@@ -992,12 +1016,22 @@ defmodule KiroCockpit.KiroSession do
   defp maybe_auto_handle_callback(%{auto_callbacks: false}, _port_pid, _msg), do: :ok
 
   defp maybe_auto_handle_callback(state, port_pid, %{id: id, method: method, params: params}) do
-    if Callbacks.known_method?(method) do
-      if String.starts_with?(method, "terminal/") do
+    cond do
+      not Callbacks.known_method?(method) ->
+        :ok
+
+      not Callbacks.allowed_by_policy?(method, state.callback_policy) ->
+        # Method is known but denied by policy — auto-respond with error.
+        # For observability the subscriber still received the raw request.
+        {:error, code, message, data} = Callbacks.denied_error(method)
+        PortProcess.respond_error(port_pid, id, code, message, data)
+        :ok
+
+      String.starts_with?(method, "terminal/") ->
         handle_terminal_callback_async(state, port_pid, id, method, params)
-      else
+
+      true ->
         handle_sync_callback(state, port_pid, id, method, params)
-      end
     end
 
     :ok
@@ -1097,13 +1131,15 @@ defmodule KiroCockpit.KiroSession do
     end
   end
 
-  @spec maybe_start_terminal_manager(boolean()) :: pid() | nil
-  defp maybe_start_terminal_manager(true) do
+  @spec maybe_start_terminal_manager(boolean(), Callbacks.callback_policy()) :: pid() | nil
+  defp maybe_start_terminal_manager(true, policy) when policy in [:all, :trusted] do
     {:ok, tm} = TerminalManager.start_link()
     tm
   end
 
-  defp maybe_start_terminal_manager(false), do: nil
+  defp maybe_start_terminal_manager(true, :read_only), do: nil
+
+  defp maybe_start_terminal_manager(false, _policy), do: nil
 
   @spec do_initialize(pid(), map(), pos_integer(), timeout()) ::
           {{:ok, map()}, map()} | {{:error, term()}, map()}
@@ -1316,35 +1352,22 @@ defmodule KiroCockpit.KiroSession do
 
   # -- Best-effort EventStore persistence -----------------------------------
 
-  # Outbound request: reconstruct a JSON-RPC request envelope for the
-  # raw_payload so EventStore classification works correctly. The id is a
-  # placeholder since we don't know what PortProcess assigned internally;
-  # the rpc_id field is mostly useful as a non-nil indicator that this
-  # was a request.
-  @spec persist_outbound(t(), String.t(), map()) :: :ok
-  defp persist_outbound(%{persist_messages: false}, _method, _params), do: :ok
+  # Persist the exact raw outbound JSON-RPC payload received from PortProcess
+  # via {:acp_outbound, port_pid, payload}. The payload contains the true
+  # assigned id, method, params, etc. — no reconstruction needed.
+  #
+  # This replaces the old synthetic persist_outbound/3 which reconstructed
+  # payloads with a fake `"id" => 0` because PortProcess owned request ids.
+  #
+  # When `persist_messages: false` (test/runtime option; production default is
+  # `true`), persistence is skipped. Failures are logged but never crash the
+  # session.
+  @spec persist_raw_outbound(t(), map()) :: :ok
+  defp persist_raw_outbound(%{persist_messages: false}, _payload), do: :ok
 
-  defp persist_outbound(state, method, params) do
-    payload = %{"jsonrpc" => "2.0", "id" => 0, "method" => method, "params" => params}
-    write_outbound(state, method, payload)
-  end
+  defp persist_raw_outbound(state, payload) when is_map(payload) do
+    method = Map.get(payload, "method")
 
-  # Outbound notification: reconstruct a JSON-RPC notification envelope
-  # (no `id`) so EventStore classifies it as `message_type: "notification"`
-  # with `rpc_id: nil`. Used for fire-and-forget messages like
-  # `session/cancel` (kiro-1rd Shepherd MUST fix).
-  @spec persist_outbound_notification(t(), String.t(), map()) :: :ok
-  defp persist_outbound_notification(%{persist_messages: false}, _method, _params), do: :ok
-
-  defp persist_outbound_notification(state, method, params) do
-    payload = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
-    write_outbound(state, method, payload)
-  end
-
-  # Shared writer for both outbound shapes — keeps the rescue block
-  # in one place and the message envelope concern at the call site.
-  @spec write_outbound(t(), String.t(), map()) :: :ok
-  defp write_outbound(state, method, payload) do
     try do
       EventStore.record_acp_message("client_to_agent", payload, session_id: state.session_id)
     rescue

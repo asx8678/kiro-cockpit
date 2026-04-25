@@ -453,13 +453,11 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
     end
   end
 
-  @spec build_env_list([map()]) :: list() | nil
-  defp build_env_list([]), do: nil
+  @spec build_env_list([map()]) :: list()
+  defp build_env_list([]), do: build_isolated_env()
 
   defp build_env_list(env) when is_list(env) do
-    base_env =
-      System.get_env()
-      |> Enum.map(fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
+    base_env = build_isolated_env()
 
     overrides =
       Enum.map(env, fn entry ->
@@ -476,6 +474,38 @@ defmodule KiroCockpit.KiroSession.TerminalManager do
       end)
 
     Map.to_list(merged)
+  end
+
+  # Build an isolated environment for the subprocess:
+  # - Allowlisted host env vars are inherited with their values
+  # - All other host env vars are explicitly unset (set to `false`)
+  #   because Erlang's Port :env option MERGES with the parent env,
+  #   not replaces it. Without explicit unset, non-allowlisted vars
+  #   like DATABASE_URL or API keys would leak into the subprocess.
+  #
+  # See Erlang docs: "If Name is set as the atom false, the environment
+  # variable is removed."
+  @host_env_allowlist ~w(PATH TMPDIR TMP TEMP LANG HOME USER SHELL TERM LC_ALL LC_CTYPE LC_MESSAGES LC_TIME LC_COLLATE LC_NUMERIC LC_MONETARY)
+
+  @spec build_isolated_env() :: [{charlist(), charlist() | false}]
+  defp build_isolated_env do
+    # 1. Collect allowlisted vars with their values
+    allowed =
+      @host_env_allowlist
+      |> Enum.filter(fn name -> System.get_env(name) != nil end)
+      |> Enum.map(fn name ->
+        {String.to_charlist(name), String.to_charlist(System.get_env(name))}
+      end)
+
+    allowed_names = MapSet.new(@host_env_allowlist)
+
+    # 2. Explicitly unset all non-allowlisted host vars to prevent leakage
+    unset =
+      System.get_env()
+      |> Enum.filter(fn {k, _v} -> k not in allowed_names end)
+      |> Enum.map(fn {k, _v} -> {String.to_charlist(k), false} end)
+
+    allowed ++ unset
   end
 
   @spec safe_open_port(String.t(), list()) ::

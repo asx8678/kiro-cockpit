@@ -522,4 +522,159 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
                Callbacks.handle_request("terminal/release", %{}, nil)
     end
   end
+
+  # -- Callback policy (MUST FIX 2) ------------------------------------------
+
+  describe "mutating_method?/1" do
+    test "identifies write and terminal methods as mutating" do
+      assert Callbacks.mutating_method?("fs/write_text_file")
+      assert Callbacks.mutating_method?("terminal/create")
+      assert Callbacks.mutating_method?("terminal/output")
+      assert Callbacks.mutating_method?("terminal/wait_for_exit")
+      assert Callbacks.mutating_method?("terminal/kill")
+      assert Callbacks.mutating_method?("terminal/release")
+    end
+
+    test "fs/read_text_file is not mutating" do
+      refute Callbacks.mutating_method?("fs/read_text_file")
+    end
+
+    test "unknown methods are not mutating" do
+      refute Callbacks.mutating_method?("session/prompt")
+    end
+  end
+
+  describe "allowed_by_policy?/2" do
+    test ":read_only allows fs/read_text_file" do
+      assert Callbacks.allowed_by_policy?("fs/read_text_file", :read_only)
+    end
+
+    test ":read_only denies fs/write_text_file" do
+      refute Callbacks.allowed_by_policy?("fs/write_text_file", :read_only)
+    end
+
+    test ":read_only denies terminal/*" do
+      refute Callbacks.allowed_by_policy?("terminal/create", :read_only)
+      refute Callbacks.allowed_by_policy?("terminal/output", :read_only)
+      refute Callbacks.allowed_by_policy?("terminal/wait_for_exit", :read_only)
+      refute Callbacks.allowed_by_policy?("terminal/kill", :read_only)
+      refute Callbacks.allowed_by_policy?("terminal/release", :read_only)
+    end
+
+    test ":read_only denies unknown methods" do
+      refute Callbacks.allowed_by_policy?("session/prompt", :read_only)
+    end
+
+    test ":all allows all known callback methods only" do
+      assert Callbacks.allowed_by_policy?("fs/read_text_file", :all)
+      assert Callbacks.allowed_by_policy?("fs/write_text_file", :all)
+      assert Callbacks.allowed_by_policy?("terminal/create", :all)
+      refute Callbacks.allowed_by_policy?("session/prompt", :all)
+    end
+
+    test ":trusted allows all known callback methods only" do
+      assert Callbacks.allowed_by_policy?("fs/read_text_file", :trusted)
+      assert Callbacks.allowed_by_policy?("fs/write_text_file", :trusted)
+      assert Callbacks.allowed_by_policy?("terminal/create", :trusted)
+      refute Callbacks.allowed_by_policy?("session/prompt", :trusted)
+    end
+  end
+
+  describe "capabilities_for_policy/1" do
+    test ":read_only advertises read-only fs, no terminal" do
+      caps = Callbacks.capabilities_for_policy(:read_only)
+      assert caps["fs"]["readTextFile"] == true
+      assert caps["fs"]["writeTextFile"] == false
+      assert caps["terminal"] == false
+    end
+
+    test ":all advertises full fs and terminal" do
+      caps = Callbacks.capabilities_for_policy(:all)
+      assert caps["fs"]["readTextFile"] == true
+      assert caps["fs"]["writeTextFile"] == true
+      assert caps["terminal"] == true
+    end
+
+    test ":trusted advertises full fs and terminal" do
+      caps = Callbacks.capabilities_for_policy(:trusted)
+      assert caps["fs"]["readTextFile"] == true
+      assert caps["fs"]["writeTextFile"] == true
+      assert caps["terminal"] == true
+    end
+  end
+
+  describe "clamp_capabilities_for_policy/2" do
+    test ":read_only clamps unsafe caller capability overrides" do
+      unsafe = %{
+        "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+        "terminal" => true
+      }
+
+      caps = Callbacks.clamp_capabilities_for_policy(unsafe, :read_only)
+
+      assert caps["fs"]["readTextFile"] == true
+      assert caps["fs"]["writeTextFile"] == false
+      assert caps["terminal"] == false
+    end
+
+    test ":read_only permits callers to reduce read capabilities" do
+      requested = %{"fs" => %{"readTextFile" => false, "writeTextFile" => true}}
+
+      caps = Callbacks.clamp_capabilities_for_policy(requested, :read_only)
+
+      assert caps["fs"]["readTextFile"] == false
+      assert caps["fs"]["writeTextFile"] == false
+      assert caps["terminal"] == false
+    end
+
+    test ":read_only normalizes atom-keyed caller capabilities before clamping" do
+      unsafe = %{
+        fs: %{readTextFile: true, writeTextFile: true},
+        terminal: true
+      }
+
+      caps = Callbacks.clamp_capabilities_for_policy(unsafe, :read_only)
+
+      assert caps == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => false},
+               "terminal" => false
+             }
+    end
+
+    test ":read_only prefers explicit string keys in mixed caller capabilities" do
+      unsafe = %{
+        :fs => %{readTextFile: false, writeTextFile: true},
+        "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+        :terminal => true,
+        "terminal" => true
+      }
+
+      caps = Callbacks.clamp_capabilities_for_policy(unsafe, :read_only)
+
+      assert caps == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => false},
+               "terminal" => false
+             }
+    end
+
+    test ":all keeps caller capability values but normalizes keys" do
+      requested = %{
+        fs: %{readTextFile: true, writeTextFile: true},
+        terminal: true
+      }
+
+      assert Callbacks.clamp_capabilities_for_policy(requested, :all) == %{
+               "fs" => %{"readTextFile" => true, "writeTextFile" => true},
+               "terminal" => true
+             }
+    end
+  end
+
+  describe "denied_error/1" do
+    test "returns an error tuple with method name in message" do
+      assert {:error, -32_000, message, nil} = Callbacks.denied_error("fs/write_text_file")
+      assert message =~ "not allowed under current policy"
+      assert message =~ "fs/write_text_file"
+    end
+  end
 end

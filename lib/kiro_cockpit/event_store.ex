@@ -128,6 +128,11 @@ defmodule KiroCockpit.EventStore do
     |> unwrap_record_transaction(attrs, retries_left)
   end
 
+  # Dialyzer/Elixir 1.19 can expand `Ecto.Multi.new/0` to struct internals
+  # and report an opaque `MapSet` subterm mismatch before Ecto.Multi.insert/3.
+  # Keep the suppression narrow to this Ecto.Multi builder.
+  @dialyzer {:nowarn_function, record_multi: 1}
+  @spec record_multi(map()) :: Ecto.Multi.t()
   defp record_multi(attrs) do
     Multi.new()
     |> Multi.insert(:message, RawAcpMessage.changeset(%RawAcpMessage{}, attrs))

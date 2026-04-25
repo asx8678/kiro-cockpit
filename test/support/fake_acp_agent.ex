@@ -68,6 +68,8 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
     "normal" => :normal,
     "long_turn" => :long_turn,
     "callback" => :callback,
+    "callback_write" => :callback_write,
+    "callback_terminal" => :callback_terminal,
     "error" => :error,
     "cancel" => :cancel
   }
@@ -78,6 +80,8 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
   # client → agent request IDs which start at 1).
   @fs_read_id 9001
   @fs_read_text_file_id 9002
+  @fs_write_text_file_id 9003
+  @terminal_create_id 9004
 
   @default_config_options [
     %{
@@ -245,8 +249,48 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
     {[tool_update, prompt_reply], state}
   end
 
+  defp handle_response(@fs_write_text_file_id, msg, state) do
+    finish_policy_callback("write", msg, state)
+  end
+
+  defp handle_response(@terminal_create_id, msg, state) do
+    finish_policy_callback("terminal", msg, state)
+  end
+
   defp handle_response(_id, _msg, state) do
     {[], state}
+  end
+
+  defp finish_policy_callback(kind, msg, state) do
+    status =
+      case msg do
+        %{"result" => _result} -> "allowed"
+        %{"error" => _error} -> "denied"
+        _ -> "unknown"
+      end
+
+    update =
+      notify("session/update", %{
+        "sessionId" => state.pending_session_id,
+        "update" => %{
+          "sessionUpdate" => "agent_message_chunk",
+          "content" => [%{"type" => "text", "text" => "#{kind}:#{status}"}]
+        }
+      })
+
+    turn_end =
+      notify("session/update", %{
+        "sessionId" => state.pending_session_id,
+        "update" => %{
+          "sessionUpdate" => "turn_end",
+          "reason" => "end_turn"
+        }
+      })
+
+    prompt_reply = success_response(state.pending_prompt_id, %{"stopReason" => "end_turn"})
+    state = %{state | pending_prompt_id: nil, pending_session_id: nil}
+
+    {[update, turn_end, prompt_reply], state}
   end
 
   # -- Request handling (all handle_request/4 clauses grouped) ---------------
@@ -369,6 +413,8 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
       :normal -> handle_prompt_normal(id, session_id, state)
       :long_turn -> handle_prompt_long_turn(id, session_id, state)
       :callback -> handle_prompt_callback(id, session_id, state)
+      :callback_write -> handle_prompt_callback_write(id, session_id, state)
+      :callback_terminal -> handle_prompt_callback_terminal(id, session_id, state)
       :error -> handle_prompt_error(id, session_id, state)
       :cancel -> handle_prompt_cancel(id, session_id, state)
     end
@@ -527,6 +573,35 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
     {actions, state}
   end
 
+  defp handle_prompt_callback_write(id, session_id, state) do
+    actions = [
+      request(@fs_write_text_file_id, "fs/write_text_file", %{
+        "sessionId" => session_id,
+        "path" => "/tmp/kiro-fake-write-policy.txt",
+        "content" => "write callback was allowed"
+      })
+    ]
+
+    state = %{state | pending_prompt_id: id, pending_session_id: session_id}
+
+    {actions, state}
+  end
+
+  defp handle_prompt_callback_terminal(id, session_id, state) do
+    actions = [
+      request(@terminal_create_id, "terminal/create", %{
+        "sessionId" => session_id,
+        "command" => System.find_executable("sh") || "sh",
+        "args" => ["-c", "echo terminal callback was allowed"],
+        "outputByteLimit" => 1024
+      })
+    ]
+
+    state = %{state | pending_prompt_id: id, pending_session_id: session_id}
+
+    {actions, state}
+  end
+
   # Cancel: emit one chunk, then block reading stdin until we observe a
   # `session/cancel` notification carrying our session_id. On cancel,
   # emit a normalized turn_end and resolve the prompt with
@@ -639,7 +714,19 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
   @spec write(map()) :: :ok
   defp write(map) do
     line = Jason.encode!(map) <> "\n"
-    IO.binwrite(:standard_io, line)
+
+    try do
+      IO.binwrite(:standard_io, line)
+    rescue
+      error in ErlangError ->
+        case error.original do
+          reason when reason in [:terminated, :epipe] -> :ok
+          _other -> reraise(error, __STACKTRACE__)
+        end
+    catch
+      :exit, reason when reason in [:terminated, :epipe] -> :ok
+    end
+
     :ok
   end
 

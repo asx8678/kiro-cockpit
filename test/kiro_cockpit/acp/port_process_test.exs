@@ -193,6 +193,91 @@ defmodule KiroCockpit.Acp.PortProcessTest do
     end
   end
 
+  # -- Outbound capture -------------------------------------------------------
+
+  describe "outbound message capture" do
+    setup %{elixir: elixir, args: args} do
+      {:ok, pid} = PortProcess.start_link(executable: elixir, args: args, owner: self())
+      on_exit(fn -> safe_stop(pid) end)
+      {:ok, %{pid: pid}}
+    end
+
+    test "sends {:acp_outbound, pid, payload} after request write", %{pid: pid} do
+      assert {:ok, _} = PortProcess.request(pid, "ping", %{}, 5_000)
+
+      assert_receive {:acp_outbound, ^pid, payload}, 2_000
+      assert payload["jsonrpc"] == "2.0"
+      assert payload["method"] == "ping"
+      assert Map.has_key?(payload, "id")
+      # The id must be a real assigned integer, NOT a placeholder zero
+      assert is_integer(payload["id"])
+
+      assert payload["id"] > 0,
+             "outbound request id must be a real assigned id (got: #{inspect(payload["id"])})"
+    end
+
+    test "outbound request ids are sequential", %{pid: pid} do
+      assert {:ok, _} = PortProcess.request(pid, "ping", %{}, 5_000)
+      assert_receive {:acp_outbound, ^pid, %{"id" => id1}}, 2_000
+      # Drain the side effects from the first ping
+      assert_receive {:acp_notification, ^pid, _}, 2_000
+      assert_receive {:acp_request, ^pid, _}, 2_000
+
+      assert {:ok, _} = PortProcess.request(pid, "echo", %{"x" => 1}, 5_000)
+      assert_receive {:acp_outbound, ^pid, %{"id" => id2}}, 2_000
+
+      assert id2 == id1 + 1, "outbound request ids must be sequential (got: #{id1} then #{id2})"
+    end
+
+    test "sends {:acp_outbound, pid, payload} after notification write", %{pid: pid} do
+      assert :ok = PortProcess.notify(pid, "session/cancel", %{"reason" => "test"})
+      # Allow a moment for the cast to process
+      Process.sleep(50)
+
+      assert_receive {:acp_outbound, ^pid, payload}, 2_000
+      assert payload["jsonrpc"] == "2.0"
+      assert payload["method"] == "session/cancel"
+      # Notifications have no id
+      refute Map.has_key?(payload, "id")
+    end
+
+    test "sends {:acp_outbound, pid, payload} after respond write", %{pid: pid} do
+      # First trigger an inbound request from the agent
+      assert {:ok, _} = PortProcess.request(pid, "ping", %{}, 5_000)
+
+      # Drain the outbound from the ping request
+      assert_receive {:acp_outbound, ^pid, _ping_payload}, 2_000
+
+      assert_receive {:acp_request, ^pid, %{id: req_id, method: "fs/read"}}, 2_000
+
+      # Respond to the agent's request
+      :ok = PortProcess.respond(pid, req_id, %{"contents" => "hello"})
+      Process.sleep(50)
+
+      assert_receive {:acp_outbound, ^pid, payload}, 2_000
+      assert payload["jsonrpc"] == "2.0"
+      assert payload["id"] == req_id
+      assert Map.has_key?(payload, "result")
+    end
+
+    test "sends {:acp_outbound, pid, payload} after respond_error write", %{pid: pid} do
+      assert {:ok, _} = PortProcess.request(pid, "ping", %{}, 5_000)
+
+      # Drain the outbound from the ping request
+      assert_receive {:acp_outbound, ^pid, _ping_payload}, 2_000
+
+      assert_receive {:acp_request, ^pid, %{id: req_id, method: "fs/read"}}, 2_000
+
+      :ok = PortProcess.respond_error(pid, req_id, -32_000, "denied", nil)
+      Process.sleep(50)
+
+      assert_receive {:acp_outbound, ^pid, payload}, 2_000
+      assert payload["jsonrpc"] == "2.0"
+      assert payload["id"] == req_id
+      assert Map.has_key?(payload, "error")
+    end
+  end
+
   # `on_exit/1` callbacks run in a separate process, so by the time they fire
   # the GenServer's owner-monitor may have already brought it down. Tolerate
   # "no process" exits — they're a successful cleanup, not a failure.
