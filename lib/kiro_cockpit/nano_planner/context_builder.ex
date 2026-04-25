@@ -108,10 +108,10 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
           {:ok, %{snapshot | total_chars: total_chars}}
 
         {:error, :budget_exceeded} ->
-          trimmed_snapshot =
-            trim_to_budget(snapshot, max_total, max_file_chars)
-
-          {:ok, trimmed_snapshot}
+          case trim_to_budget(snapshot, max_total, max_file_chars) do
+            {:ok, trimmed_snapshot} -> {:ok, trimmed_snapshot}
+            {:error, reason} -> {:error, reason}
+          end
       end
     end
   end
@@ -313,33 +313,43 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilder do
     end
   end
 
-  # When the full context exceeds the budget, progressively trim
-  # config excerpts (which are the largest component) until it fits.
+  # When the full context exceeds the budget, progressively remove verbose
+  # fields until the rendered snapshot fits. If even the minimal section
+  # skeleton is too large for an unusually tiny budget, return an error rather
+  # than claiming the budget was enforced.
   defp trim_to_budget(snapshot, max_total, max_file_chars) do
-    markdown = ProjectSnapshot.to_markdown(snapshot)
+    candidates = [
+      snapshot,
+      %{snapshot | config_excerpts: truncate_excerpts(snapshot.config_excerpts, max_file_chars)},
+      %{snapshot | config_excerpts: %{}},
+      %{snapshot | config_excerpts: %{}, existing_plans: nil, session_summary: nil},
+      %{
+        snapshot
+        | root_tree: "(omitted due to context budget)",
+          config_excerpts: %{},
+          existing_plans: nil,
+          session_summary: nil
+      }
+    ]
 
-    if String.length(markdown) <= max_total do
-      %{snapshot | total_chars: String.length(markdown)}
-    else
-      # Halve file excerpt cap and rebuild
-      half_chars = max(div(max_file_chars, 2), 500)
-
-      trimmed_excerpts =
-        snapshot.config_excerpts
-        |> Enum.map(fn {k, v} -> {k, String.slice(v, 0, half_chars)} end)
-        |> Map.new()
-
-      trimmed = %{snapshot | config_excerpts: trimmed_excerpts}
-      trimmed_markdown = ProjectSnapshot.to_markdown(trimmed)
-
-      if String.length(trimmed_markdown) <= max_total do
-        %{trimmed | total_chars: String.length(trimmed_markdown)}
-      else
-        # Drop config excerpts entirely if still too large
-        bare = %{trimmed | config_excerpts: %{}}
-        bare_markdown = ProjectSnapshot.to_markdown(bare)
-        %{bare | total_chars: String.length(bare_markdown)}
-      end
+    candidates
+    |> Enum.map(&put_rendered_total_chars/1)
+    |> Enum.find(&(&1.total_chars <= max_total))
+    |> case do
+      nil -> {:error, :budget_exceeded}
+      trimmed_snapshot -> {:ok, trimmed_snapshot}
     end
+  end
+
+  defp truncate_excerpts(excerpts, max_file_chars) do
+    half_chars = max(div(max_file_chars, 2), 500)
+
+    excerpts
+    |> Enum.map(fn {path, content} -> {path, String.slice(content, 0, half_chars)} end)
+    |> Map.new()
+  end
+
+  defp put_rendered_total_chars(snapshot) do
+    %{snapshot | total_chars: snapshot |> ProjectSnapshot.to_markdown() |> String.length()}
   end
 end

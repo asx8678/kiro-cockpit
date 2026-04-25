@@ -165,8 +165,8 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
       kiro_dir = Path.join(dir, ".kiro")
       File.mkdir_p!(kiro_dir)
       File.write!(Path.join(kiro_dir, "agents"), "test agent config")
-
       assert {:ok, snapshot} = ContextBuilder.build(project_dir: dir)
+
       kiro_keys =
         Enum.filter(Map.keys(snapshot.config_excerpts), &String.starts_with?(&1, ".kiro"))
 
@@ -292,7 +292,19 @@ defmodule KiroCockpit.NanoPlanner.ContextBuilderTest do
                )
 
       markdown = ProjectSnapshot.to_markdown(snapshot)
-      assert String.length(markdown) <= 1_500
+      assert String.length(markdown) <= 500
+    end
+
+    @tag :tmp_dir
+    test "returns budget_exceeded when even minimal snapshot cannot fit", %{project_dir: dir} do
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "mix.exs"), "defmodule MixProject do end")
+
+      assert {:error, :budget_exceeded} =
+               ContextBuilder.build(
+                 project_dir: dir,
+                 max_total_context_chars: 10
+               )
     end
   end
 
