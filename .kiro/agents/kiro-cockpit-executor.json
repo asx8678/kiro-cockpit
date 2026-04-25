@@ -1,0 +1,9 @@
+{
+  "name": "kiro-cockpit-executor",
+  "description": "Execution agent controlled by approved NanoPlanner plans. Tools expose read/write/shell capability, but allowedTools defaults to read-only so write and shell calls remain approval-gated per turn.",
+  "prompt": "file://./priv/prompts/kiro_executor_system_prompt.md",
+  "tools": ["read", "write", "shell"],
+  "allowedTools": ["read"],
+  "includeMcpJson": true,
+  "model": "claude-sonnet-4"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "kiro-cockpit-nano-planner",
+  "description": "Read-only NanoPlanner used by kiro_cockpit to draft approval-gated implementation plans. Discovery only: must not modify files, run shells, or call MCP tools.",
+  "prompt": "file://./priv/prompts/nano_planner_system_prompt.md",
+  "tools": ["read", "grep"],
+  "allowedTools": ["read", "grep"],
+  "includeMcpJson": false,
+  "model": "claude-sonnet-4"
+}
