@@ -40,7 +40,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     KiroCockpit.Swarm.Hooks.SteeringPreActionHook
   ]
 
-  @default_post_hooks []
+  @default_post_hooks [KiroCockpit.Swarm.Hooks.TaskGuidanceHook]
 
   @type boundary_result :: {:ok, term()} | {:error, {:swarm_blocked, String.t(), [String.t()]}}
 
@@ -269,4 +269,36 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   """
   @spec default_post_hooks() :: [module()]
   def default_post_hooks, do: @default_post_hooks
+
+  @doc """
+  Run post-hooks only for lifecycle actions (no pre-hook gating).
+
+  Lifecycle actions (task create/activate/complete/block, plan_approved)
+  are internal state transitions that don't need pre-hook blocking but
+  should fire post-hooks for Bronze trace capture and guidance injection.
+
+  Unlike `run/3`, this does not gate on pre-hooks — the transition has
+  already succeeded. Post-hooks fire for Bronze capture and guidance.
+
+  Always returns `:ok`. Persistence errors are rescued and never crash
+  the caller.
+  """
+  @spec run_lifecycle_post_hooks(atom(), keyword()) :: :ok
+  def run_lifecycle_post_hooks(action, opts) when is_atom(action) do
+    if boundary_enabled?(opts) do
+      hm = Keyword.get(opts, :hook_manager_module, HookManager)
+      tm = Keyword.get(opts, :task_manager_module, TaskManager)
+      staleness_mod = Keyword.get(opts, :staleness_module, Staleness)
+
+      event = build_event(action, opts, tm)
+      ctx = build_ctx(opts, event, staleness_mod)
+      post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
+
+      _ = hm.run(event, post_hooks, ctx, :post)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
 end

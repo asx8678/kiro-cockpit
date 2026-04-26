@@ -31,6 +31,7 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
 
   alias Ecto.Multi
   alias KiroCockpit.Repo
+  alias KiroCockpit.Swarm.ActionBoundary
   alias KiroCockpit.Swarm.Tasks.{Guidance, Task}
 
   # Dialyzer false positives: Ecto.Multi opacity and Repo.insert success-typing
@@ -65,7 +66,9 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
     |> Repo.transaction()
     |> case do
       {:ok, %{task: task}} ->
-        {:ok, attach_create_guidance(task)}
+        result = {:ok, attach_create_guidance(task)}
+        fire_lifecycle_post_hook(:task_create, task)
+        result
 
       {:error, :task, changeset, _changes} ->
         {:error, changeset}
@@ -100,6 +103,8 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
           |> Enum.sort_by(fn {{:task, idx}, _} -> idx end)
           |> Enum.map(fn {_, task} -> task end)
 
+        # Fire post-hook per task for Bronze trace capture
+        Enum.each(tasks, &fire_lifecycle_post_hook(:task_create, &1))
         {:ok, tasks}
 
       {:error, _failed_step, _changeset, _changes} ->
@@ -204,8 +209,13 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   def activate(task_id) do
     with {:ok, task} <- fetch_task(Repo, task_id) do
       case activate_with_exclusive_check(task) do
-        {:ok, activated} -> {:ok, attach_activate_guidance(activated)}
-        {:error, reason} -> {:error, reason}
+        {:ok, activated} ->
+          result = {:ok, attach_activate_guidance(activated)}
+          fire_lifecycle_post_hook(:task_activate, activated)
+          result
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
@@ -220,8 +230,13 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   def complete(task_id) do
     with {:ok, task} <- fetch_task(Repo, task_id) do
       case transition_with_multi(task, "completed") do
-        {:ok, completed} -> {:ok, attach_complete_guidance(completed)}
-        {:error, reason} -> {:error, reason}
+        {:ok, completed} ->
+          result = {:ok, attach_complete_guidance(completed)}
+          fire_lifecycle_post_hook(:task_complete, completed)
+          result
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
@@ -236,8 +251,13 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   def block(task_id) do
     with {:ok, task} <- fetch_task(Repo, task_id) do
       case transition_with_multi(task, "blocked") do
-        {:ok, blocked} -> {:ok, attach_block_guidance(blocked)}
-        {:error, reason} -> {:error, reason}
+        {:ok, blocked} ->
+          result = {:ok, attach_block_guidance(blocked)}
+          fire_lifecycle_post_hook(:task_block, blocked)
+          result
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
@@ -253,6 +273,23 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
     with {:ok, task} <- fetch_task(Repo, task_id) do
       transition_with_multi(task, "deleted")
     end
+  end
+
+  # -------------------------------------------------------------------
+  # Post-hook fire (Bronze trace capture)
+  # -------------------------------------------------------------------
+
+  # Fire-and-forget post-hook for Bronze trace capture and guidance injection.
+  # Uses ActionBoundary.run_lifecycle_post_hooks which checks the app config
+  # (swarm_action_hooks_enabled) before running. Never crashes the caller.
+  @spec fire_lifecycle_post_hook(atom(), Task.t()) :: :ok
+  defp fire_lifecycle_post_hook(action_name, %Task{} = task) do
+    ActionBoundary.run_lifecycle_post_hooks(action_name,
+      session_id: task.session_id,
+      agent_id: task.owner_id,
+      task_id: task.id,
+      plan_id: task.plan_id
+    )
   end
 
   # -------------------------------------------------------------------
