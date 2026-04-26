@@ -584,7 +584,7 @@ defmodule KiroCockpit.Swarm.HooksTest do
     end
   end
 
-  describe "SteeringPreActionHook" do
+  describe "SteeringPreActionHook — deterministic signals" do
     test "continues when no deterministic signals present" do
       event = Event.new(:read, session_id: "sess_1", agent_id: "agent_1")
       ctx = %{}
@@ -654,6 +654,256 @@ defmodule KiroCockpit.Swarm.HooksTest do
       result = SteeringPreActionHook.on_event(event, ctx)
 
       assert %HookResult{decision: :block, reason: "Task mismatch"} = result
+    end
+
+    test "deterministic block overrides LLM even when steering model returns continue" do
+      # Deterministic off-topic signal is present
+      event =
+        Event.new(:write,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          metadata: %{off_topic: true, off_topic_guidance: "Off-topic"}
+        )
+
+      # LLM model that would say continue
+      continue_model = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "continue", "reason": "Looks fine", "risk_level": "low"})}
+      end
+
+      ctx = %{steering_opts: [steering_model: continue_model]}
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      # Deterministic signal MUST win
+      assert %HookResult{decision: :block, reason: "Action is off-topic"} = result
+    end
+
+    test "deterministic drift overrides LLM even when model returns block" do
+      event =
+        Event.new(:write,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          metadata: %{drift: true, drift_message: "Drift detected"}
+        )
+
+      block_model = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "block", "reason": "Should block", "risk_level": "high"})}
+      end
+
+      ctx = %{steering_opts: [steering_model: block_model]}
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      # Deterministic drift (focus) wins — not block
+      assert %HookResult{decision: :modify} = result
+    end
+  end
+
+  describe "SteeringPreActionHook — LLM-backed steering" do
+    test "calls LLM steering when no deterministic signal present" do
+      llm_continue = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "continue", "reason": "Aligned with task", "risk_level": "low"})}
+      end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: llm_continue]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :continue} = result
+      assert result.hook_metadata[:steering_decision] == :continue
+      assert result.hook_metadata[:steering_source] == :llm
+    end
+
+    test "maps LLM focus to modify with reminder message" do
+      llm_focus = fn _prompt, _opts ->
+        {:ok,
+         ~s({"decision": "focus", "reason": "Slight drift from task", "suggested_next_action": "Return to auth", "risk_level": "medium"})}
+      end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: llm_focus]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :modify} = result
+      assert result.hook_metadata[:steering_decision] == :focus
+      assert Enum.any?(result.messages, &String.contains?(&1, "Slight drift"))
+      assert Enum.any?(result.messages, &String.contains?(&1, "Return to auth"))
+    end
+
+    test "maps LLM guide to modify with guidance and memory refs" do
+      llm_guide = fn _prompt, _opts ->
+        {:ok,
+         ~s({"decision": "guide", "reason": "Config hot-reload issue", "suggested_next_action": "Add validation", "memory_refs": ["mem_config"], "risk_level": "medium"})}
+      end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: llm_guide]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :modify} = result
+      assert result.hook_metadata[:steering_decision] == :guide
+      assert Enum.any?(result.messages, &String.contains?(&1, "Config hot-reload"))
+      assert Enum.any?(result.messages, &String.contains?(&1, "mem_config"))
+    end
+
+    test "maps LLM block to block with reason and alternative" do
+      llm_block = fn _prompt, _opts ->
+        {:ok,
+         ~s({"decision": "block", "reason": "Off-topic", "suggested_next_action": "Do X instead", "risk_level": "high"})}
+      end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: llm_block]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :block} = result
+      assert result.reason == "Off-topic"
+      assert Enum.any?(result.messages, &String.contains?(&1, "Do X instead"))
+    end
+
+    test "falls back to continue when no steering model configured" do
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      # No model → fallback continue (quiet, no scary messages)
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "falls back to continue when model is unavailable" do
+      failing_model = fn _prompt, _opts -> {:error, "model unavailable"} end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: failing_model]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      # Fallback: continue (deterministic gates already passed)
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "falls back to continue when model returns invalid JSON" do
+      bad_model = fn _prompt, _opts -> {:ok, "not json at all"} end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: bad_model]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "runs after task enforcement in hook chain and does not call model when deterministic task gate blocks" do
+      Process.put(:steering_model_called, false)
+
+      llm_block = fn _prompt, _opts ->
+        Process.put(:steering_model_called, true)
+        {:ok, ~s({"decision": "block", "reason": "model block", "risk_level": "high"})}
+      end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: llm_block]}
+      hooks = [SteeringPreActionHook, TaskEnforcementHook]
+
+      assert {:blocked, _event, "No active task", _messages} =
+               HookManager.run(event, hooks, ctx, :pre)
+
+      refute Process.get(:steering_model_called)
+    after
+      Process.delete(:steering_model_called)
+    end
+
+    test "filters spec-listed wrapper actions from §27.3" do
+      for action <- [
+            :kiro_session_prompt,
+            :kiro_tool_call_detected,
+            :permission_request,
+            :file_write_requested,
+            :shell_command_requested,
+            :subagent_invoke,
+            :mcp_tool_invoke,
+            :verification_run,
+            :memory_promote,
+            :subagent,
+            :memory_write
+          ] do
+        assert SteeringPreActionHook.filter(Event.new(action))
+      end
+    end
+
+    test "payload off-topic signal overrides LLM, including string keys" do
+      continue_model = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "continue", "reason": "model continue", "risk_level": "low"})}
+      end
+
+      event =
+        Event.new(:write,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          payload: %{"off_topic" => "true", "off_topic_guidance" => "Payload says off-topic"}
+        )
+
+      result =
+        SteeringPreActionHook.on_event(event, %{steering_opts: [steering_model: continue_model]})
+
+      assert %HookResult{decision: :block, reason: "Action is off-topic"} = result
+      assert result.messages == ["Payload says off-topic"]
+    end
+
+    test "payload focus signal overrides LLM block" do
+      block_model = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "block", "reason": "model block", "risk_level": "high"})}
+      end
+
+      event =
+        Event.new(:write,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          payload: %{steering_decision: :focus, reason: "Payload focus"}
+        )
+
+      result =
+        SteeringPreActionHook.on_event(event, %{steering_opts: [steering_model: block_model]})
+
+      assert %HookResult{decision: :modify} = result
+      assert result.hook_metadata[:steering_decision] == :focus
+      assert result.messages == ["Payload focus"]
+    end
+
+    test "payload guide signal overrides LLM block" do
+      block_model = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "block", "reason": "model block", "risk_level": "high"})}
+      end
+
+      event =
+        Event.new(:write,
+          session_id: "sess_1",
+          agent_id: "agent_1",
+          payload: %{"steering_decision" => "guide", "guide_message" => "Payload guide"}
+        )
+
+      result =
+        SteeringPreActionHook.on_event(event, %{steering_opts: [steering_model: block_model]})
+
+      assert %HookResult{decision: :modify} = result
+      assert result.hook_metadata[:steering_decision] == :guide
+      assert result.messages == ["Payload guide"]
+    end
+
+    test "steering metadata includes source field" do
+      llm_continue = fn _prompt, _opts ->
+        {:ok, ~s({"decision": "continue", "reason": "ok", "risk_level": "low"})}
+      end
+
+      event = Event.new(:write, session_id: "sess_1", agent_id: "agent_1")
+      ctx = %{steering_opts: [steering_model: llm_continue]}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      assert result.hook_metadata[:steering_source] == :llm
     end
   end
 
