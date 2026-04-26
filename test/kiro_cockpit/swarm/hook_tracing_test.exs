@@ -327,5 +327,39 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
       assert hook_result["hook"] == "block_hook"
       assert hook_result["decision"] == "block"
     end
+
+    test "Bronze capture records blocked events with correlation IDs and reason (§36.1)" do
+      session_id = "sess_bronze_s36_#{System.unique_integer([:positive])}"
+      plan_id = Ecto.UUID.generate()
+      task_id = Ecto.UUID.generate()
+
+      event =
+        Event.new(:file_write,
+          session_id: session_id,
+          plan_id: plan_id,
+          task_id: task_id,
+          agent_id: "bronze_agent"
+        )
+
+      hooks = [BlockHook]
+      ctx = %{persist_hook_trace?: true}
+
+      {:blocked, _event, reason, _messages} = HookManager.run(event, hooks, ctx, :pre)
+
+      # Bronze event captures the blocked action's full context
+      [bronze] = Events.list_by_session(session_id, limit: 10)
+      assert bronze.event_type == "hook_trace"
+      assert bronze.session_id == session_id
+      assert bronze.plan_id == plan_id
+      assert bronze.task_id == task_id
+      assert bronze.agent_id == "bronze_agent"
+      assert bronze.phase == "pre"
+      # The trace summary includes the block reason and hook_results
+      assert bronze.hook_results["outcome"] == "blocked"
+      assert bronze.hook_results["reason"] == reason
+      assert is_list(bronze.hook_results["hook_results"])
+      [hr] = bronze.hook_results["hook_results"]
+      assert hr["decision"] == "block"
+    end
   end
 end
