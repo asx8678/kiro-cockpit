@@ -1070,7 +1070,14 @@ defmodule KiroCockpit.KiroSession do
   # Merges session-level swarm_ctx (durable trusted flags) into the
   # boundary opts so hooks see approved/policy flags set at session
   # construction time.
+  #
+  # Derives plan_mode from durable plan status when a plan_id is available
+  # from opts, or state.swarm_plan_id, and no explicit plan_mode exists.
+  # This makes execution prompt opts from NanoPlanner.approve produce an
+  # executing/approved plan mode without caller explicitly passing PlanMode.
   defp prompt_boundary_opts(state, opts) do
+    plan_mode = state.plan_mode || derive_plan_mode(opts, state)
+
     Keyword.merge(
       [
         session_id: state.session_id,
@@ -1078,7 +1085,7 @@ defmodule KiroCockpit.KiroSession do
         plan_id: state.swarm_plan_id,
         permission_level: :subagent,
         project_dir: state.cwd,
-        plan_mode: state.plan_mode,
+        plan_mode: plan_mode,
         swarm_ctx: state.swarm_ctx
       ],
       opts
@@ -1191,7 +1198,11 @@ defmodule KiroCockpit.KiroSession do
 
   # Build boundary options for callback actions.
   # Includes session-level swarm_ctx for durable trusted flags.
+  # Derives plan_mode from durable plan status when a plan_id is available
+  # from state.swarm_plan_id and no explicit plan_mode exists.
   defp callback_boundary_opts(state, _action, permission, target_path, _params) do
+    plan_mode = state.plan_mode || derive_plan_mode([], state)
+
     base =
       [
         session_id: state.session_id,
@@ -1199,7 +1210,7 @@ defmodule KiroCockpit.KiroSession do
         plan_id: state.swarm_plan_id,
         permission_level: permission,
         project_dir: state.cwd,
-        plan_mode: state.plan_mode,
+        plan_mode: plan_mode,
         swarm_ctx: state.swarm_ctx
       ]
 
@@ -1210,6 +1221,25 @@ defmodule KiroCockpit.KiroSession do
     else
       base
     end
+  end
+
+  # Derive plan_mode from durable plan status when a plan_id is available.
+  # Checks opts first, then state.swarm_plan_id. Returns nil if no plan_id
+  # is found or the plan cannot be loaded (fail-safe to nil so callers fall
+  # back to PlanMode.new() / idle behavior).
+  defp derive_plan_mode(opts, state) do
+    plan_id =
+      Keyword.get(opts, :plan_id) || Keyword.get(opts, :swarm_plan_id) || state.swarm_plan_id
+
+    if plan_id do
+      case KiroCockpit.Plans.get_plan(plan_id) do
+        nil -> nil
+        plan -> KiroCockpit.Swarm.PlanMode.from_plan(plan)
+      end
+    end
+  rescue
+    # DB or plan lookup failures should not crash the session
+    _ -> nil
   end
 
   # fs/* methods are fast file operations — handle synchronously.

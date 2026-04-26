@@ -239,6 +239,71 @@ defmodule KiroCockpit.Swarm.PlanMode do
     {:ok, %__MODULE__{plan_id: plan_mode.plan_id, rejected_count: plan_mode.rejected_count}}
   end
 
+  # ── Derivation helpers ──────────────────────────────────────────────────
+
+  @doc """
+  Derives a PlanMode struct from a plan's status.
+
+  Maps plan statuses to runtime PlanMode states:
+
+    | Plan status     | PlanMode state        |
+    |-----------------|-----------------------|
+    | `draft`         | `:waiting_for_approval` |
+    | `approved`      | `:approved`           |
+    | `running`       | `:executing`          |
+    | `completed`     | `:completed`          |
+    | `rejected`      | `:rejected`           |
+    | `failed`        | `:failed`             |
+    | `superseded`    | `:rejected` (terminal) |
+    | nil/unknown     | `:idle` (fail-safe)   |
+
+  The plan_id is preserved from the plan struct for trace correlation.
+  """
+  @spec from_plan(map()) :: t()
+  def from_plan(%{status: status, id: plan_id}) do
+    %{from_plan_status(status) | plan_id: plan_id}
+  end
+
+  def from_plan(%{status: status}) do
+    from_plan_status(status)
+  end
+
+  @doc """
+  Derives a PlanMode from a plan status string, without a plan_id.
+  """
+  @spec from_plan_status(String.t() | nil) :: t()
+  def from_plan_status(status) when is_binary(status) do
+    state =
+      case status do
+        "draft" -> :waiting_for_approval
+        "approved" -> :approved
+        "running" -> :executing
+        "completed" -> :completed
+        "rejected" -> :rejected
+        "failed" -> :failed
+        "superseded" -> :rejected
+        _ -> :idle
+      end
+
+    %__MODULE__{state: state}
+  end
+
+  def from_plan_status(_nil_or_unknown) do
+    %__MODULE__{state: :idle}
+  end
+
+  @doc """
+  Returns a PlanMode in the `:planning` state, suitable for plan generation.
+
+  Use this as the default plan_mode for `NanoPlanner.plan/3` boundary opts
+  so that the planning lifecycle state is automatically wired without
+  requiring callers to construct a PlanMode explicitly.
+  """
+  @spec for_planning() :: t()
+  def for_planning do
+    %__MODULE__{state: :planning}
+  end
+
   # ── Action / permission predicates ────────────────────────────────────
 
   @doc """

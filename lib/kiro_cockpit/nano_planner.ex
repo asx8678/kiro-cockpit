@@ -146,7 +146,8 @@ defmodule KiroCockpit.NanoPlanner do
 
   defp plan_generate_boundary_opts(session_id, project_dir, mode, user_request, opts) do
     agent_id = Keyword.get(opts, :agent_id, "nano-planner")
-    plan_mode = Keyword.get(opts, :plan_mode)
+    # Default to planning state for plan generation unless caller explicitly provides plan_mode
+    plan_mode = Keyword.get(opts, :plan_mode, KiroCockpit.Swarm.PlanMode.for_planning())
     swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
 
     [
@@ -308,7 +309,9 @@ defmodule KiroCockpit.NanoPlanner do
   defp plan_approve_boundary_opts(plan, project_dir, opts) do
     session_id = Keyword.get(opts, :session_id, plan.session_id)
     agent_id = Keyword.get(opts, :agent_id, "nano-planner")
-    plan_mode = Keyword.get(opts, :plan_mode)
+
+    # Default plan_mode from the fetched plan (draft => waiting_for_approval) unless caller overrides
+    plan_mode = Keyword.get(opts, :plan_mode, KiroCockpit.Swarm.PlanMode.from_plan(plan))
     swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
 
     [
