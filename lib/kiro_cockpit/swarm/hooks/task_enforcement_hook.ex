@@ -217,43 +217,43 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   defp check_category_permission(event, ctx) do
     active_task = get_active_task(event)
 
-    if active_task do
-      permission = permission_for_event(event)
-
-      # Executor dispatch is a control-plane action that bypasses
-      # category/scope checks when plan is approved and active task exists.
-      # This allows KiroSession.prompt to dispatch execution prompts even
-      # when the task category is "researching" and lacks :subagent scope.
-      if executor_dispatch_action?(event) and execution_prompt_dispatch_allowed?(ctx) do
+    cond do
+      is_nil(active_task) ->
         :ok
-      else
-        case TaskScope.permission_allowed?(
-               active_task,
-               permission,
-               approval_opts(event, ctx, active_task)
-             ) do
-          {:ok, :allowed} ->
-            :ok
 
-          {:error, :category_denied} ->
-            category = active_task.category
-            guidance = "Category '#{category}' does not allow #{permission} actions."
-            {:blocked, "Category permission denied", guidance}
+      executor_dispatch_allowed?(event, ctx) ->
+        :ok
 
-          {:error, :scope_denied} ->
-            guidance = "Task permission scope does not allow #{permission} actions."
-            {:blocked, "Task scope permission denied", guidance}
+      true ->
+        permission = permission_for_event(event)
+        check_task_permission(active_task, permission, event, ctx)
+    end
+  end
 
-          {:error, :needs_approval} ->
-            guidance =
-              "Category '#{active_task.category}' allows #{permission} with approval. " <>
-                "Request approval before proceeding."
+  defp check_task_permission(active_task, permission, event, ctx) do
+    case TaskScope.permission_allowed?(
+           active_task,
+           permission,
+           approval_opts(event, ctx, active_task)
+         ) do
+      {:ok, :allowed} ->
+        :ok
 
-            {:blocked, "Permission requires approval", guidance}
-        end
-      end
-    else
-      :ok
+      {:error, :category_denied} ->
+        category = active_task.category
+        guidance = "Category '#{category}' does not allow #{permission} actions."
+        {:blocked, "Category permission denied", guidance}
+
+      {:error, :scope_denied} ->
+        guidance = "Task permission scope does not allow #{permission} actions."
+        {:blocked, "Task scope permission denied", guidance}
+
+      {:error, :needs_approval} ->
+        guidance =
+          "Category '#{active_task.category}' allows #{permission} with approval. " <>
+            "Request approval before proceeding."
+
+        {:blocked, "Permission requires approval", guidance}
     end
   end
 
@@ -392,5 +392,11 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   # Never trust event payload/metadata for this decision.
   defp execution_prompt_dispatch_allowed?(ctx) do
     truthy?(trusted_lookup(ctx, :approved))
+  end
+
+  # Combined check for whether executor dispatch is allowed.
+  # Extracted to reduce nesting depth per Credo.
+  defp executor_dispatch_allowed?(event, ctx) do
+    executor_dispatch_action?(event) and execution_prompt_dispatch_allowed?(ctx)
   end
 end
