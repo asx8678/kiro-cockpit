@@ -22,7 +22,7 @@ defmodule KiroCockpit.NanoPlanner do
   Any other mode returns `{:error, {:invalid_mode, mode}}`.
   """
 
-  alias KiroCockpit.NanoPlanner.{ContextBuilder, PlanSchema, PromptBuilder, Staleness}
+  alias KiroCockpit.NanoPlanner.{ContextBuilder, PlanSchema, PromptBuilder}
   alias KiroCockpit.Plans
   alias KiroCockpit.Swarm.ActionBoundary
 
@@ -179,11 +179,12 @@ defmodule KiroCockpit.NanoPlanner do
   @doc """
   Approves a draft plan and sends its execution prompt to Kiro.
 
-  Before approval, checks whether the project snapshot has changed since
-  the plan was created. If the hash differs, returns `{:error, :stale_plan}`.
-  If the current project dir is unavailable or the snapshot cannot be
-  computed, returns `{:error, :stale_plan_unknown}` — the check **fails
-  closed** rather than being skipped.
+  Routes through `ActionBoundary` for stale-plan enforcement and Bronze
+  trace capture. Staleness checking happens inside the boundary via
+  `TaskEnforcementHook`, which inspects trusted context computed from
+  `Staleness.trusted_context/3`. If the boundary blocks a stale plan, a
+  Bronze `hook_trace` with outcome `blocked` is persisted and the plan
+  remains in draft status.
 
   After approval (`Plans.approve_plan/1`), the plan's `execution_prompt`
   is sent to Kiro via `prompt/3`.
@@ -197,6 +198,15 @@ defmodule KiroCockpit.NanoPlanner do
     * `:context_builder_module` — module implementing `build/1` for
       staleness checks (default `ContextBuilder`). Useful for testing
       snapshot-build failure scenarios.
+    * `:swarm_hooks` — explicitly enable/disable hook boundary
+      (default: app config, `false` in test)
+    * `:pre_hooks` — list of pre-action hook modules
+    * `:post_hooks` — list of post-action hook modules
+    * `:hook_manager_module` — module for hook execution
+    * `:task_manager_module` — module for active task lookup
+    * `:staleness_module` — module for trusted_context (default Staleness)
+    * `:stale_plan_override?` / `:stale_plan_confirmed?` —
+      trusted server-side override to allow stale plan approval
 
   Returns `{:ok, %{plan: approved_plan, prompt_result: result}}` on success,
   or `{:error, reason}` on failure. If the prompt send fails after approval,
@@ -212,27 +222,22 @@ defmodule KiroCockpit.NanoPlanner do
          {:ok, project_dir} <- resolve_project_dir_for_staleness(session_mod, session, opts) do
       boundary_opts = plan_approve_boundary_opts(plan, project_dir, opts)
 
-      # Staleness check remains outside boundary for now (kiro-ux7 will move
-      # it into the boundary executor). If stale, we skip the boundary
-      # entirely — the action never reaches hooks.
-      case Staleness.check(plan, project_dir, opts) do
-        :ok ->
-          if boundary_enabled?(opts) do
-            case ActionBoundary.run(:nano_plan_approve, boundary_opts, fn ->
-                   do_approve(session_mod, session, plan_id, opts)
-                 end) do
-              {:ok, result} ->
-                result
+      # Staleness checking happens inside the boundary via
+      # TaskEnforcementHook, which inspects trusted ctx computed from
+      # Staleness.trusted_context/3. If blocked, Bronze trace captures
+      # the blocked attempt with outcome "blocked".
+      if boundary_enabled?(opts) do
+        case ActionBoundary.run(:nano_plan_approve, boundary_opts, fn ->
+               do_approve(session_mod, session, plan_id, opts)
+             end) do
+          {:ok, result} ->
+            result
 
-              {:error, {:swarm_blocked, reason, messages}} ->
-                {:error, {:swarm_blocked, reason, messages}}
-            end
-          else
-            do_approve(session_mod, session, plan_id, opts)
-          end
-
-        {:error, reason} ->
-          {:error, reason}
+          {:error, {:swarm_blocked, reason, messages}} ->
+            {:error, {:swarm_blocked, reason, messages}}
+        end
+      else
+        do_approve(session_mod, session, plan_id, opts)
       end
     end
   end
@@ -271,6 +276,8 @@ defmodule KiroCockpit.NanoPlanner do
     |> maybe_put_opt(opts, :task_manager_module)
     |> maybe_put_opt(opts, :stale_plan_override?)
     |> maybe_put_opt(opts, :stale_plan_confirmed?)
+    |> maybe_put_opt(opts, :context_builder_module)
+    |> maybe_put_opt(opts, :staleness_module)
   end
 
   @doc """

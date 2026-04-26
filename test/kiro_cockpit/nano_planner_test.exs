@@ -618,20 +618,48 @@ defmodule KiroCockpit.NanoPlannerTest do
   describe "approve/3 stale plan detection" do
     setup [:setup_project_dir]
 
-    test "rejects stale plan when snapshot hash differs", %{project_dir: dir} do
+    test "rejects stale plan when snapshot hash differs via boundary", %{project_dir: dir} do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "stale-approve-hash-#{System.unique_integer([:positive])}"
+
+      plan_opts = default_plan_opts(dir) |> Keyword.put(:session_id, session_id)
 
       assert {:ok, plan} =
-               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+               NanoPlanner.plan(:fake_session, "Build it", plan_opts)
 
       # Modify the project so the snapshot hash changes
       File.write!(Path.join(dir, "NEW_FILE.md"), "# New content changes the hash")
 
-      assert {:error, :stale_plan} =
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # With hooks enabled, staleness is checked inside ActionBoundary
+      assert {:error, {:swarm_blocked, reason, _messages}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 session_id: session_id,
+                 swarm_hooks: true,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
                )
+
+      assert reason =~ "Stale plan"
+
+      # Plan should still be draft (not approved)
+      refreshed = Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
+      # No prompt should have been sent
+      calls = Process.get(:fake_kiro_prompt_calls, [])
+      assert calls == []
+
+      # Bronze trace should be persisted
+      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+      assert length(events) >= 1
+      trace = List.first(events)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "blocked"
+      assert trace.hook_results["action"] == "nano_plan_approve"
     end
 
     test "fails closed when project dir is unavailable", %{project_dir: dir} do
@@ -661,11 +689,14 @@ defmodule KiroCockpit.NanoPlannerTest do
       Process.put(:fake_kiro_state, %{session_id: "test-session", cwd: dir})
     end
 
-    test "fails closed when snapshot build fails", %{project_dir: dir} do
+    test "fails closed when snapshot build fails via boundary", %{project_dir: dir} do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "stale-approve-fail-#{System.unique_integer([:positive])}"
+
+      plan_opts = default_plan_opts(dir) |> Keyword.put(:session_id, session_id)
 
       assert {:ok, plan} =
-               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+               NanoPlanner.plan(:fake_session, "Build it", plan_opts)
 
       # Delete the project dir so snapshot build fails
       File.rm_rf!(dir)
@@ -673,12 +704,19 @@ defmodule KiroCockpit.NanoPlannerTest do
       # Reset prompt calls from plan/3
       Process.put(:fake_kiro_prompt_calls, [])
 
-      # Approval must be blocked — fail closed
-      assert {:error, :stale_plan_unknown} =
+      # With hooks enabled, snapshot build failure triggers stale_plan_unknown
+      # inside the boundary, which TaskEnforcementHook blocks.
+      assert {:error, {:swarm_blocked, reason, _messages}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 session_id: session_id,
+                 swarm_hooks: true,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
                )
+
+      assert reason =~ "Stale plan"
 
       # Plan should still be draft
       refreshed = Plans.get_plan(plan.id)
@@ -690,13 +728,26 @@ defmodule KiroCockpit.NanoPlannerTest do
 
       # Re-create dir for on_exit cleanup (though it was already removed)
       File.mkdir_p!(dir)
+
+      # Bronze trace should be persisted
+      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+      assert length(events) >= 1
+      trace = List.first(events)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "blocked"
+      assert trace.hook_results["action"] == "nano_plan_approve"
     end
 
-    test "fails closed with injectable context_builder_module that errors", %{project_dir: dir} do
+    test "fails closed with injectable context_builder_module that errors via boundary", %{
+      project_dir: dir
+    } do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "stale-approve-cb-#{System.unique_integer([:positive])}"
+
+      plan_opts = default_plan_opts(dir) |> Keyword.put(:session_id, session_id)
 
       assert {:ok, plan} =
-               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+               NanoPlanner.plan(:fake_session, "Build it", plan_opts)
 
       defmodule BrokenContextBuilder do
         @moduledoc false
@@ -706,13 +757,20 @@ defmodule KiroCockpit.NanoPlannerTest do
       # Reset prompt calls from plan/3
       Process.put(:fake_kiro_prompt_calls, [])
 
-      # Approval must be blocked when context builder fails
-      assert {:error, :stale_plan_unknown} =
+      # With hooks enabled, the broken context builder triggers stale_plan_unknown
+      # inside the boundary, which TaskEnforcementHook blocks.
+      assert {:error, {:swarm_blocked, reason, _messages}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
                  project_dir: dir,
-                 context_builder_module: BrokenContextBuilder
+                 session_id: session_id,
+                 swarm_hooks: true,
+                 context_builder_module: BrokenContextBuilder,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
                )
+
+      assert reason =~ "Stale plan"
 
       # Plan should still be draft
       refreshed = Plans.get_plan(plan.id)
@@ -721,6 +779,14 @@ defmodule KiroCockpit.NanoPlannerTest do
       # No prompt should have been sent
       calls = Process.get(:fake_kiro_prompt_calls, [])
       assert calls == []
+
+      # Bronze trace should be persisted
+      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+      assert length(events) >= 1
+      trace = List.first(events)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "blocked"
+      assert trace.hook_results["action"] == "nano_plan_approve"
     end
   end
 
