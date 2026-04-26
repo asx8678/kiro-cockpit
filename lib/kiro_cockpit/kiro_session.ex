@@ -1143,11 +1143,11 @@ defmodule KiroCockpit.KiroSession do
   # If hooks allow but callback_policy denies, respond with
   # Callbacks.denied_error (preserving existing behavior).
   defp run_callback_with_boundary(state, port_pid, id, method, params) do
-    {action, permission} = callback_action_mapping(method)
+    {action, permission} = Callbacks.action_mapping(method)
     target_path = extract_callback_target_path(method, params)
 
     boundary_opts =
-      callback_boundary_opts(state, action, permission, target_path, params)
+      callback_boundary_opts(state, action, permission, target_path, params, method)
 
     case state.swarm_hooks_module.run(action, boundary_opts, fn ->
            # The executor runs inside the boundary — pre/post trace
@@ -1183,11 +1183,7 @@ defmodule KiroCockpit.KiroSession do
     end
   end
 
-  # Map callback methods to action names and permission levels.
-  defp callback_action_mapping("fs/read_text_file"), do: {:fs_read_requested, :read}
-  defp callback_action_mapping("fs/write_text_file"), do: {:fs_write_requested, :write}
-  defp callback_action_mapping("terminal/" <> _), do: {:terminal_requested, :terminal}
-  defp callback_action_mapping(method), do: {String.to_atom(method), :read}
+  # callback_action_mapping/1 moved to Callbacks.action_mapping/1 (kiro-2ai).
 
   # Extract target file path from callback params for file scope checks.
   defp extract_callback_target_path("fs/" <> _, params) when is_map(params) do
@@ -1200,7 +1196,10 @@ defmodule KiroCockpit.KiroSession do
   # Includes session-level swarm_ctx for durable trusted flags.
   # Derives plan_mode from durable plan status when a plan_id is available
   # from state.swarm_plan_id and no explicit plan_mode exists.
-  defp callback_boundary_opts(state, _action, permission, target_path, _params) do
+  # The raw `method` string is always included in metadata/payload for
+  # observability — even when the action atom is a stable fallback
+  # (kiro-2ai: no String.to_atom on unknown methods).
+  defp callback_boundary_opts(state, _action, permission, target_path, _params, method) do
     plan_mode = state.plan_mode || derive_plan_mode([], state)
 
     base =
@@ -1214,13 +1213,15 @@ defmodule KiroCockpit.KiroSession do
         swarm_ctx: state.swarm_ctx
       ]
 
-    if target_path do
-      base
-      |> Keyword.put(:metadata, %{target_path: target_path})
-      |> Keyword.put(:payload, %{target_path: target_path})
-    else
-      base
-    end
+    meta = %{callback_method: method}
+    payload = %{callback_method: method}
+
+    meta = if target_path, do: Map.put(meta, :target_path, target_path), else: meta
+    payload = if target_path, do: Map.put(payload, :target_path, target_path), else: payload
+
+    base
+    |> Keyword.put(:metadata, meta)
+    |> Keyword.put(:payload, payload)
   end
 
   # Derive plan_mode from durable plan status when a plan_id is available.

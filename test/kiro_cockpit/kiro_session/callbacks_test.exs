@@ -677,4 +677,73 @@ defmodule KiroCockpit.KiroSession.CallbacksTest do
       assert message =~ "fs/write_text_file"
     end
   end
+
+  # -- action_mapping/1 (kiro-2ai: safe callback action mapping) ------------
+
+  describe "action_mapping/1" do
+    test "maps fs/read_text_file to {:fs_read_requested, :read}" do
+      assert Callbacks.action_mapping("fs/read_text_file") == {:fs_read_requested, :read}
+    end
+
+    test "maps fs/write_text_file to {:fs_write_requested, :write}" do
+      assert Callbacks.action_mapping("fs/write_text_file") == {:fs_write_requested, :write}
+    end
+
+    test "maps terminal/* methods to {:terminal_requested, :terminal}" do
+      assert Callbacks.action_mapping("terminal/create") == {:terminal_requested, :terminal}
+      assert Callbacks.action_mapping("terminal/output") == {:terminal_requested, :terminal}
+      assert Callbacks.action_mapping("terminal/kill") == {:terminal_requested, :terminal}
+
+      assert Callbacks.action_mapping("terminal/wait_for_exit") ==
+               {:terminal_requested, :terminal}
+
+      assert Callbacks.action_mapping("terminal/release") == {:terminal_requested, :terminal}
+    end
+
+    test "unknown methods map to :callback_requested without atom creation" do
+      # These are arbitrary external strings — must not create atoms.
+      assert Callbacks.action_mapping("session/prompt") == {:callback_requested, :read}
+
+      assert Callbacks.action_mapping("_kiro.dev/commands/execute") ==
+               {:callback_requested, :read}
+
+      assert Callbacks.action_mapping("fs/unknown_method") == {:callback_requested, :read}
+      assert Callbacks.action_mapping("completely/bogus/method") == {:callback_requested, :read}
+
+      # Verify no new atoms were created from these strings.
+      refute atom_exists?("session/prompt"),
+             "String.to_atom should not have been called on 'session/prompt'"
+
+      refute atom_exists?("_kiro.dev/commands/execute"),
+             "String.to_atom should not have been called on '_kiro.dev/commands/execute'"
+    end
+
+    test "all known methods have explicit mappings (no fallback to unknown)" do
+      known_methods = [
+        "fs/read_text_file",
+        "fs/write_text_file",
+        "terminal/create",
+        "terminal/output",
+        "terminal/wait_for_exit",
+        "terminal/kill",
+        "terminal/release"
+      ]
+
+      for method <- known_methods do
+        {action, _perm} = Callbacks.action_mapping(method)
+
+        refute action == :callback_requested,
+               "Expected explicit mapping for known method #{method}, got :callback_requested"
+      end
+    end
+  end
+
+  defp atom_exists?(string) when is_binary(string) do
+    try do
+      String.to_existing_atom(string)
+      true
+    rescue
+      ArgumentError -> false
+    end
+  end
 end
