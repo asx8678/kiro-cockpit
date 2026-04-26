@@ -58,7 +58,8 @@ defmodule KiroCockpit.Swarm.Tasks.Task do
           files_scope: [String.t()],
           acceptance_criteria: [String.t()],
           inserted_at: DateTime.t() | nil,
-          updated_at: DateTime.t() | nil
+          updated_at: DateTime.t() | nil,
+          guidance: [String.t()]
         }
 
   schema "swarm_tasks" do
@@ -75,6 +76,8 @@ defmodule KiroCockpit.Swarm.Tasks.Task do
     field :permission_scope, {:array, :string}, default: []
     field :files_scope, {:array, :string}, default: []
     field :acceptance_criteria, {:array, :string}, default: []
+
+    field :guidance, {:array, :string}, virtual: true, default: []
 
     belongs_to :plan, KiroCockpit.Plans.Plan, type: :binary_id, on_replace: :nilify
 

@@ -391,6 +391,117 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManagerTest do
   end
 
   # -----------------------------------------------------------------
+  # Lifecycle guidance (§27.9)
+  # -----------------------------------------------------------------
+
+  describe "guidance — create/1" do
+    test "attaches activate-next guidance when no active task exists in lane" do
+      attrs = %{
+        session_id: "guidance_create_1",
+        content: "First task",
+        owner_id: "agent-guidance"
+      }
+
+      assert {:ok, task} = TaskManager.create(attrs)
+
+      assert task.guidance == [
+               "Activate the next task with status=in_progress before execution."
+             ]
+    end
+
+    test "attaches empty guidance when another task is already active in the lane" do
+      lane = %{session_id: "guidance_create_2", owner_id: "agent-guidance-2"}
+
+      # Create and activate a task in the lane
+      {:ok, task1} = TaskManager.create(Map.merge(lane, %{content: "Active task"}))
+      {:ok, _} = TaskManager.activate(task1.id)
+
+      # Create another task in same lane — should get empty guidance
+      {:ok, task2} = TaskManager.create(Map.merge(lane, %{content: "Second task"}))
+      assert task2.guidance == []
+    end
+
+    test "attaches activate-next guidance even when active task exists in a different lane" do
+      # Create active task in lane A
+      {:ok, active} =
+        TaskManager.create(%{session_id: "lane_a", content: "Active", owner_id: "owner_a"})
+
+      {:ok, _} = TaskManager.activate(active.id)
+
+      # Create task in lane B — should get guidance
+      {:ok, task_b} =
+        TaskManager.create(%{session_id: "lane_b", content: "Fresh", owner_id: "owner_b"})
+
+      assert task_b.guidance == [
+               "Activate the next task with status=in_progress before execution."
+             ]
+    end
+  end
+
+  describe "guidance — activate/1" do
+    test "attaches activation guidance on successful activate" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "guidance_act",
+          content: "Activate me",
+          owner_id: "agent-act"
+        })
+
+      assert {:ok, activated} = TaskManager.activate(task.id)
+
+      assert activated.guidance == [
+               "Task is active. Proceed within its category and permission scope."
+             ]
+    end
+
+    test "attaches activation guidance on idempotent activate" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "guidance_act_idem",
+          content: "Already active",
+          owner_id: "agent-act-idem"
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+      assert {:ok, reactivated} = TaskManager.activate(task.id)
+
+      assert reactivated.guidance == [
+               "Task is active. Proceed within its category and permission scope."
+             ]
+    end
+  end
+
+  describe "guidance — complete/1" do
+    test "attaches completion guidance on successful complete" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "guidance_comp",
+          content: "Complete me",
+          owner_id: "agent-comp"
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+      assert {:ok, completed} = TaskManager.complete(task.id)
+      assert completed.guidance == ["Pick the next pending task or run final verification."]
+    end
+  end
+
+  describe "guidance — block/1" do
+    test "attaches block guidance on successful block" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "guidance_block",
+          content: "Block me",
+          owner_id: "agent-block"
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+      assert {:ok, blocked} = TaskManager.block(task.id)
+      assert blocked.guidance == ["Resolve blocker, revise plan, or ask user."]
+    end
+  end
+
+  # -----------------------------------------------------------------
   # Transition validity
   # -----------------------------------------------------------------
 
