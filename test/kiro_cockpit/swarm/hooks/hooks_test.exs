@@ -1017,4 +1017,76 @@ defmodule KiroCockpit.Swarm.HooksTest do
       assert Enum.any?(messages, &String.contains?(&1, "Task is active"))
     end
   end
+
+  describe "TaskEnforcementHook recognizes subagent and memory_write" do
+    test "recognizes subagent permission level" do
+      event =
+        Event.new(:subagent_invoke,
+          session_id: "sess_sub",
+          agent_id: "agent_sub",
+          permission_level: :subagent
+        )
+
+      # No active task → should block
+      ctx = %{plan_mode: PlanMode.new()}
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :block} = result
+    end
+
+    test "recognizes memory_write permission level" do
+      event =
+        Event.new(:memory_write,
+          session_id: "sess_mw",
+          agent_id: "agent_mw",
+          permission_level: :memory_write
+        )
+
+      ctx = %{plan_mode: PlanMode.new()}
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :block} = result
+    end
+  end
+
+  describe "PlanModeFirstActionHook recognizes subagent and memory_write" do
+    test "filters subagent permission" do
+      event =
+        Event.new(:subagent_invoke,
+          session_id: "sess_sub2",
+          agent_id: "agent_sub2",
+          permission_level: :subagent
+        )
+
+      assert PlanModeFirstActionHook.filter(event)
+    end
+
+    test "filters memory_write permission" do
+      event =
+        Event.new(:memory_promote,
+          session_id: "sess_mw2",
+          agent_id: "agent_mw2",
+          permission_level: :memory_write
+        )
+
+      assert PlanModeFirstActionHook.filter(event)
+    end
+
+    test "provides guidance for subagent in planning mode" do
+      event =
+        Event.new(:subagent_invoke,
+          session_id: "sess_sub3",
+          agent_id: "agent_sub3",
+          permission_level: :subagent
+        )
+
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+      ctx = %{plan_mode: plan_mode, first_action_shown: false}
+
+      result = PlanModeFirstActionHook.on_event(event, ctx)
+
+      assert %HookResult{decision: :modify} = result
+      assert Enum.any?(result.messages, &String.contains?(&1, "plan mode"))
+    end
+  end
 end

@@ -28,6 +28,7 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
   a category denies is still denied.
   """
 
+  alias KiroCockpit.Permissions
   alias KiroCockpit.Swarm.Tasks.{CategoryMatrix, Task}
 
   @type permission ::
@@ -329,25 +330,15 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
     Enum.any?(scope, fn s -> to_permission_atom(s) == permission end)
   end
 
-  @permission_atoms %{
-    "read" => :read,
-    "write" => :write,
-    "shell_read" => :shell_read,
-    "shell_write" => :shell_write,
-    "terminal" => :terminal,
-    "external" => :external,
-    "destructive" => :destructive,
-    "subagent" => :subagent,
-    "memory_write" => :memory_write
-  }
-
-  @spec to_permission_atom(String.t()) :: permission() | nil
   defp to_permission_atom(str) when is_binary(str) do
-    Map.get(@permission_atoms, str)
+    case Permissions.parse_permission(str) do
+      {:ok, perm} -> perm
+      {:error, _} -> nil
+    end
   end
 
   defp to_permission_atom(atom) when is_atom(atom) do
-    if Map.has_key?(@permission_atoms, Atom.to_string(atom)), do: atom, else: nil
+    if Permissions.valid_permission?(atom), do: atom, else: nil
   end
 
   # Simplified glob matching for file scope patterns.

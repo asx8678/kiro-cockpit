@@ -4,15 +4,17 @@ defmodule KiroCockpit.Permissions do
 
   Pure, deterministic module — no DB, no UI, no side effects.
 
-  ## Permission levels (escalation order)
+  ## Permission levels (escalation order, §32.1)
 
-      :read         – safe project inspection
-      :write        – file creation/modification
-      :shell_read   – read-only commands (git status, ls, mix test --dry-run)
-      :shell_write  – commands that generate files, install deps, migrate DB
+      :read          – safe project inspection
+      :write         – file creation/modification
+      :shell_read    – read-only commands (git status, ls, mix test --dry-run)
+      :shell_write   – commands that generate files, install deps, migrate DB
       :terminal     – long-running interactive process
       :external     – network, MCP, docs/search, browser
       :destructive  – rm, reset, kill, overwrites, data deletion
+      :subagent     – invoke another agent
+      :memory_write  – promote or consolidate memory
 
   ## Policies
 
@@ -27,7 +29,17 @@ defmodule KiroCockpit.Permissions do
   should regenerate by default.
   """
 
-  @escalation_order [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+  @escalation_order [
+    :read,
+    :write,
+    :shell_read,
+    :shell_write,
+    :terminal,
+    :external,
+    :destructive,
+    :subagent,
+    :memory_write
+  ]
 
   # Explicit string→atom mapping so arbitrary LLM strings never pollute the atom table.
   @string_to_permission %{
@@ -38,14 +50,80 @@ defmodule KiroCockpit.Permissions do
     "terminal" => :terminal,
     "external" => :external,
     "destructive" => :destructive,
+    "subagent" => :subagent,
+    "memory_write" => :memory_write,
     "shell" => :shell_write,
     "shell_readonly" => :shell_read
   }
 
   @type permission ::
-          :read | :write | :shell_read | :shell_write | :terminal | :external | :destructive
+          :read
+          | :write
+          | :shell_read
+          | :shell_write
+          | :terminal
+          | :external
+          | :destructive
+          | :subagent
+          | :memory_write
   @type policy :: :read_only | :auto_allow_readonly | :auto_allow_all
   @type policy_check_result :: :ok | {:needs_approval, [permission()]}
+
+  # ── Public API: permission vocabulary ────────────────────────────────
+
+  @doc "Returns the closed list of all 9 canonical permissions (§32.1)."
+  @spec permissions() :: [permission()]
+  def permissions, do: @escalation_order
+
+  @doc "Alias for `permissions/0` — the canonical §32.1 list."
+  @spec canonical_permissions() :: [permission()]
+  def canonical_permissions, do: @escalation_order
+
+  @doc "Returns the string forms of all canonical permissions."
+  @spec permission_strings() :: [String.t()]
+  def permission_strings, do: Enum.map(@escalation_order, &to_string/1)
+
+  @doc """
+  Parses a permission value to its canonical atom form.
+
+  Returns `{:ok, atom}` for valid permissions, `{:error, :invalid_permission}`
+  for unknown values. Atom-safe: arbitrary LLM strings never pollute the
+  atom table.
+  """
+  @spec parse_permission(atom() | String.t()) ::
+          {:ok, permission()} | {:error, :invalid_permission}
+  def parse_permission(perm) when perm in @escalation_order, do: {:ok, perm}
+
+  def parse_permission(perm) when is_binary(perm) do
+    case Map.get(@string_to_permission, String.downcase(perm)) do
+      nil -> {:error, :invalid_permission}
+      atom -> {:ok, atom}
+    end
+  end
+
+  def parse_permission(perm) when is_atom(perm) do
+    if perm in @escalation_order, do: {:ok, perm}, else: {:error, :invalid_permission}
+  end
+
+  def parse_permission(_), do: {:error, :invalid_permission}
+
+  @doc """
+  Returns `true` if the value resolves to a canonical permission.
+
+  Accepts atoms, strings, and common aliases. Atom-safe.
+  """
+  @spec valid_permission?(atom() | String.t()) :: boolean()
+  def valid_permission?(perm) when perm in @escalation_order, do: true
+
+  def valid_permission?(perm) when is_binary(perm) do
+    Map.has_key?(@string_to_permission, String.downcase(perm))
+  end
+
+  def valid_permission?(perm) when is_atom(perm) do
+    perm in @escalation_order
+  end
+
+  def valid_permission?(_), do: false
 
   # ── Escalation helpers ───────────────────────────────────────────────
 
@@ -77,6 +155,11 @@ defmodule KiroCockpit.Permissions do
   Accepts atoms, strings, and common aliases:
     - `"shell"` → `:shell_write`
     - `"shell_readonly"` → `:shell_read`
+    - `"subagent"` → `:subagent`
+    - `"memory_write"` → `:memory_write`
+
+  Falls back to `:read` for invalid input. Use `valid_permission?/1` or
+  `parse_permission/1` when you need to distinguish valid from invalid.
   """
   @spec normalize_permission(atom() | String.t()) :: permission()
   def normalize_permission(perm) when perm in @escalation_order, do: perm
@@ -91,6 +174,27 @@ defmodule KiroCockpit.Permissions do
   def normalize_permission(perm) when is_atom(perm) do
     if perm in @escalation_order, do: perm, else: :read
   end
+
+  def normalize_permission(_), do: :read
+
+  @doc """
+  Normalizes a step permission value that may be a scalar or a list.
+
+  When the value is a list, normalizes/sorts each element and returns
+  the **highest** (last in escalation order) permission. This prevents
+  crashes when LLM output contains list-valued permission fields.
+  """
+  @spec normalize_step_permission(atom() | String.t() | [atom() | String.t()]) ::
+          permission()
+  def normalize_step_permission(perm) when is_list(perm) do
+    perm
+    |> Enum.map(&normalize_permission/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&escalation_rank/1)
+    |> List.last() || :read
+  end
+
+  def normalize_step_permission(perm), do: normalize_permission(perm)
 
   @doc "Normalizes a list of permissions (deduped, sorted by escalation order)."
   @spec normalize_permissions([atom() | String.t()]) :: [permission()]
@@ -156,7 +260,7 @@ defmodule KiroCockpit.Permissions do
       |> Enum.flat_map(fn key ->
         case get_field(map, key) do
           nil -> []
-          perm when is_list(perm) -> perm
+          perm when is_list(perm) -> Enum.flat_map(perm, &List.wrap/1)
           perm -> [perm]
         end
       end)
@@ -235,11 +339,15 @@ defmodule KiroCockpit.Permissions do
 
   @doc """
   Returns the set of permissions auto-allowed under a given policy.
+
+  - `:read_only` — only `:read` allowed
+  - `:auto_allow_readonly` — `:read` and `:shell_read` auto-approved
+  - `:auto_allow_all` — all 9 permissions auto-approved
   """
   @spec auto_allowed(policy()) :: [permission()]
   def auto_allowed(:read_only), do: [:read]
   def auto_allowed(:auto_allow_readonly), do: [:read, :shell_read]
-  def auto_allowed(:auto_allow_all), do: escalation_order()
+  def auto_allowed(:auto_allow_all), do: permissions()
 
   @doc """
   Checks whether a plan's required permissions exceed the current policy.

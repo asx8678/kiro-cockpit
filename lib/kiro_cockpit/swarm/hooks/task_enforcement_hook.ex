@@ -14,20 +14,11 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
 
   @behaviour KiroCockpit.Swarm.Hook
 
+  alias KiroCockpit.Permissions
   alias KiroCockpit.Swarm.{Event, HookResult, PlanMode}
   alias KiroCockpit.Swarm.Tasks.{CategoryMatrix, TaskManager, TaskScope}
 
-  @permissions [
-    :read,
-    :write,
-    :shell_read,
-    :shell_write,
-    :terminal,
-    :external,
-    :destructive,
-    :subagent,
-    :memory_write
-  ]
+  @permissions Permissions.permissions()
 
   @exempt_actions [:task_create, :task_activate, :task_complete, :task_block, :plan_approved]
 

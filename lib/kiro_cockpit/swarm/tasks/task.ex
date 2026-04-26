@@ -26,6 +26,8 @@ defmodule KiroCockpit.Swarm.Tasks.Task do
 
   import Ecto.Changeset
 
+  alias KiroCockpit.Permissions
+
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
@@ -130,6 +132,7 @@ defmodule KiroCockpit.Swarm.Tasks.Task do
     |> validate_length(:owner_id, max: 255)
     |> validate_length(:content, min: 1, max: 10_000)
     |> validate_number(:sequence, greater_than_or_equal_to: 0)
+    |> normalize_and_validate_permission_scope()
     |> assoc_constraint(:plan)
     |> check_constraint(:status, name: :swarm_tasks_status_check)
     |> check_constraint(:priority, name: :swarm_tasks_priority_check)
@@ -197,4 +200,37 @@ defmodule KiroCockpit.Swarm.Tasks.Task do
   def valid_transition?("in_progress", "deleted"), do: true
   def valid_transition?("blocked", "in_progress"), do: true
   def valid_transition?(_current, _new), do: false
+
+  defp normalize_and_validate_permission_scope(changeset) do
+    case get_field(changeset, :permission_scope) do
+      permission_scope when is_list(permission_scope) ->
+        {canonical, invalid} = normalize_permission_scope(permission_scope)
+
+        if invalid == [] do
+          put_change(changeset, :permission_scope, canonical)
+        else
+          add_error(changeset, :permission_scope, "contains invalid permissions",
+            invalid: invalid
+          )
+        end
+
+      _other ->
+        changeset
+    end
+  end
+
+  defp normalize_permission_scope(permission_scope) do
+    Enum.reduce(permission_scope, {[], []}, fn raw_permission, {canonical, invalid} ->
+      case Permissions.parse_permission(raw_permission) do
+        {:ok, permission} ->
+          {[to_string(permission) | canonical], invalid}
+
+        {:error, _reason} ->
+          {canonical, [raw_permission | invalid]}
+      end
+    end)
+    |> then(fn {canonical, invalid} ->
+      {canonical |> Enum.reverse() |> Enum.uniq(), Enum.reverse(invalid)}
+    end)
+  end
 end

@@ -39,24 +39,16 @@ defmodule KiroCockpit.Swarm.Tasks.CategoryMatrix do
   policy gate rather than an auto-allowed documentation action.
   """
 
+  alias KiroCockpit.Permissions
   alias KiroCockpit.Swarm.Tasks.CategoryMatrix.Decision
 
-  @type permission ::
-          :read
-          | :write
-          | :shell_read
-          | :shell_write
-          | :terminal
-          | :external
-          | :destructive
-          | :subagent
-          | :memory_write
+  @type permission :: Permissions.permission()
 
   @type category :: String.t() | atom()
 
   @categories ~w(researching planning acting verifying debugging documenting)a
 
-  @permissions ~w(read write shell_read shell_write terminal external destructive subagent memory_write)a
+  @permissions Permissions.permissions()
 
   @category_by_string Map.new(@categories, &{Atom.to_string(&1), &1})
   @permission_by_string Map.new(@permissions, &{Atom.to_string(&1), &1})
@@ -362,9 +354,12 @@ defmodule KiroCockpit.Swarm.Tasks.CategoryMatrix do
 
   @doc """
   Returns the list of canonical permissions (§32.1).
+
+  Delegates to `KiroCockpit.Permissions.permissions/0` to maintain a
+  single source of truth for the closed permission list.
   """
-  @spec permissions() :: [atom()]
-  def permissions, do: @permissions
+  @spec permissions() :: [permission()]
+  def permissions, do: Permissions.permissions()
 
   @doc """
   Looks up the gating decision for a category and permission.

@@ -32,6 +32,14 @@ defmodule KiroCockpitWeb.Components.Planning.PermissionBadge do
     destructive: %{
       color: "bg-rose-100 text-rose-800 border-rose-200",
       icon: "hero-exclamation-triangle"
+    },
+    subagent: %{
+      color: "bg-indigo-100 text-indigo-800 border-indigo-200",
+      icon: "hero-user-group"
+    },
+    memory_write: %{
+      color: "bg-violet-100 text-violet-800 border-violet-200",
+      icon: "hero-archive-box"
     }
   }
 
@@ -82,6 +90,7 @@ defmodule KiroCockpitWeb.Components.Planning.PermissionBadge do
 
   defp format_permission_label(:shell_read), do: "shell read"
   defp format_permission_label(:shell_write), do: "shell write"
+  defp format_permission_label(:memory_write), do: "memory write"
   defp format_permission_label(perm), do: to_string(perm)
 
   # Icon component for use within this module

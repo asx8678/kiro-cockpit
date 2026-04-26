@@ -100,6 +100,32 @@ defmodule KiroCockpitWeb.Components.PermissionBadgeTest do
       assert html =~ "text-rose-800"
     end
 
+    test "renders subagent permission with correct styling" do
+      assigns = %{}
+
+      html =
+        rendered_to_string(~H"""
+        <.permission_badge permission={:subagent} />
+        """)
+
+      assert html =~ "subagent"
+      assert html =~ "bg-indigo-100"
+      assert html =~ "text-indigo-800"
+    end
+
+    test "renders memory_write permission with correct styling" do
+      assigns = %{}
+
+      html =
+        rendered_to_string(~H"""
+        <.permission_badge permission={:memory_write} />
+        """)
+
+      assert html =~ "memory write"
+      assert html =~ "bg-violet-100"
+      assert html =~ "text-violet-800"
+    end
+
     test "accepts string permissions" do
       assigns = %{}
 

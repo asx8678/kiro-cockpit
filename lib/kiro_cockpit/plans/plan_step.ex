@@ -7,10 +7,12 @@ defmodule KiroCockpit.Plans.PlanStep do
 
   import Ecto.Changeset
 
+  alias KiroCockpit.Permissions
+
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
-  @permission_levels ~w(read write shell_read shell_write terminal external destructive)
+  @permission_levels Permissions.permission_strings()
   @statuses ~w(planned running done failed skipped)
 
   @required_fields ~w(
