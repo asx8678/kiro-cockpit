@@ -15,7 +15,7 @@ defmodule KiroCockpit.Swarm.Hooks.TaskGuidanceHook do
   @behaviour KiroCockpit.Swarm.Hook
 
   alias KiroCockpit.Swarm.{Event, HookResult}
-  alias KiroCockpit.Swarm.Tasks.TaskManager
+  alias KiroCockpit.Swarm.Tasks.{Guidance, TaskManager}
 
   @impl true
   def name, do: :task_guidance
@@ -43,26 +43,21 @@ defmodule KiroCockpit.Swarm.Hooks.TaskGuidanceHook do
   defp build_guidance(event, _ctx) do
     case event.action_name do
       :task_create ->
-        # Check if there's an active task
         active_task = get_active_task(event)
-
-        if active_task == nil do
-          "Activate the next task with status=in_progress before execution."
-        else
-          nil
-        end
+        guidance = Guidance.for_create(is_nil(active_task) == false)
+        if guidance == [], do: nil, else: hd(guidance)
 
       :task_activate ->
-        "Task is active. Proceed within its category and permission scope."
+        hd(Guidance.for_activate())
 
       :task_complete ->
-        "Pick the next pending task or run final verification."
+        hd(Guidance.for_complete())
 
       :task_block ->
-        "Resolve blocker, revise plan, or ask user."
+        hd(Guidance.for_block())
 
       :plan_approved ->
-        "Create/activate Phase 1 task and begin read-only inspection."
+        hd(Guidance.for_plan_approved())
 
       _ ->
         nil

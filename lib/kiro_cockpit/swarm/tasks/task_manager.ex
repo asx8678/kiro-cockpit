@@ -31,7 +31,7 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
 
   alias Ecto.Multi
   alias KiroCockpit.Repo
-  alias KiroCockpit.Swarm.Tasks.Task
+  alias KiroCockpit.Swarm.Tasks.{Guidance, Task}
 
   # Dialyzer false positives: Ecto.Multi opacity and Repo.insert success-typing
   # are well-known Ecto/Dialyzer interaction issues.
@@ -64,8 +64,11 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
     |> Multi.insert(:task, changeset)
     |> Repo.transaction()
     |> case do
-      {:ok, %{task: task}} -> {:ok, task}
-      {:error, :task, changeset, _changes} -> {:error, changeset}
+      {:ok, %{task: task}} ->
+        {:ok, attach_create_guidance(task)}
+
+      {:error, :task, changeset, _changes} ->
+        {:error, changeset}
     end
   end
 
@@ -200,7 +203,10 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   @spec activate(task_id) :: {:ok, Task.t()} | {:error, term()}
   def activate(task_id) do
     with {:ok, task} <- fetch_task(Repo, task_id) do
-      activate_with_exclusive_check(task)
+      case activate_with_exclusive_check(task) do
+        {:ok, activated} -> {:ok, attach_activate_guidance(activated)}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -213,7 +219,10 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   @spec complete(task_id) :: {:ok, Task.t()} | {:error, term()}
   def complete(task_id) do
     with {:ok, task} <- fetch_task(Repo, task_id) do
-      transition_with_multi(task, "completed")
+      case transition_with_multi(task, "completed") do
+        {:ok, completed} -> {:ok, attach_complete_guidance(completed)}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -226,7 +235,10 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   @spec block(task_id) :: {:ok, Task.t()} | {:error, term()}
   def block(task_id) do
     with {:ok, task} <- fetch_task(Repo, task_id) do
-      transition_with_multi(task, "blocked")
+      case transition_with_multi(task, "blocked") do
+        {:ok, blocked} -> {:ok, attach_block_guidance(blocked)}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -242,6 +254,25 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
       transition_with_multi(task, "deleted")
     end
   end
+
+  # -------------------------------------------------------------------
+  # Guidance attachment
+  # -------------------------------------------------------------------
+
+  @spec attach_create_guidance(Task.t()) :: Task.t()
+  defp attach_create_guidance(%Task{session_id: sid, owner_id: oid} = task) do
+    active_exists? = not is_nil(get_active(sid, oid))
+    %{task | guidance: Guidance.for_create(active_exists?)}
+  end
+
+  @spec attach_activate_guidance(Task.t()) :: Task.t()
+  defp attach_activate_guidance(task), do: %{task | guidance: Guidance.for_activate()}
+
+  @spec attach_complete_guidance(Task.t()) :: Task.t()
+  defp attach_complete_guidance(task), do: %{task | guidance: Guidance.for_complete()}
+
+  @spec attach_block_guidance(Task.t()) :: Task.t()
+  defp attach_block_guidance(task), do: %{task | guidance: Guidance.for_block()}
 
   # -------------------------------------------------------------------
   # Private helpers
