@@ -263,24 +263,47 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
       assert length(calls) == 1
     end
 
-    test "detects stale plan when snapshot hash differs", %{project_dir: dir} do
+    test "detects stale plan when snapshot hash differs via boundary", %{project_dir: dir} do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "integ-stale-#{System.unique_integer([:positive])}"
+
+      plan_opts = default_plan_opts(dir) |> Keyword.put(:session_id, session_id)
 
       assert {:ok, plan} =
-               NanoPlanner.plan(:fake_session, "Build dashboard widget", default_plan_opts(dir))
+               NanoPlanner.plan(:fake_session, "Build dashboard widget", plan_opts)
 
       # Modify the project so the snapshot hash changes
       File.write!(Path.join(dir, "STALE_MARKER.md"), "# This changes the hash")
 
-      assert {:error, :stale_plan} =
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      assert {:error, {:swarm_blocked, reason, _messages}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 session_id: session_id,
+                 swarm_hooks: true,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
                )
+
+      assert reason =~ "Stale plan"
 
       # Plan should still be draft (not approved)
       refreshed = Plans.get_plan(plan.id)
       assert refreshed.status == "draft"
+
+      # No prompt should have been sent
+      calls = Process.get(:fake_kiro_prompt_calls, [])
+      assert calls == []
+
+      # Bronze trace should be persisted
+      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+      assert length(events) >= 1
+      trace = List.first(events)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "blocked"
+      assert trace.hook_results["action"] == "nano_plan_approve"
     end
   end
 

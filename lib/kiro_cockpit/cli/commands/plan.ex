@@ -279,17 +279,17 @@ defmodule KiroCockpit.CLI.Commands.Plan do
   end
 
   @doc """
-  Marks an approved plan as `running`, after a staleness check.
+  Marks an approved plan as `running`, routing through ActionBoundary
+  for stale-plan enforcement and Bronze trace capture.
+
+  Staleness checking is performed inside the boundary via
+  `TaskEnforcementHook`. If the boundary blocks a stale plan, a Bronze
+  `hook_trace` with outcome `blocked` is persisted.
 
   This is an explicit status transition — it does NOT generate a new
   prompt and does NOT bypass approval. To go from draft to running,
   use `/plan approve` (which approves and dispatches the execution
   prompt) or `/plan approve` followed by `/plan run`.
-
-  **Fail-closed**: before transitioning, a staleness check is performed.
-  If the project has changed since the plan was created, the run is
-  blocked with `:stale_plan`. If staleness cannot be determined (e.g.
-  no `project_dir`), the run is blocked with `:stale_plan_unknown`.
 
   ## Optional opts
 
@@ -299,6 +299,8 @@ defmodule KiroCockpit.CLI.Commands.Plan do
       Falls back to the current working directory if not provided.
     * `:context_builder_module` — module implementing `build/1` for
       staleness checks (forwarded to `Plans.run_plan/2`).
+    * `:swarm_hooks` — explicitly enable/disable hook boundary
+      (default: app config, `true` in production).
   """
   @spec run(String.t(), keyword()) :: KiroCockpit.CLI.result()
   def run(id, opts) do
@@ -343,6 +345,13 @@ defmodule KiroCockpit.CLI.Commands.Plan do
           plan_id: id
         )
 
+      {:error, {:swarm_blocked, reason}} ->
+        Result.error(
+          :stale_plan,
+          "plan #{id} is stale — #{reason}",
+          plan_id: id
+        )
+
       {:error, reason} ->
         Result.error(:run_failed, "could not transition plan to running: #{inspect(reason)}",
           plan_id: id
@@ -351,7 +360,7 @@ defmodule KiroCockpit.CLI.Commands.Plan do
   end
 
   defp run_opts(opts) do
-    Keyword.take(opts, [:project_dir, :context_builder_module])
+    Keyword.take(opts, [:project_dir, :context_builder_module, :swarm_hooks])
     |> Keyword.put(:payload, %{"source" => "cli"})
   end
 

@@ -201,14 +201,13 @@ defmodule KiroCockpit.Plans do
   end
 
   @doc """
-  Runs an approved plan after verifying it is not stale.
+  Runs an approved plan, routing through ActionBoundary for stale/plan-mode
+  enforcement and Bronze trace capture.
 
-  This is the fail-closed entry point for plan execution. It checks:
-
-    1. The plan exists and is in `"approved"` status
-    2. The project snapshot has not changed (via `Staleness.check/3`)
-
-  If both checks pass, transitions the plan to `"running"`.
+  Staleness checking is performed inside the boundary via
+  `TaskEnforcementHook`, which inspects the trusted context computed by
+  `Staleness.trusted_context/3`. If the boundary blocks a stale plan, a
+  Bronze `hook_trace` with outcome `blocked` is persisted.
 
   ## Options
 
@@ -218,28 +217,37 @@ defmodule KiroCockpit.Plans do
       staleness checks (default `NanoPlanner.ContextBuilder`)
     * `:payload` — map merged into the status-change event payload
       (default `%{"source" => "run"}`)
+    * `:swarm_hooks` — explicitly enable/disable hook boundary
+      (default: app config, `false` in test)
+    * `:pre_hooks` — list of pre-action hook modules
+    * `:post_hooks` — list of post-action hook modules
+    * `:hook_manager_module` — module for hook execution
+    * `:task_manager_module` — module for active task lookup
+    * `:staleness_module` — module for trusted_context (default Staleness)
+    * `:stale_plan_override?` / `:stale_plan_confirmed?` —
+      trusted server-side override to allow stale plan execution
 
   Returns `{:ok, Plan.t()}` on success, or one of:
 
     * `{:error, :not_found}` — plan does not exist
     * `{:error, :invalid_transition}` — plan is not in `"approved"` status
-    * `{:error, :stale_plan}` — project has changed since plan was created
-    * `{:error, :stale_plan_unknown}` — cannot determine staleness
+    * `{:error, :stale_plan_unknown}` — cannot determine project directory
+    * `{:error, {:swarm_blocked, reason}}` — pre-hooks blocked execution
+      (stale plan, plan-mode gate, etc.)
   """
   @spec run_plan(plan_id(), keyword()) ::
           {:ok, Plan.t()} | {:error, term()}
   def run_plan(plan_id, opts \\ []) do
-    alias KiroCockpit.NanoPlanner.Staleness
     alias KiroCockpit.Swarm.ActionBoundary
 
     with {:ok, plan} <- fetch_plan(plan_id),
          :ok <- require_status(plan, "approved"),
-         {:ok, project_dir} <- resolve_project_dir(opts),
-         :ok <- Staleness.check(plan, project_dir, opts) do
-      # Run plan transition through the action boundary (kiro-00j).
-      # Hooks enforce stale plan checks, active task/category/scope
-      # before the approved→running transition. nano_plan_run is
-      # exempt from active task requirement (lifecycle action).
+         {:ok, project_dir} <- resolve_project_dir(opts) do
+      # Run plan transition through the action boundary (kiro-ux7).
+      # Staleness checking happens inside the boundary via
+      # TaskEnforcementHook, which inspects trusted ctx computed from
+      # Staleness.trusted_context/3. If blocked, Bronze trace captures
+      # the blocked attempt with outcome "blocked".
       if plan_run_boundary_enabled?(opts) do
         boundary_opts = plan_run_boundary_opts(plan, project_dir, opts)
 
@@ -287,6 +295,12 @@ defmodule KiroCockpit.Plans do
     ]
     |> maybe_put_opt(opts, :stale_plan_override?)
     |> maybe_put_opt(opts, :stale_plan_confirmed?)
+    |> maybe_put_opt(opts, :context_builder_module)
+    |> maybe_put_opt(opts, :staleness_module)
+    |> maybe_put_opt(opts, :pre_hooks)
+    |> maybe_put_opt(opts, :post_hooks)
+    |> maybe_put_opt(opts, :hook_manager_module)
+    |> maybe_put_opt(opts, :task_manager_module)
   end
 
   defp maybe_put_opt(kw, opts, key) do

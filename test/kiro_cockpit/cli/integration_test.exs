@@ -177,15 +177,34 @@ defmodule KiroCockpit.CLI.IntegrationTest do
       File.rm_rf!(dir)
     end
 
-    test "refuses to run a stale plan" do
+    test "refuses to run a stale plan via boundary" do
       dir = setup_integration_project_dir()
       plan = create_real_plan()
       {:ok, _approved} = Plans.approve_plan(plan.id)
 
+      # Enable hooks so the boundary runs and staleness is checked
       assert {:error, %{code: :stale_plan}} =
-               CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
+               CLI.run(
+                 "/plan run #{plan.id}",
+                 opts(project_dir: dir, swarm_hooks: true)
+               )
 
       assert Plans.get_plan(plan.id).status == "approved"
+
+      File.rm_rf!(dir)
+    end
+
+    test "run_plan stale check skipped when hooks disabled (default test config)" do
+      dir = setup_integration_project_dir()
+      plan = create_real_plan()
+      {:ok, _approved} = Plans.approve_plan(plan.id)
+
+      # With hooks disabled (default test config), staleness check is skipped
+      # and the plan transitions to running directly
+      assert {:ok, %{kind: :plan_running}} =
+               CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
+
+      assert Plans.get_plan(plan.id).status == "running"
 
       File.rm_rf!(dir)
     end
