@@ -93,6 +93,7 @@ defmodule KiroCockpit.KiroSession do
   alias KiroCockpit.KiroSession.Callbacks
   alias KiroCockpit.KiroSession.StreamEvent
   alias KiroCockpit.KiroSession.TerminalManager
+  alias KiroCockpit.Swarm.ActionBoundary
   alias KiroCockpit.Telemetry
 
   # ACP protocol defaults per kiro-acp-instructions.md
@@ -157,7 +158,11 @@ defmodule KiroCockpit.KiroSession do
           stream_sequence: non_neg_integer(),
           stream_buffer_size: non_neg_integer(),
           stream_buffer_limit: pos_integer(),
-          stream_dropped_count: non_neg_integer()
+          stream_dropped_count: non_neg_integer(),
+          swarm_hooks: boolean(),
+          swarm_agent_id: String.t(),
+          swarm_plan_id: String.t() | nil,
+          swarm_ctx: map()
         }
 
   # Internal state
@@ -185,6 +190,13 @@ defmodule KiroCockpit.KiroSession do
             auto_callbacks: true,
             callback_policy: @default_callback_policy,
             terminal_manager: nil,
+            # Swarm action hook boundary (kiro-00j) ----------------------
+            swarm_hooks: false,
+            swarm_agent_id: "kiro-session",
+            swarm_plan_id: nil,
+            swarm_ctx: %{},
+            plan_mode: nil,
+            swarm_hooks_module: ActionBoundary,
             # Stream normalization (kiro-1rd) -----------------------------
             stream_buffer: nil,
             stream_buffer_size: 0,
@@ -237,6 +249,10 @@ defmodule KiroCockpit.KiroSession do
         * `:all` / `:trusted` — all known methods are allowed and
           auto-handled (previous default behavior). Use for
           trusted/approved execution contexts.
+    * `:swarm_ctx` — map of durable trusted context flags for the swarm
+      hook boundary (e.g. `%{approved: true, policy_allows_write: true}`).
+      Merged into every prompt/callback boundary call so that session-
+      level trust decisions don't need to be repeated per-prompt opts.
     * `:name` — GenServer registration name.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -476,6 +492,19 @@ defmodule KiroCockpit.KiroSession do
       auto_callbacks = Keyword.get(opts, :auto_callbacks, true)
       callback_policy = Keyword.get(opts, :callback_policy, @default_callback_policy)
 
+      swarm_hooks =
+        Keyword.get(
+          opts,
+          :swarm_hooks,
+          Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)
+        )
+
+      swarm_agent_id = Keyword.get(opts, :swarm_agent_id, "kiro-session")
+      swarm_plan_id = Keyword.get(opts, :swarm_plan_id)
+      swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
+      plan_mode = Keyword.get(opts, :plan_mode)
+      swarm_hooks_module = Keyword.get(opts, :swarm_hooks_module, ActionBoundary)
+
       port_opts =
         [executable: executable, args: args, owner: self()] ++ extra_port_opts(opts)
 
@@ -500,6 +529,12 @@ defmodule KiroCockpit.KiroSession do
             auto_callbacks: auto_callbacks,
             callback_policy: callback_policy,
             terminal_manager: terminal_manager,
+            swarm_hooks: swarm_hooks,
+            swarm_agent_id: swarm_agent_id,
+            swarm_plan_id: swarm_plan_id,
+            swarm_ctx: swarm_ctx,
+            plan_mode: plan_mode,
+            swarm_hooks_module: swarm_hooks_module,
             stream_buffer: :queue.new(),
             stream_buffer_limit: buffer_limit
           }
@@ -694,40 +729,26 @@ defmodule KiroCockpit.KiroSession do
         %{phase: :session_active, pending_prompt: nil, turn_status: turn_status} = state
       )
       when turn_status in [:idle, :complete] do
-    blocks = normalize_prompt(prompt_or_blocks)
-    timeout = Keyword.get(opts, :timeout, @default_prompt_timeout)
+    # Swarm action hook boundary (kiro-00j): run pre-hooks before prompt.
+    # The actual prompt-start runs inside the executor fun so that
+    # pre/post trace semantics match the real action start.
+    # Blocked prompts return immediately and do not start a turn or send
+    # a prompt to the agent.
+    if state.swarm_hooks do
+      boundary_opts = prompt_boundary_opts(state, opts)
 
-    params = %{
-      "sessionId" => state.session_id,
-      "prompt" => blocks
-    }
+      case state.swarm_hooks_module.run(:kiro_session_prompt, boundary_opts, fn ->
+             do_start_prompt(prompt_or_blocks, opts, from, state)
+           end) do
+        {:ok, {:noreply, new_state}} ->
+          {:noreply, new_state}
 
-    emit_prompt_telemetry(:start, state.session_id)
-
-    parent = self()
-    port_pid = state.port_process
-
-    {:ok, task_pid} =
-      Task.start(fn ->
-        result = PortProcess.request(port_pid, "session/prompt", params, timeout)
-        send(parent, {:prompt_result, result})
-      end)
-
-    task_ref = Process.monitor(task_pid)
-
-    # Turn discipline (kiro-1rd): mark the turn running. The prompt RPC
-    # result alone will NOT mark the turn complete — we wait for a
-    # normalized `:turn_end` stream event.
-    state = %{
-      state
-      | pending_prompt: from,
-        prompt_task_ref: task_ref,
-        turn_id: state.turn_id + 1,
-        turn_status: :running,
-        last_stop_reason: nil
-    }
-
-    {:noreply, state}
+        {:error, {:swarm_blocked, reason, messages}} ->
+          {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
+      end
+    else
+      do_start_prompt(prompt_or_blocks, opts, from, state)
+    end
   end
 
   # An RPC is currently on the wire — short-circuit fast.
@@ -773,7 +794,11 @@ defmodule KiroCockpit.KiroSession do
       stream_sequence: state.stream_sequence,
       stream_buffer_size: state.stream_buffer_size,
       stream_buffer_limit: state.stream_buffer_limit,
-      stream_dropped_count: state.stream_dropped_count
+      stream_dropped_count: state.stream_dropped_count,
+      swarm_hooks: state.swarm_hooks,
+      swarm_agent_id: state.swarm_agent_id,
+      swarm_plan_id: state.swarm_plan_id,
+      swarm_ctx: state.swarm_ctx
     }
 
     {:reply, summary, state}
@@ -1001,6 +1026,65 @@ defmodule KiroCockpit.KiroSession do
 
   # -- Internals ------------------------------------------------------------
 
+  # -- Prompt boundary helpers (kiro-00j) -----------------------------------
+
+  # Executes the prompt after boundary approval — starts the Task, monitors, etc.
+  defp do_start_prompt(prompt_or_blocks, opts, from, state) do
+    blocks = normalize_prompt(prompt_or_blocks)
+    timeout = Keyword.get(opts, :timeout, @default_prompt_timeout)
+
+    params = %{
+      "sessionId" => state.session_id,
+      "prompt" => blocks
+    }
+
+    emit_prompt_telemetry(:start, state.session_id)
+
+    parent = self()
+    port_pid = state.port_process
+
+    {:ok, task_pid} =
+      Task.start(fn ->
+        result = PortProcess.request(port_pid, "session/prompt", params, timeout)
+        send(parent, {:prompt_result, result})
+      end)
+
+    task_ref = Process.monitor(task_pid)
+
+    # Turn discipline (kiro-1rd): mark the turn running. The prompt RPC
+    # result alone will NOT mark the turn complete — we wait for a
+    # normalized `:turn_end` stream event.
+    state = %{
+      state
+      | pending_prompt: from,
+        prompt_task_ref: task_ref,
+        turn_id: state.turn_id + 1,
+        turn_status: :running,
+        last_stop_reason: nil
+    }
+
+    {:noreply, state}
+  end
+
+  # Build boundary options for prompt action.
+  # Merges session-level swarm_ctx (durable trusted flags) into the
+  # boundary opts so hooks see approved/policy flags set at session
+  # construction time.
+  defp prompt_boundary_opts(state, opts) do
+    Keyword.merge(
+      [
+        session_id: state.session_id,
+        agent_id: state.swarm_agent_id,
+        plan_id: state.swarm_plan_id,
+        permission_level: :subagent,
+        project_dir: state.cwd,
+        plan_mode: state.plan_mode,
+        swarm_ctx: state.swarm_ctx
+      ],
+      opts
+    )
+  end
+
   # -- Auto callback handling (kiro-4ff) ------------------------------------
 
   # When auto_callbacks is enabled and the inbound request method is known,
@@ -1020,6 +1104,15 @@ defmodule KiroCockpit.KiroSession do
       not Callbacks.known_method?(method) ->
         :ok
 
+      state.swarm_hooks ->
+        # When hooks are enabled, run the boundary BEFORE policy denial
+        # (kiro-00j issue 5). This ensures no-active-task/scope/stale
+        # blocks are visible in Bronze traces before policy denial.
+        # The real callback dispatch runs inside the executor fun so
+        # pre/post trace semantics match the actual action (kiro-00j
+        # issue 4).
+        run_callback_with_boundary(state, port_pid, id, method, params)
+
       not Callbacks.allowed_by_policy?(method, state.callback_policy) ->
         # Method is known but denied by policy — auto-respond with error.
         # For observability the subscriber still received the raw request.
@@ -1027,17 +1120,97 @@ defmodule KiroCockpit.KiroSession do
         PortProcess.respond_error(port_pid, id, code, message, data)
         :ok
 
-      String.starts_with?(method, "terminal/") ->
-        handle_terminal_callback_async(state, port_pid, id, method, params)
-
       true ->
-        handle_sync_callback(state, port_pid, id, method, params)
+        dispatch_callback(state, port_pid, id, method, params)
     end
 
     :ok
   end
 
   defp maybe_auto_handle_callback(_state, _port_pid, _msg), do: :ok
+
+  # Run the action boundary for known callback methods.
+  # The boundary runs BEFORE policy denial when hooks are enabled (issue 5).
+  # The actual callback dispatch executes inside the executor fun so
+  # pre/post trace semantics match the real action (issue 4).
+  # If hooks allow but callback_policy denies, respond with
+  # Callbacks.denied_error (preserving existing behavior).
+  defp run_callback_with_boundary(state, port_pid, id, method, params) do
+    {action, permission} = callback_action_mapping(method)
+    target_path = extract_callback_target_path(method, params)
+
+    boundary_opts =
+      callback_boundary_opts(state, action, permission, target_path, params)
+
+    case state.swarm_hooks_module.run(action, boundary_opts, fn ->
+           # The executor runs inside the boundary — pre/post trace
+           # timestamps bracket the real action start.
+           if Callbacks.allowed_by_policy?(method, state.callback_policy) do
+             dispatch_callback(state, port_pid, id, method, params)
+           else
+             # Hooks allowed but policy denies — respond with denied_error
+             {:error, code, message, data} = Callbacks.denied_error(method)
+             PortProcess.respond_error(port_pid, id, code, message, data)
+           end
+         end) do
+      {:ok, _result} ->
+        :ok
+
+      {:error, {:swarm_blocked, reason, _messages}} ->
+        PortProcess.respond_error(
+          port_pid,
+          id,
+          -32_000,
+          "Action blocked by swarm boundary: #{reason}",
+          nil
+        )
+    end
+  end
+
+  # Dispatch the actual callback (sync or async terminal).
+  defp dispatch_callback(state, port_pid, id, method, params) do
+    if String.starts_with?(method, "terminal/") do
+      handle_terminal_callback_async(state, port_pid, id, method, params)
+    else
+      handle_sync_callback(state, port_pid, id, method, params)
+    end
+  end
+
+  # Map callback methods to action names and permission levels.
+  defp callback_action_mapping("fs/read_text_file"), do: {:fs_read_requested, :read}
+  defp callback_action_mapping("fs/write_text_file"), do: {:fs_write_requested, :write}
+  defp callback_action_mapping("terminal/" <> _), do: {:terminal_requested, :terminal}
+  defp callback_action_mapping(method), do: {String.to_atom(method), :read}
+
+  # Extract target file path from callback params for file scope checks.
+  defp extract_callback_target_path("fs/" <> _, params) when is_map(params) do
+    Map.get(params, "path")
+  end
+
+  defp extract_callback_target_path(_method, _params), do: nil
+
+  # Build boundary options for callback actions.
+  # Includes session-level swarm_ctx for durable trusted flags.
+  defp callback_boundary_opts(state, _action, permission, target_path, _params) do
+    base =
+      [
+        session_id: state.session_id,
+        agent_id: state.swarm_agent_id,
+        plan_id: state.swarm_plan_id,
+        permission_level: permission,
+        project_dir: state.cwd,
+        plan_mode: state.plan_mode,
+        swarm_ctx: state.swarm_ctx
+      ]
+
+    if target_path do
+      base
+      |> Keyword.put(:metadata, %{target_path: target_path})
+      |> Keyword.put(:payload, %{target_path: target_path})
+    else
+      base
+    end
+  end
 
   # fs/* methods are fast file operations — handle synchronously.
   @spec handle_sync_callback(t(), pid(), integer() | binary(), String.t(), map()) :: :ok

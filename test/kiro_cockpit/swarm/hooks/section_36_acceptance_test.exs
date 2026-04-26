@@ -328,10 +328,12 @@ defmodule KiroCockpit.Swarm.Hooks.Section36AcceptanceTest do
                TaskEnforcementHook.on_event(event, %{plan_mode: PlanMode.new(), stale_plan: true})
     end
 
-    test "stale plan still preserves no-active-task invariant before stale check" do
+    test "stale plan blocks before active-task check for mutating actions" do
       event = Event.new(:write, session_id: "s36_stale_no_task", agent_id: "a1")
 
-      assert %HookResult{decision: :block, reason: "No active task"} =
+      # Per kiro-00j: stale plan is checked before active-task errors when
+      # trusted ctx says stale for mutating actions.
+      assert %HookResult{decision: :block, reason: "Stale plan blocks mutating action"} =
                TaskEnforcementHook.on_event(event, %{plan_mode: PlanMode.new(), stale_plan?: true})
     end
 

@@ -20,7 +20,13 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
 
   @permissions Permissions.permissions()
 
-  @exempt_actions [:task_create, :task_activate, :task_complete, :task_block, :plan_approved]
+  @exempt_actions [
+    :task_create,
+    :task_activate,
+    :task_complete,
+    :task_block,
+    :plan_approved
+  ]
 
   @action_permissions %{
     file_read_requested: :read,
@@ -38,7 +44,12 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     subagent_invoke: :subagent,
     kiro_delegate: :subagent,
     memory_promote: :memory_write,
-    memory_write: :memory_write
+    memory_write: :memory_write,
+    # KiroSession prompt and callback action mappings (kiro-00j)
+    kiro_session_prompt: :subagent,
+    fs_read_requested: :read,
+    fs_write_requested: :write,
+    nano_plan_run: :write
   }
 
   @impl true
@@ -47,7 +58,12 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   @impl true
   def priority, do: 95
 
+  # nano_plan_run is only exempt from the active-task requirement, not
+  # from stale/plan-mode checks. Use filter: true so it still runs through
+  # the full hook chain; check_active_task_requirement special-cases it.
   @impl true
+  def filter(%Event{action_name: :nano_plan_run}), do: true
+
   def filter(%Event{action_name: action}) when action in @exempt_actions, do: false
 
   def filter(%Event{}), do: true
@@ -55,8 +71,8 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   @impl true
   def on_event(event, ctx) do
     with :ok <- check_plan_mode(event, ctx),
-         :ok <- check_active_task_requirement(event, ctx),
          :ok <- check_stale_plan(event, ctx),
+         :ok <- check_active_task_requirement(event, ctx),
          :ok <- check_category_permission(event, ctx),
          :ok <- check_file_scope(event, ctx) do
       HookResult.continue(event)
@@ -102,7 +118,13 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     end
   end
 
-  # Check if an active task is required for this action
+  # Check if an active task is required for this action.
+  # :nano_plan_run is a lifecycle action — it is exempt from the
+  # active-task requirement but still subject to stale/plan-mode checks.
+  defp check_active_task_requirement(%Event{action_name: :nano_plan_run}, _ctx) do
+    :ok
+  end
+
   defp check_active_task_requirement(event, ctx) do
     plan_mode = Map.get(ctx, :plan_mode) || PlanMode.new()
     active_task = get_active_task(event)

@@ -1292,6 +1292,54 @@ defmodule KiroCockpit.Swarm.HooksTest do
     end
   end
 
+  describe "TaskEnforcementHook — nano_plan_run targeted exemption" do
+    test "nano_plan_run passes filter (not fully exempt)" do
+      event = Event.new(:nano_plan_run, session_id: "sess_nano", agent_id: "agent_nano")
+      # filter: true means it goes through the hook chain
+      assert TaskEnforcementHook.filter(event) == true
+    end
+
+    test "nano_plan_run does NOT require active task" do
+      event = Event.new(:nano_plan_run, session_id: "sess_nano2", agent_id: "agent_nano2")
+      ctx = %{plan_mode: PlanMode.new()}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # Should NOT be blocked for "No active task" — it's exempt from
+      # the active-task requirement but still runs stale/plan-mode checks
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "nano_plan_run is still subject to stale plan checks" do
+      event = Event.new(:nano_plan_run, session_id: "sess_nano3", agent_id: "agent_nano3")
+      ctx = %{plan_mode: PlanMode.new(), stale_plan?: true, reason: :stale_plan}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_run is write permission → stale plan blocks it
+      assert %HookResult{decision: :block, reason: reason} = result
+      assert reason =~ "Stale plan"
+    end
+
+    test "nano_plan_run is still subject to plan-mode checks" do
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+
+      event =
+        Event.new(:nano_plan_run,
+          session_id: "sess_nano5",
+          agent_id: "agent_nano5",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # In planning mode, write is blocked (not direct read discovery)
+      assert %HookResult{decision: :block} = result
+    end
+  end
+
   describe "PlanModeFirstActionHook recognizes subagent and memory_write" do
     test "filters subagent permission" do
       event =

@@ -219,13 +219,69 @@ defmodule KiroCockpit.Plans do
           {:ok, Plan.t()} | {:error, term()}
   def run_plan(plan_id, opts \\ []) do
     alias KiroCockpit.NanoPlanner.Staleness
+    alias KiroCockpit.Swarm.ActionBoundary
 
     with {:ok, plan} <- fetch_plan(plan_id),
          :ok <- require_status(plan, "approved"),
          {:ok, project_dir} <- resolve_project_dir(opts),
          :ok <- Staleness.check(plan, project_dir, opts) do
-      payload = Keyword.get(opts, :payload, %{"source" => "run"})
-      update_plan_with_event(plan, %{status: "running"}, "running", payload)
+      # Run plan transition through the action boundary (kiro-00j).
+      # Hooks enforce stale plan checks, active task/category/scope
+      # before the approved→running transition. nano_plan_run is
+      # exempt from active task requirement (lifecycle action).
+      if plan_run_boundary_enabled?(opts) do
+        boundary_opts = plan_run_boundary_opts(plan, project_dir, opts)
+
+        case ActionBoundary.run(:nano_plan_run, boundary_opts, fn ->
+               do_run_plan_transition(plan, opts)
+             end) do
+          {:ok, result} -> result
+          {:error, {:swarm_blocked, reason, _messages}} -> {:error, {:swarm_blocked, reason}}
+        end
+      else
+        do_run_plan_transition(plan, opts)
+      end
+    end
+  end
+
+  # Perform the actual approved→running transition.
+  defp do_run_plan_transition(plan, opts) do
+    payload = Keyword.get(opts, :payload, %{"source" => "run"})
+    update_plan_with_event(plan, %{status: "running"}, "running", payload)
+  end
+
+  defp plan_run_boundary_enabled?(opts) do
+    case Keyword.get(opts, :swarm_hooks) do
+      nil -> Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)
+      explicit -> explicit
+    end
+  end
+
+  defp plan_run_boundary_opts(plan, project_dir, opts) do
+    session_id = Keyword.get(opts, :session_id, plan.session_id)
+    # Default agent_id to "nano-planner" so Bronze persistence can satisfy
+    # the required agent_id field (kiro-00j issue 6).
+    agent_id = Keyword.get(opts, :agent_id, "nano-planner")
+    plan_mode = Keyword.get(opts, :plan_mode)
+
+    [
+      session_id: session_id,
+      agent_id: agent_id,
+      plan_id: plan.id,
+      permission_level: :write,
+      project_dir: project_dir,
+      plan_mode: plan_mode,
+      # Forward the enabled flag from the caller's swarm_hooks opt
+      enabled: plan_run_boundary_enabled?(opts)
+    ]
+    |> maybe_put_opt(opts, :stale_plan_override?)
+    |> maybe_put_opt(opts, :stale_plan_confirmed?)
+  end
+
+  defp maybe_put_opt(kw, opts, key) do
+    case Keyword.get(opts, key) do
+      nil -> kw
+      value -> Keyword.put(kw, key, value)
     end
   end
 

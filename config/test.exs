@@ -21,3 +21,8 @@ config :logger, level: :warning
 config :phoenix, :plug_init_mode, :runtime
 
 config :kiro_cockpit, :sql_sandbox, true
+
+# Swarm action hooks disabled by default in test (kiro-00j).
+# Explicit tests that need DB-backed hook queries should enable
+# via opts or Application.put_env.
+config :kiro_cockpit, :swarm_action_hooks_enabled, false
