@@ -42,6 +42,18 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
 
   @default_post_hooks [KiroCockpit.Swarm.Hooks.TaskGuidanceHook]
 
+  @typedoc """
+  Context map passed to arity-1 executor functions.
+
+  Contains the modified event after pre-hooks have processed it,
+  accumulated messages from hooks, and other boundary context.
+  """
+  @type executor_context :: %{
+          optional(:event) => Event.t(),
+          optional(:messages) => [String.t()],
+          optional(:hook_messages) => [String.t()]
+        }
+
   @type boundary_result :: {:ok, term()} | {:error, {:swarm_blocked, String.t(), [String.t()]}}
 
   @doc """
@@ -51,7 +63,20 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
 
     * `action` — atom action name (e.g. `:kiro_session_prompt`)
     * `opts` — keyword list with event/boundary options
-    * `fun` — zero-arity executor function
+    * `fun` — zero-arity or arity-1 executor function
+
+  ## Executor Function Support
+
+  The executor function can be:
+
+    * **Arity-0** (`fn -> ... end`) — called with no arguments.
+      Hook messages are merged into the event's metadata under `:hook_guidance`
+      so they are visible in traces and to post-hooks.
+    
+    * **Arity-1** (`fn ctx -> ... end`) — called with a context map:
+      `%{event: modified_event, messages: messages, hook_messages: messages}`.
+      This allows the executor to directly access hook guidance messages
+      and inject them into prompts (e.g., for PlanMode or Steering messages).
 
   ## Options
 
@@ -77,12 +102,12 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     * `{:ok, result}` — executor ran, result is the executor's return value
     * `{:error, {:swarm_blocked, reason, messages}}` — pre-hooks blocked execution
   """
-  @spec run(atom(), keyword(), (-> term())) :: boundary_result()
-  def run(action, opts, fun) when is_atom(action) and is_function(fun, 0) do
+  @spec run(atom(), keyword(), (-> term()) | (executor_context() -> term())) :: boundary_result()
+  def run(action, opts, fun) when is_atom(action) and is_function(fun) do
     if boundary_enabled?(opts) do
       run_boundary(action, opts, fun)
     else
-      {:ok, fun.()}
+      {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
     end
   end
 
@@ -113,17 +138,64 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
 
     case hm.run(event, pre_hooks, ctx, :pre) do
-      {:ok, _modified_event, _messages} ->
-        result = fun.()
+      {:ok, modified_event, messages} ->
+        # kiro-4dk: Thread modified event and hook messages to executor and post-hooks
+        # For arity-0 functions, merge hook messages into event metadata for trace visibility
+        # For arity-1 functions, pass context map with event, messages, and hook_messages
+        {event_for_executor, executor_ctx} =
+          prepare_executor_context(modified_event, messages)
+
+        result = call_executor(fun, executor_ctx)
 
         # Post-hooks for Bronze trace; never undo execution on post block
-        _ = hm.run(event, post_hooks, ctx, :post)
+        # kiro-4dk: Pass the modified event (not original) so post-hooks see pre-hook changes
+        _ = hm.run(event_for_executor, post_hooks, ctx, :post)
 
         {:ok, result}
 
       {:blocked, _event, reason, messages} ->
         {:error, {:swarm_blocked, reason, messages}}
     end
+  end
+
+  # Prepare context for executor based on function arity.
+  # For arity-0: merge hook messages into event metadata so they persist in traces.
+  # For arity-1: return context map with event, messages, hook_messages.
+  defp prepare_executor_context(modified_event, messages) do
+    if messages == [] do
+      {modified_event, %{event: modified_event, messages: [], hook_messages: []}}
+    else
+      # Merge hook guidance into event metadata for trace visibility
+      existing_guidance = List.wrap(modified_event.metadata[:hook_guidance])
+
+      updated_metadata =
+        Map.put(modified_event.metadata, :hook_guidance, existing_guidance ++ messages)
+
+      event_with_guidance = %{modified_event | metadata: updated_metadata}
+
+      executor_ctx = %{
+        event: event_with_guidance,
+        messages: messages,
+        hook_messages: messages
+      }
+
+      {event_with_guidance, executor_ctx}
+    end
+  end
+
+  # Call executor function, handling both arity-0 and arity-1.
+  # Arity-1 functions receive the executor context map.
+  defp call_executor(fun, _ctx) when is_function(fun, 0) do
+    fun.()
+  end
+
+  defp call_executor(fun, ctx) when is_function(fun, 1) do
+    fun.(ctx)
+  end
+
+  # Fallback for other function arities - treat as arity-0
+  defp call_executor(fun, _ctx) do
+    fun.()
   end
 
   defp build_event(action, opts, tm) do
