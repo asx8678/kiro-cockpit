@@ -2,9 +2,10 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
   @moduledoc """
   Injects decomposition/read-only guidance on the first action in plan mode.
 
-  Per §27.8, when in planning or waiting_for_approval state and this is the
-  first action/tool, inject guidance to help the operator understand they
-  should be doing read-only discovery.
+  Per §27.6/§36.2, when in planning or waiting_for_approval state and this is
+  the first action/tool, inject guidance to help the operator understand that
+  direct reads are allowed for discovery while shell/command/mutating tools are
+  blocked until approval.
 
   Priority: 96 (pre-action, non-blocking)
   """
@@ -51,13 +52,13 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
     case plan_mode.state do
       :planning ->
         "You are in plan mode (planning). " <>
-          "Focus on read-only discovery: explore the codebase, understand the project structure, " <>
-          "and gather information. Avoid making changes until the plan is approved. " <>
+          "Focus on read-only discovery and planning output. Direct reads are allowed; " <>
+          "shell commands and mutations are blocked until the plan is approved. " <>
           "Action '#{action}' requested #{permission_label(permission)}. #{permission_guidance}"
 
       :waiting_for_approval ->
         "You are in plan mode (waiting for approval). " <>
-          "The plan draft is ready for review. You can continue read-only discovery while waiting. " <>
+          "The plan draft is ready for review. Direct reads remain allowed while shell/command/mutating tools are blocked. " <>
           "Action '#{action}' requested #{permission_label(permission)}. #{permission_guidance} " <>
           "Once approved, you can proceed with implementation."
 
@@ -66,12 +67,12 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
     end
   end
 
-  defp permission_guidance(permission) when permission in [:read, :shell_read] do
-    "This read-only action is allowed for discovery purposes."
+  defp permission_guidance(:read) do
+    "This direct read action is allowed for discovery purposes."
   end
 
   defp permission_guidance(_permission) do
-    "Mutating actions are blocked in plan mode until the plan is approved."
+    "Shell/command/mutating tools are blocked in plan mode until the plan is approved."
   end
 
   defp permission_label(nil), do: "no explicit permission"
