@@ -231,6 +231,39 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
       assert KiroCockpit.Plans.get_plan(plan.id).status == "approved"
     end
 
+    test "run_plan shows stale-plan message when boundary returns {:swarm_blocked, reason}", %{
+      conn: conn
+    } do
+      session_id = "run-swarm-blocked-#{System.unique_integer([:positive])}"
+      dir = setup_project_dir_for_run()
+
+      {:ok, plan} =
+        create_test_plan(session_id, %{
+          status: "approved",
+          user_request: "Blocked by stale guard",
+          project_snapshot_hash: "definitely-not-current-hash"
+        })
+
+      Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)
+      Application.put_env(:kiro_cockpit, :kiro_session_resolver, fn _sid -> %{cwd: dir} end)
+
+      try do
+        {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+        html =
+          view
+          |> element("button[phx-click='run_plan'][phx-value-id='#{plan.id}']")
+          |> render_click()
+
+        assert html =~ "stale" or html =~ "Stale"
+        assert KiroCockpit.Plans.get_plan(plan.id).status == "approved"
+      after
+        Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, false)
+        Application.delete_env(:kiro_cockpit, :kiro_session_resolver)
+        File.rm_rf!(dir)
+      end
+    end
+
     test "refuses to run when staleness cannot be determined (no project dir)", %{conn: conn} do
       session_id = "run-unknown-#{System.unique_integer([:positive])}"
 
