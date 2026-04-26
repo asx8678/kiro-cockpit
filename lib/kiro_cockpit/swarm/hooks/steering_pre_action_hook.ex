@@ -1,14 +1,18 @@
 defmodule KiroCockpit.Swarm.Hooks.SteeringPreActionHook do
   @moduledoc """
-  Steering pre-action hook — deterministic signals first, then LLM-backed steering.
+  Steering pre-action hook — trusted deterministic signals first, then LLM-backed steering.
 
-  Per §27.7, this hook evaluates action relevance in two layers:
+  Per §27.7 and §26.6, this hook evaluates action relevance in two layers:
 
-  1. **Deterministic signals** (metadata/payload) always take precedence.
-     These include: off-topic, drift, guide, task_mismatch, explicit block.
-  2. **LLM-backed SteeringAgent** runs only when no deterministic signal is
-     found (`:no_signal`). The agent evaluates context and returns one of:
-     `:continue`, `:focus`, `:guide`, or `:block`.
+  1. **Trusted deterministic signals** (from server-side `ctx` only) always
+     take precedence. These come from `ctx[:steering_signal]`, a map set by
+     trusted policy/hook context — never from `event.payload` or
+     `event.metadata`, which are untrusted agent-provided data.
+     Signal keys include: `steering_decision`, `off_topic`, `drift`,
+     `guide`, `task_mismatch`.
+  2. **LLM-backed SteeringAgent** runs only when no trusted deterministic
+     signal is found (`:no_signal`). The agent evaluates context and returns
+     one of: `:continue`, `:focus`, `:guide`, or `:block`.
 
   If no steering model is configured, the hook falls through to a quiet
   `:continue` — deterministic gates have already run elsewhere. This hook's
@@ -174,11 +178,12 @@ defmodule KiroCockpit.Swarm.Hooks.SteeringPreActionHook do
   end
 
   # -------------------------------------------------------------------
-  # Deterministic signals (metadata and payload, atom and string keys)
+  # Trusted deterministic signals (from ctx only, never event payload/metadata)
   # -------------------------------------------------------------------
 
-  defp check_deterministic_signals(event, _ctx) do
-    deterministic_signal(event.metadata) || deterministic_signal(event.payload) || :no_signal
+  defp check_deterministic_signals(_event, ctx) do
+    trusted_signal = ctx_field(ctx, :steering_signal) || ctx_field(ctx, :trusted_steering_signal)
+    deterministic_signal(trusted_signal) || :no_signal
   end
 
   defp deterministic_signal(map) when is_map(map) do
@@ -267,6 +272,10 @@ defmodule KiroCockpit.Swarm.Hooks.SteeringPreActionHook do
 
   defp map_field(map, key) do
     Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  end
+
+  defp ctx_field(ctx, key) do
+    Map.get(ctx, key) || Map.get(ctx, Atom.to_string(key))
   end
 
   defp truthy?(true), do: true
