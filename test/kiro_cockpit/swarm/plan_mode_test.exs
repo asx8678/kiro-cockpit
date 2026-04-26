@@ -290,16 +290,19 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
 
   # ── Read-only discovery in planning (§27.8, §27.11 Invariant 2, §36.2) ──
 
-  describe "action allowed during planning — read-only" do
+  describe "action allowed during planning — direct reads only" do
     test "read action is allowed in planning state without task" do
       {:ok, pm} = PlanMode.enter_plan_mode(PlanMode.new())
       assert PlanMode.action_allowed?(pm, :read)
       assert :ok = PlanMode.check_action(pm, :read)
     end
 
-    test "shell_read action is allowed in planning state without task" do
+    test "shell_read action is blocked in planning state without task" do
       {:ok, pm} = PlanMode.enter_plan_mode(PlanMode.new())
-      assert PlanMode.action_allowed?(pm, :shell_read)
+      refute PlanMode.action_allowed?(pm, :shell_read)
+      assert {:blocked, reason, guidance} = PlanMode.check_action(pm, :shell_read)
+      assert reason == "Action blocked during planning"
+      assert guidance =~ "Shell/command"
     end
 
     test "read action is allowed in waiting_for_approval state" do
@@ -307,9 +310,9 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       assert PlanMode.action_allowed?(pm, :read)
     end
 
-    test "shell_read action is allowed in waiting_for_approval state" do
+    test "shell_read action is blocked in waiting_for_approval state" do
       {:ok, pm} = full_draft()
-      assert PlanMode.action_allowed?(pm, :shell_read)
+      refute PlanMode.action_allowed?(pm, :shell_read)
     end
   end
 
@@ -321,7 +324,7 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       refute PlanMode.action_allowed?(pm, :write)
 
       assert {:blocked, reason, guidance} = PlanMode.check_action(pm, :write)
-      assert reason =~ "Mutating action blocked"
+      assert reason =~ "Action blocked"
       assert is_binary(guidance) and guidance != ""
     end
 
@@ -330,7 +333,7 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       refute PlanMode.action_allowed?(pm, :shell_write)
 
       assert {:blocked, _reason, guidance} = PlanMode.check_action(pm, :shell_write)
-      assert guidance =~ "read-only"
+      assert guidance =~ "Finish"
     end
 
     test "write action is blocked in waiting_for_approval state" do
@@ -371,7 +374,8 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
     test "all actions are allowed in approved state" do
       {:ok, pm} = full_approve()
 
-      for perm <- PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() do
+      for perm <-
+            PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() ++ [:shell_read] do
         assert PlanMode.action_allowed?(pm, perm),
                "Expected #{perm} to be allowed in approved state"
       end
@@ -380,7 +384,8 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
     test "all actions are allowed in executing state" do
       {:ok, pm} = full_execute()
 
-      for perm <- PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() do
+      for perm <-
+            PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() ++ [:shell_read] do
         assert PlanMode.action_allowed?(pm, perm),
                "Expected #{perm} to be allowed in executing state"
       end
@@ -389,7 +394,8 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
     test "all actions are allowed in verifying state" do
       {:ok, pm} = full_verify()
 
-      for perm <- PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() do
+      for perm <-
+            PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() ++ [:shell_read] do
         assert PlanMode.action_allowed?(pm, perm),
                "Expected #{perm} to be allowed in verifying state"
       end
@@ -514,7 +520,7 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
     test "all blocked permissions produce non-empty guidance" do
       {:ok, pm} = PlanMode.enter_plan_mode(PlanMode.new())
 
-      for perm <- PlanMode.mutating_permissions() do
+      for perm <- PlanMode.mutating_permissions() ++ [:shell_read] do
         {:blocked, reason, guidance} = PlanMode.check_action(pm, perm)
         assert is_binary(reason) and reason != "", "reason for #{perm} should not be empty"
         assert is_binary(guidance) and guidance != "", "guidance for #{perm} should not be empty"
@@ -524,7 +530,8 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
     test "idle state returns :ok for all permissions" do
       pm = PlanMode.new()
 
-      all_perms = PlanMode.read_only_permissions() ++ PlanMode.mutating_permissions()
+      all_perms =
+        PlanMode.mutating_permissions() ++ PlanMode.read_only_permissions() ++ [:shell_read]
 
       for perm <- all_perms do
         assert :ok = PlanMode.check_action(pm, perm)

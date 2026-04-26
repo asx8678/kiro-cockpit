@@ -9,14 +9,17 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
   - Checking whether a file path is within a task's file scope
   - Checking whether an action is permitted by a task's permission scope
 
-  ## Category gating (§27.5)
+  All category gating decisions are delegated to `CategoryMatrix`,
+  which is the single source of truth for the §32.2 permission matrix.
 
-      researching  → read, grep, config, docs/search if approved
-      planning     → read, grep, skills, ask user, read-only reviewers
-      acting       → actions inside active task permission scope
-      verifying    → tests, diffs, logs, reads, non-mutating shell
-      debugging    → read, grep, git diff/log, logs, targeted diagnostics
-      documenting  → read, doc writes if approved
+  ## Category gating (§27.5, §32.2)
+
+      researching  → read, shell_read; external/subagent/memory_write: ask; writes: block
+      planning     → read; external/subagent/memory_write: ask; writes/shell: block
+      acting       → read: allow; all others: ask (policy/approval-gated)
+      verifying    → read, shell_read: allow; shell_write/terminal/external/subagent/memory_write: ask; write/destructive: block
+      debugging    → read, shell_read: allow; terminal/external/subagent/memory_write: ask; write/shell_write/destructive: block
+      documenting  → read, shell_read; write/external/subagent/memory_write: ask; shell_write/terminal/destructive: block
 
   ## Composition rule (§4.5, §10.3)
 
@@ -25,24 +28,20 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
   a category denies is still denied.
   """
 
-  alias KiroCockpit.Swarm.Tasks.Task
+  alias KiroCockpit.Swarm.Tasks.{CategoryMatrix, Task}
 
   @type permission ::
-          :read | :write | :shell_read | :shell_write | :terminal | :external | :destructive
+          :read
+          | :write
+          | :shell_read
+          | :shell_write
+          | :terminal
+          | :external
+          | :destructive
+          | :subagent
+          | :memory_write
 
-  # Category → set of permissions allowed by that category alone.
-  # These are the *maximum* — the task's permission_scope may further narrow.
-  @category_permissions %{
-    "researching" => MapSet.new([:read, :shell_read]),
-    "planning" => MapSet.new([:read, :shell_read]),
-    "acting" => MapSet.new([:read, :write, :shell_read, :shell_write]),
-    "verifying" => MapSet.new([:read, :shell_read]),
-    "debugging" => MapSet.new([:read, :shell_read]),
-    "documenting" => MapSet.new([:read, :write])
-  }
-
-  # Categories that allow write-level actions (subject to permission_scope narrowing).
-  @write_capable_categories ~w(acting documenting)
+  @type permission_error :: :category_denied | :scope_denied | :needs_approval
 
   # -------------------------------------------------------------------
   # Permission checks
@@ -57,6 +56,13 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
 
   Returns `{:ok, :allowed}` or `{:error, reason}`.
 
+  The `:needs_approval` error indicates the category would allow the action
+  with approval/policy, but no explicit approval signal was supplied. Pass
+  `approved: true` in opts to treat `:ask` verdicts as allowed.
+
+  Additional opts are forwarded to `CategoryMatrix.decision/3` for
+  conditional promotions (e.g. `root_cause_stated: true`).
+
   ## Examples
 
       iex> task = %Task{category: "researching", permission_scope: ["read"]}
@@ -66,65 +72,103 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
       iex> task = %Task{category: "researching", permission_scope: ["read"]}
       iex> TaskScope.permission_allowed?(task, :write)
       {:error, :category_denied}
+
+      iex> task = %Task{category: "acting", permission_scope: ["write"]}
+      iex> TaskScope.permission_allowed?(task, :write)
+      {:error, :needs_approval}
+
+      iex> task = %Task{category: "acting", permission_scope: ["write"]}
+      iex> TaskScope.permission_allowed?(task, :write, approved: true)
+      {:ok, :allowed}
   """
-  @spec permission_allowed?(Task.t(), permission()) ::
-          {:ok, :allowed} | {:error, :category_denied | :scope_denied}
-  def permission_allowed?(%Task{category: category, permission_scope: scope}, permission)
+  @spec permission_allowed?(Task.t(), permission(), keyword()) ::
+          {:ok, :allowed} | {:error, permission_error()}
+  def permission_allowed?(
+        %Task{category: category, permission_scope: scope},
+        permission,
+        opts \\ []
+      )
       when is_atom(permission) do
-    category_perms = Map.get(@category_permissions, category, MapSet.new())
+    approved = approval_satisfies?(category, permission, opts)
+    matrix_decision = CategoryMatrix.decision(category, permission, opts)
 
-    cond do
-      not MapSet.member?(category_perms, permission) ->
-        {:error, :category_denied}
-
-      scope != [] and not permission_in_scope?(scope, permission) ->
-        {:error, :scope_denied}
-
-      true ->
-        {:ok, :allowed}
-    end
+    matrix_decision.verdict
+    |> permission_result(scope, permission, approved)
   end
 
   @doc """
-  Returns the effective set of allowed permissions for a task.
+  Returns the effective set of auto-allowed permissions for a task.
 
-  This is the intersection of the category's hard ceiling and the
-  task's `permission_scope`. If `permission_scope` is empty, the
-  category ceiling is used as-is (empty scope = unconstrained within
-  category — the broadest interpretation).
+  This is the intersection of the category's `:allow` verdict permissions
+  and the task's `permission_scope`. If `permission_scope` is empty, the
+  auto-allowed set is used as-is (empty scope = unconstrained within
+  auto-allowed permissions).
+
+  Note: this only returns permissions with `:allow` verdict. Permissions
+  with `:ask` verdict are NOT included — they require approval.
   """
   @spec effective_permissions(Task.t()) :: MapSet.t(permission())
   def effective_permissions(%Task{category: category, permission_scope: scope}) do
-    category_perms = Map.get(@category_permissions, category, MapSet.new())
+    allow_perms =
+      category
+      |> CategoryMatrix.auto_allowed_permissions()
+      |> MapSet.new()
 
     if scope == [] do
-      category_perms
+      allow_perms
     else
       scope_atoms = scope |> Enum.map(&to_permission_atom/1) |> MapSet.new()
-      MapSet.intersection(category_perms, scope_atoms)
+      MapSet.intersection(allow_perms, scope_atoms)
     end
   end
 
   @doc """
-  Returns the permissions allowed by a category (hard ceiling).
+  Returns the permissions allowed by a category (auto-allowed only).
 
-  Useful for displaying what a category can do before a task is created.
+  This is the set of permissions with `:allow` verdict for the category.
+  Useful for displaying what a category can do without approval.
+
+  For the full hard ceiling (including `:ask` permissions), see
+  `CategoryMatrix.non_blocked_permissions/1`.
   """
   @spec category_permissions(String.t()) :: MapSet.t(permission())
   def category_permissions(category) do
-    Map.get(@category_permissions, category, MapSet.new())
+    category
+    |> CategoryMatrix.auto_allowed_permissions()
+    |> MapSet.new()
+  end
+
+  @doc """
+  Returns the full hard ceiling for a category — all non-blocked permissions.
+
+  This includes both `:allow` and `:ask` verdict permissions. These are
+  the permissions a category could potentially use (with approval where
+  needed).
+  """
+  @spec category_ceiling(String.t()) :: MapSet.t(permission())
+  def category_ceiling(category) do
+    category
+    |> CategoryMatrix.non_blocked_permissions()
+    |> MapSet.new()
   end
 
   @doc """
   Checks whether a category allows writes at all (before scope narrowing).
 
-  Per §27.5, `researching` and `planning` block writes entirely;
-  `debugging` and `verifying` block writes; only `acting` and
-  `documenting` may write (subject to scope).
+  Per §27.5/§32.2, `researching` and `planning` block writes entirely;
+  `verifying` and `debugging` block writes by default (with conditional
+  exceptions); only `acting` and `documenting` may write (subject to
+  approval/scope).
+
+  A category "allows writes" if the write verdict is not `:block`.
   """
   @spec category_allows_write?(String.t()) :: boolean()
-  def category_allows_write?(category) when category in @write_capable_categories, do: true
-  def category_allows_write?(_category), do: false
+  def category_allows_write?(category) do
+    case CategoryMatrix.decision(category, :write) do
+      %CategoryMatrix.Decision{verdict: :block} -> false
+      %CategoryMatrix.Decision{} -> true
+    end
+  end
 
   # -------------------------------------------------------------------
   # File scope checks
@@ -135,9 +179,9 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
 
   File patterns support simple glob-style matching:
 
-  - Exact match: `"lib/kiro_cockpit/event_store.ex"`
-  - Directory prefix: `"lib/kiro_cockpit/event_store/"`
-  - Glob wildcard: `"test/**/*_test.exs"` (simplified `**` matching)
+  - Exact match: `\"lib/kiro_cockpit/event_store.ex\"`
+  - Directory prefix: `\"lib/kiro_cockpit/event_store/\"`
+  - Glob wildcard: `\"test/**/*_test.exs\"` (simplified `**` matching)
 
   Returns `{:ok, :allowed}` or `{:error, :out_of_scope}`.
 
@@ -145,31 +189,48 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
   """
   @spec file_allowed?(Task.t(), String.t()) ::
           {:ok, :allowed} | {:error, :out_of_scope}
-  def file_allowed?(%Task{files_scope: []}, _path), do: {:ok, :allowed}
-
   def file_allowed?(%Task{files_scope: scope}, path) when is_binary(path) do
-    if Enum.any?(scope, &match_pattern?(&1, path)) do
-      {:ok, :allowed}
-    else
-      {:error, :out_of_scope}
+    case normalize_relative_path(path) do
+      {:ok, normalized_path} ->
+        normalized_scope = normalize_scope_patterns(scope)
+
+        cond do
+          scope == [] ->
+            {:ok, :allowed}
+
+          Enum.any?(normalized_scope, &match_pattern?(&1, normalized_path)) ->
+            {:ok, :allowed}
+
+          true ->
+            {:error, :out_of_scope}
+        end
+
+      :error ->
+        {:error, :out_of_scope}
     end
   end
 
-  @doc """
-  Checks whether a task's category permits writing to the given file path.
+  def file_allowed?(_task, _path), do: {:error, :out_of_scope}
 
-  Combines `category_allows_write?/1` with `file_allowed?/2`.
+  @doc """
+  Checks whether a task permits writing to the given file path.
+
+  This is the write-specific composition helper for §27.5/§32.2 enforcement:
+  it first evaluates the category/permission matrix through
+  `permission_allowed?/3` (preserving `:needs_approval` for unresolved `:ask`
+  verdicts), then enforces file scope with `file_allowed?/2`. Documenting tasks
+  only treat documentation-scoped paths as eligible for the write approval gate;
+  code paths remain category-denied by default.
   """
-  @spec category_and_file_allowed?(Task.t(), String.t()) ::
-          {:ok, :allowed} | {:error, :category_denied | :out_of_scope}
-  def category_and_file_allowed?(%Task{category: category} = task, path) do
-    if category_allows_write?(category) do
-      case file_allowed?(task, path) do
-        {:ok, :allowed} -> {:ok, :allowed}
-        {:error, :out_of_scope} -> {:error, :out_of_scope}
-      end
-    else
-      {:error, :category_denied}
+  @spec category_and_file_allowed?(Task.t(), String.t(), keyword()) ::
+          {:ok, :allowed}
+          | {:error, :category_denied | :scope_denied | :needs_approval | :out_of_scope}
+  def category_and_file_allowed?(task, path, opts \\ []) do
+    opts = opts |> Keyword.put_new(:path, path) |> maybe_mark_docs_scoped(path)
+
+    case permission_allowed?(task, :write, opts) do
+      {:ok, :allowed} -> file_allowed?(task, path)
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -195,6 +256,75 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
   # Private helpers
   # -------------------------------------------------------------------
 
+  defp approval_satisfies?("acting", :write, opts) do
+    Keyword.get(opts, :approved, false) and Keyword.get(opts, :policy_allows_write, false)
+  end
+
+  defp approval_satisfies?(:acting, :write, opts) do
+    Keyword.get(opts, :approved, false) and Keyword.get(opts, :policy_allows_write, false)
+  end
+
+  defp approval_satisfies?(_category, _permission, opts), do: Keyword.get(opts, :approved, false)
+
+  defp permission_result(:block, _scope, _permission, _approved), do: {:error, :category_denied}
+
+  defp permission_result(:allow, scope, permission, _approved), do: check_scope(scope, permission)
+
+  defp permission_result(:ask, scope, permission, true), do: check_scope(scope, permission)
+
+  defp permission_result(:ask, scope, permission, false) do
+    case check_scope(scope, permission) do
+      {:ok, :allowed} -> {:error, :needs_approval}
+      {:error, :scope_denied} -> {:error, :scope_denied}
+    end
+  end
+
+  defp maybe_mark_docs_scoped(opts, path) do
+    if CategoryMatrix.docs_scoped_path?(path) do
+      Keyword.put_new(opts, :docs_scoped, true)
+    else
+      opts
+    end
+  end
+
+  defp normalize_scope_patterns(scope) do
+    Enum.flat_map(scope, &normalize_scope_pattern/1)
+  end
+
+  defp normalize_scope_pattern(pattern) when is_binary(pattern) do
+    case normalize_relative_path(pattern) do
+      {:ok, normalized} ->
+        if String.ends_with?(pattern, "/"), do: [normalized <> "/"], else: [normalized]
+
+      :error ->
+        []
+    end
+  end
+
+  defp normalize_scope_pattern(_pattern), do: []
+
+  defp normalize_relative_path(path) when is_binary(path) do
+    segments = Path.split(path)
+
+    if Path.type(path) == :relative and not Enum.any?(segments, &(&1 in [".", ".."])) do
+      {:ok, path |> Path.expand("/workspace") |> Path.relative_to("/workspace")}
+    else
+      :error
+    end
+  end
+
+  @spec check_scope([String.t()], permission()) ::
+          {:ok, :allowed} | {:error, :scope_denied}
+  defp check_scope([], _permission), do: {:ok, :allowed}
+
+  defp check_scope(scope, permission) do
+    if permission_in_scope?(scope, permission) do
+      {:ok, :allowed}
+    else
+      {:error, :scope_denied}
+    end
+  end
+
   defp permission_in_scope?(scope, permission) do
     Enum.any?(scope, fn s -> to_permission_atom(s) == permission end)
   end
@@ -206,7 +336,9 @@ defmodule KiroCockpit.Swarm.Tasks.TaskScope do
     "shell_write" => :shell_write,
     "terminal" => :terminal,
     "external" => :external,
-    "destructive" => :destructive
+    "destructive" => :destructive,
+    "subagent" => :subagent,
+    "memory_write" => :memory_write
   }
 
   @spec to_permission_atom(String.t()) :: permission() | nil

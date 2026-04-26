@@ -24,10 +24,10 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   "Plan mode allows read-only discovery only."
 
-  During `planning` and `waiting_for_approval`, only `:read` and
-  `:shell_read` actions are permitted. All mutating actions (`:write`,
-  `:shell_write`, `:terminal`, `:external`, `:destructive`) are blocked
-  with actionable guidance explaining *why* and *what to do next*.
+  During `planning` and `waiting_for_approval`, direct file reads (`:read`) are
+  allowed for local discovery. Shell/command tools (`:shell_read` included),
+  writes, terminals, external access, and destructive actions are blocked with
+  actionable guidance explaining *why* and *what to do next*.
 
   ## Scope
 
@@ -64,7 +64,7 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   @states ~w(idle planning waiting_for_approval approved executing verifying completed rejected failed)a
 
-  @read_only_permissions [:read, :shell_read]
+  @read_only_permissions [:read]
 
   @mutating_permissions [:write, :shell_write, :terminal, :external, :destructive]
 
@@ -103,7 +103,7 @@ defmodule KiroCockpit.Swarm.PlanMode do
   @spec states() :: [state()]
   def states, do: @states
 
-  @doc "Returns the list of read-only discovery permissions allowed during planning."
+  @doc "Returns the list of direct read permissions allowed during locked planning."
   @spec read_only_permissions() :: [permission()]
   def read_only_permissions, do: @read_only_permissions
 
@@ -115,7 +115,7 @@ defmodule KiroCockpit.Swarm.PlanMode do
   @spec state(t()) :: state()
   def state(%__MODULE__{state: s}), do: s
 
-  @doc "Returns true when the state machine is in a planning-locked state (read-only discovery only)."
+  @doc "Returns true when the state machine is in a planning-locked, read-only state."
   @spec planning_locked?(t()) :: boolean()
   def planning_locked?(%__MODULE__{state: s}), do: s in [:planning, :waiting_for_approval]
 
@@ -242,7 +242,7 @@ defmodule KiroCockpit.Swarm.PlanMode do
   ## Rules (§27.8, §27.11 Invariant 2)
 
     - `:idle` — no plan-mode restrictions (other policies apply externally).
-    - `:planning` / `:waiting_for_approval` — read-only discovery only.
+    - `:planning` / `:waiting_for_approval` — direct reads only; commands/tools are blocked.
     - `:approved` / `:executing` / `:verifying` — mutations unlocked by scope.
     - `:completed` / `:rejected` / `:failed` — no plan-mode restrictions.
 
@@ -253,9 +253,8 @@ defmodule KiroCockpit.Swarm.PlanMode do
       :ok
 
       iex> {:ok, pm} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(KiroCockpit.Swarm.PlanMode.new())
-      iex> KiroCockpit.Swarm.PlanMode.check_action(pm, :write)
-      {:blocked, "Mutating action blocked during planning",
-       "Wait for plan approval before making changes. Approve the plan to unlock execution."}
+      iex> KiroCockpit.Swarm.PlanMode.check_action(pm, :read)
+      :ok
   """
   @spec check_action(t(), permission()) :: action_result()
   def check_action(%__MODULE__{state: state}, permission) do
@@ -267,7 +266,7 @@ defmodule KiroCockpit.Swarm.PlanMode do
         if permission in @read_only_permissions do
           :ok
         else
-          {:blocked, "Mutating action blocked during planning",
+          {:blocked, "Action blocked during planning",
            guidance_for_blocked_permission(permission, state)}
         end
 
@@ -290,10 +289,10 @@ defmodule KiroCockpit.Swarm.PlanMode do
   end
 
   @doc """
-  Returns true if read-only discovery actions are allowed in the current state.
+  Returns true if direct read discovery is allowed in the current state.
 
-  Read-only discovery (`:read`, `:shell_read`) is allowed in `:planning`
-  and `:waiting_for_approval` without requiring an active task (§27.8).
+  Locked planning states allow direct reads for local discovery, but shell/command
+  tools remain blocked until approval/execution unlocks them (§27.6, §36.2).
   """
   @spec read_only_discovery_allowed?(t()) :: boolean()
   def read_only_discovery_allowed?(%__MODULE__{state: state}) do
@@ -341,6 +340,16 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   # Guidance strings are actionable — they tell the operator *what to do*,
   # not just *what went wrong*.
+  defp guidance_for_blocked_permission(:read, :planning) do
+    "File reads are tool actions and are not allowed while planning. " <>
+      "Use existing context to draft the plan, then request approval before tool use."
+  end
+
+  defp guidance_for_blocked_permission(:read, :waiting_for_approval) do
+    "File reads are blocked until the plan is approved. " <>
+      "Approve the plan to unlock read access, or request revisions."
+  end
+
   defp guidance_for_blocked_permission(:write, :planning) do
     "File modifications are not allowed while planning. " <>
       "Finish the plan draft and get approval before making changes."
@@ -351,9 +360,19 @@ defmodule KiroCockpit.Swarm.PlanMode do
       "Approve the plan to unlock write access, or request revisions."
   end
 
+  defp guidance_for_blocked_permission(:shell_read, :planning) do
+    "Shell/command tools are not allowed while planning. " <>
+      "Produce the plan first, then execute diagnostics after approval or delegation."
+  end
+
+  defp guidance_for_blocked_permission(:shell_read, :waiting_for_approval) do
+    "Shell/command tools are blocked until the plan is approved. " <>
+      "Approve the plan to unlock command execution."
+  end
+
   defp guidance_for_blocked_permission(:shell_write, :planning) do
     "Shell commands that modify files are not allowed while planning. " <>
-      "Use read-only commands (git status, mix test --dry-run) for discovery."
+      "Finish and approve the plan before running commands."
   end
 
   defp guidance_for_blocked_permission(:shell_write, :waiting_for_approval) do
