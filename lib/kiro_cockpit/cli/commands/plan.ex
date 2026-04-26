@@ -161,6 +161,13 @@ defmodule KiroCockpit.CLI.Commands.Plan do
           plan: plan
         )
 
+      {:error, {:swarm_blocked, reason, _messages}} ->
+        Result.error(
+          :stale_plan,
+          "plan #{id} is stale — #{reason}",
+          plan_id: id
+        )
+
       {:error, reason} ->
         Result.error(:approve_failed, "could not approve plan: #{inspect(reason)}", plan_id: id)
     end

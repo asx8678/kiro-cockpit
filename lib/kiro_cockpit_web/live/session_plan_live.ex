@@ -151,6 +151,14 @@ defmodule KiroCockpitWeb.SessionPlanLive do
            "Plan is stale — the project has changed since it was generated. Revise or regenerate."
          )}
 
+      {:error, {:swarm_blocked, _reason, _messages}} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Plan is stale — the project has changed since it was generated. Revise or regenerate."
+         )}
+
       {:error, :invalid_transition} ->
         {:noreply, put_flash(socket, :error, "Cannot approve plan: invalid status transition")}
 
@@ -226,6 +234,14 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, socket}
 
       {:error, :stale_plan} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Plan is stale — the project has changed since it was generated. Revise or regenerate."
+         )}
+
+      {:error, {:swarm_blocked, _reason}} ->
         {:noreply,
          put_flash(
            socket,
