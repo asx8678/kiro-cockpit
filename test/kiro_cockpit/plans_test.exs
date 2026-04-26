@@ -180,6 +180,97 @@ defmodule KiroCockpit.PlansTest do
     end
   end
 
+  describe "approve_plan_with_tasks/4" do
+    alias KiroCockpit.Swarm.Tasks.TaskManager
+
+    test "atomically approves plan, creates tasks, and activates first task" do
+      # Create a plan with steps
+      steps = [
+        %{
+          phase_number: 1,
+          step_number: 1,
+          title: "Step 1",
+          details: "First step details",
+          files: %{"file1.ex" => "read"},
+          permission_level: "read",
+          status: "planned"
+        },
+        %{
+          phase_number: 1,
+          step_number: 2,
+          title: "Step 2",
+          details: "Second step details",
+          files: %{"file2.ex" => "write"},
+          permission_level: "write",
+          status: "planned"
+        }
+      ]
+
+      {:ok, plan} = Plans.create_plan("sess-atomic", "request", :nano, steps, default_opts())
+      assert plan.status == "draft"
+      assert length(plan.plan_steps) == 2
+
+      # Approve with task creation
+      assert {:ok, %{plan: approved_plan, tasks: tasks, active_task: active_task}} =
+               Plans.approve_plan_with_tasks(plan.id, "kiro-executor", TaskManager)
+
+      # Verify plan is approved
+      assert approved_plan.status == "approved"
+      assert approved_plan.approved_at != nil
+
+      # Verify tasks were created
+      assert length(tasks) == 2
+
+      # Verify exactly one task is active
+      assert active_task != nil
+      assert active_task.status == "in_progress"
+
+      # Verify tasks exist in the database
+      db_tasks = TaskManager.list("sess-atomic", plan_id: plan.id)
+      assert length(db_tasks) == 2
+
+      # Verify one is in_progress
+      in_progress_count = Enum.count(db_tasks, &(&1.status == "in_progress"))
+      assert in_progress_count == 1
+    end
+
+    test "gracefully handles plan with no steps, approving without tasks" do
+      {:ok, plan} = Plans.create_plan("sess-empty", "request", :nano, [], default_opts())
+      assert plan.plan_steps == []
+
+      # Should succeed with empty tasks and nil active_task (graceful handling)
+      assert {:ok, %{plan: approved_plan, tasks: [], active_task: nil}} =
+               Plans.approve_plan_with_tasks(plan.id, "kiro-executor", TaskManager)
+
+      # Verify plan is approved (no rollback - graceful success)
+      assert approved_plan.status == "approved"
+
+      # Verify no tasks were created
+      db_tasks = TaskManager.list("sess-empty", plan_id: plan.id)
+      assert db_tasks == []
+    end
+
+    test "fails to approve non-draft plan" do
+      steps = [
+        %{
+          phase_number: 1,
+          step_number: 1,
+          title: "Step 1",
+          details: "Details",
+          permission_level: "read",
+          status: "planned"
+        }
+      ]
+
+      {:ok, plan} = Plans.create_plan("sess", "request", :nano, steps, default_opts())
+      {:ok, _} = Plans.approve_plan(plan.id)
+
+      # Should fail with invalid_transition
+      assert {:error, :invalid_transition} =
+               Plans.approve_plan_with_tasks(plan.id, "kiro-executor", TaskManager)
+    end
+  end
+
   describe "reject_plan/2" do
     test "transitions to rejected with reason" do
       {:ok, plan} = Plans.create_plan("sess", "request", :nano, [], default_opts())
