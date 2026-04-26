@@ -112,16 +112,27 @@ defmodule KiroCockpit.Plans do
   @doc """
   Approves a draft plan, adding an approval event.
   """
-  @spec approve_plan(plan_id) :: {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
-  def approve_plan(plan_id) do
+  @spec approve_plan(plan_id, keyword()) ::
+          {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
+  def approve_plan(plan_id, opts \\ []) do
     with {:ok, plan} <- fetch_plan(plan_id),
          :ok <- require_status(plan, "draft") do
-      update_plan_with_event(
-        plan,
-        %{status: "approved", approved_at: DateTime.utc_now()},
-        "approved",
-        %{}
-      )
+      result =
+        update_plan_with_event(
+          plan,
+          %{status: "approved", approved_at: DateTime.utc_now()},
+          "approved",
+          %{}
+        )
+
+      case result do
+        {:ok, approved_plan} ->
+          fire_plan_approved_hook(approved_plan, opts)
+          result
+
+        _ ->
+          result
+      end
     end
   end
 
@@ -346,6 +357,21 @@ defmodule KiroCockpit.Plans do
 
   defp rejection_payload(nil), do: %{}
   defp rejection_payload(reason), do: %{"reason" => reason}
+
+  # Fire :plan_approved post-hook for Bronze trace and guidance injection.
+  # Uses ActionBoundary.run_lifecycle_post_hooks which checks app config
+  # (swarm_action_hooks_enabled) before running. Never crashes the caller.
+  defp fire_plan_approved_hook(plan, opts) do
+    alias KiroCockpit.Swarm.ActionBoundary
+
+    agent_id = Keyword.get(opts, :agent_id, "nano-planner")
+
+    ActionBoundary.run_lifecycle_post_hooks(:plan_approved,
+      session_id: plan.session_id,
+      agent_id: agent_id,
+      plan_id: plan.id
+    )
+  end
 
   defp update_plan_with_event(plan, attrs, event_type, payload) do
     new_multi()

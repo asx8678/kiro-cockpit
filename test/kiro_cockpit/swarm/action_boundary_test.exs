@@ -571,8 +571,9 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
       assert KiroCockpit.Swarm.Hooks.SteeringPreActionHook in hooks
     end
 
-    test "default_post_hooks returns empty list" do
-      assert ActionBoundary.default_post_hooks() == []
+    test "default_post_hooks includes TaskGuidanceHook" do
+      hooks = ActionBoundary.default_post_hooks()
+      assert KiroCockpit.Swarm.Hooks.TaskGuidanceHook in hooks
     end
   end
 end
