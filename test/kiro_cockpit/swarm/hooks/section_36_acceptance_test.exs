@@ -460,14 +460,11 @@ defmodule KiroCockpit.Swarm.Hooks.Section36AcceptanceTest do
     end
 
     test "deterministic drift signal produces focus with reminder" do
-      event =
-        Event.new(:write,
-          session_id: "s36_det_focus",
-          agent_id: "a1",
-          metadata: %{drift: true, drift_message: "Slight drift detected"}
-        )
+      event = Event.new(:write, session_id: "s36_det_focus", agent_id: "a1")
 
-      result = SteeringPreActionHook.on_event(event, %{})
+      ctx = %{steering_signal: %{drift: true, drift_message: "Slight drift detected"}}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
 
       assert %HookResult{decision: :modify} = result
       assert result.hook_metadata[:steering_decision] == :focus
@@ -495,14 +492,11 @@ defmodule KiroCockpit.Swarm.Hooks.Section36AcceptanceTest do
     end
 
     test "deterministic guide signal produces guidance with message" do
-      event =
-        Event.new(:write,
-          session_id: "s36_det_guide",
-          agent_id: "a1",
-          metadata: %{guide: true, guide_message: "Consider memory on auth tokens"}
-        )
+      event = Event.new(:write, session_id: "s36_det_guide", agent_id: "a1")
 
-      result = SteeringPreActionHook.on_event(event, %{})
+      ctx = %{steering_signal: %{guide: true, guide_message: "Consider memory on auth tokens"}}
+
+      result = SteeringPreActionHook.on_event(event, ctx)
 
       assert %HookResult{decision: :modify} = result
       assert result.hook_metadata[:steering_decision] == :guide
@@ -528,14 +522,13 @@ defmodule KiroCockpit.Swarm.Hooks.Section36AcceptanceTest do
     end
 
     test "deterministic block signal prevents action" do
-      event =
-        Event.new(:write,
-          session_id: "s36_det_block",
-          agent_id: "a1",
-          metadata: %{off_topic: true, off_topic_guidance: "Unrelated to current task"}
-        )
+      event = Event.new(:write, session_id: "s36_det_block", agent_id: "a1")
 
-      result = SteeringPreActionHook.on_event(event, %{})
+      ctx = %{
+        steering_signal: %{off_topic: true, off_topic_guidance: "Unrelated to current task"}
+      }
+
+      result = SteeringPreActionHook.on_event(event, ctx)
 
       assert %HookResult{decision: :block, reason: "Action is off-topic"} = result
     end
@@ -572,17 +565,16 @@ defmodule KiroCockpit.Swarm.Hooks.Section36AcceptanceTest do
         {:ok, ~s({"decision": "continue", "reason": "Ok by model", "risk_level": "low"})}
       end
 
-      event =
-        Event.new(:write,
-          session_id: "s36_det_override",
-          agent_id: "a1",
-          metadata: %{off_topic: true, off_topic_guidance: "Off-topic detected"}
-        )
+      event = Event.new(:write, session_id: "s36_det_override", agent_id: "a1")
 
-      result =
-        SteeringPreActionHook.on_event(event, %{steering_opts: [steering_model: llm_continue]})
+      ctx = %{
+        steering_signal: %{off_topic: true, off_topic_guidance: "Off-topic detected"},
+        steering_opts: [steering_model: llm_continue]
+      }
 
-      # Deterministic signal wins over LLM
+      result = SteeringPreActionHook.on_event(event, ctx)
+
+      # Trusted deterministic signal wins over LLM
       assert %HookResult{decision: :block, reason: "Action is off-topic"} = result
     end
   end
