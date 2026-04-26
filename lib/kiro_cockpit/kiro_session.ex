@@ -1075,6 +1075,11 @@ defmodule KiroCockpit.KiroSession do
   # from opts, or state.swarm_plan_id, and no explicit plan_mode exists.
   # This makes execution prompt opts from NanoPlanner.approve produce an
   # executing/approved plan mode without caller explicitly passing PlanMode.
+  #
+  # Sets permission_level to :executor_dispatch for KiroSession.prompt to
+  # distinguish it from arbitrary subagent invocation. This is a control-plane
+  # action that bypasses category/scope checks when plan is approved and
+  # active task exists (kiro-rhk issue bd).
   defp prompt_boundary_opts(state, opts) do
     plan_mode = state.plan_mode || derive_plan_mode(opts, state)
 
@@ -1083,14 +1088,29 @@ defmodule KiroCockpit.KiroSession do
         session_id: state.session_id,
         agent_id: state.swarm_agent_id,
         plan_id: state.swarm_plan_id,
-        permission_level: :subagent,
+        permission_level: :executor_dispatch,
         project_dir: state.cwd,
         plan_mode: plan_mode,
-        swarm_ctx: state.swarm_ctx
+        swarm_ctx: state.swarm_ctx,
+        approved: truthy_lookup(state.swarm_ctx, :approved)
       ],
       opts
     )
   end
+
+  defp truthy_lookup(map, key) when is_map(map) do
+    case Map.get(map, key) do
+      true -> true
+      "true" -> true
+      1 -> true
+      "1" -> true
+      :yes -> true
+      "yes" -> true
+      _ -> false
+    end
+  end
+
+  defp truthy_lookup(_nil_or_not_map, _key), do: false
 
   # -- Auto callback handling (kiro-4ff) ------------------------------------
 

@@ -882,9 +882,13 @@ defmodule KiroCockpit.NanoPlanner do
 
     # Merge correlation identifiers (plan_id, task_id, agent_id, swarm_plan_id)
     # into prompt opts so downstream boundary can trace execution context.
+    # Include :approved flag in swarm_ctx to signal executor dispatch is allowed.
     prompt_opts =
-      [timeout: timeout] ++
-        Enum.reject(correlation, fn {_k, v} -> is_nil(v) end)
+      [timeout: timeout]
+      |> Keyword.merge(Enum.reject(correlation, fn {_k, v} -> is_nil(v) end))
+      |> Keyword.update(:swarm_ctx, %{approved: true}, fn existing_ctx ->
+        Map.put(existing_ctx || %{}, :approved, true)
+      end)
 
     case session_mod.prompt(session, execution_prompt, prompt_opts) do
       {:ok, result} ->

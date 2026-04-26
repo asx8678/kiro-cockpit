@@ -170,6 +170,83 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
       assert {:error, {:swarm_blocked, reason, _messages}} = result
       assert reason =~ "out of scope"
     end
+
+    test "executor dispatch (:kiro_session_prompt) allowed with approved plan and active task even for researching category" do
+      session_id = "sess_exec_dispatch_#{System.unique_integer([:positive])}"
+      agent_id = "agent_exec_dispatch"
+
+      # Create a researching task (normally doesn't allow subagent)
+      _task =
+        create_active_task!(session_id, agent_id,
+          category: "researching",
+          files_scope: []
+        )
+
+      # Build approved plan_mode
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      # Executor dispatch with :executor_dispatch permission level and approved flag
+      result =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :executor_dispatch,
+            plan_mode: plan_mode,
+            approved: true,
+            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+            post_hooks: []
+          ],
+          fn -> :prompt_dispatched end
+        )
+
+      # Should be allowed because it's executor dispatch with approved plan
+      assert {:ok, :prompt_dispatched} = result
+    end
+
+    test "subsequent fs_write_requested still blocked for researching category even with approved plan" do
+      session_id = "sess_write_blocked_#{System.unique_integer([:positive])}"
+      agent_id = "agent_write_blocked"
+
+      # Create a researching task
+      _task =
+        create_active_task!(session_id, agent_id,
+          category: "researching",
+          files_scope: ["lib/"]
+        )
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      # fs_write_requested maps to :write permission
+      result =
+        ActionBoundary.run(
+          :fs_write_requested,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :write,
+            plan_mode: plan_mode,
+            approved: true,
+            payload: %{target_path: "lib/test.ex"},
+            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+            post_hooks: []
+          ],
+          fn -> :written end
+        )
+
+      # Should be blocked because researching category doesn't allow writes
+      assert {:error, {:swarm_blocked, reason, _messages}} = result
+      assert reason =~ "Category permission denied"
+    end
   end
 
   describe "run/3 — custom hooks" do

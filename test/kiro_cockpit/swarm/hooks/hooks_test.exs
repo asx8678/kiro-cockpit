@@ -539,6 +539,136 @@ defmodule KiroCockpit.Swarm.HooksTest do
     assert %HookResult{decision: :block, reason: "Category permission denied"} = result
   end
 
+  describe "TaskEnforcementHook — executor dispatch for approved execution prompt" do
+    test "allows :kiro_session_prompt with executor_dispatch permission when approved and active task exists" do
+      # Create a researching task (which normally doesn't allow :subagent)
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "sess_exec_dispatch",
+          owner_id: "agent_exec_dispatch",
+          content: "Research task",
+          category: "researching",
+          permission_scope: ["read"]
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+
+      event =
+        Event.new(:kiro_session_prompt,
+          session_id: "sess_exec_dispatch",
+          agent_id: "agent_exec_dispatch"
+        )
+
+      # Executor dispatch should be allowed when plan is approved
+      result =
+        TaskEnforcementHook.on_event(event, %{
+          plan_mode: PlanMode.new(),
+          approved: true
+        })
+
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "blocks :kiro_session_prompt without approved flag even with active task" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "sess_exec_dispatch_blocked",
+          owner_id: "agent_exec_dispatch_blocked",
+          content: "Research task",
+          category: "researching"
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+
+      event =
+        Event.new(:kiro_session_prompt,
+          session_id: "sess_exec_dispatch_blocked",
+          agent_id: "agent_exec_dispatch_blocked"
+        )
+
+      # Without approved flag, executor dispatch should be blocked by category check
+      result = TaskEnforcementHook.on_event(event, %{plan_mode: PlanMode.new()})
+
+      assert %HookResult{decision: :block, reason: "Category permission denied"} = result
+    end
+
+    test "blocks :kiro_session_prompt when no active task exists" do
+      event =
+        Event.new(:kiro_session_prompt,
+          session_id: "sess_no_task",
+          agent_id: "agent_no_task"
+        )
+
+      result =
+        TaskEnforcementHook.on_event(event, %{
+          plan_mode: PlanMode.new(),
+          approved: true
+        })
+
+      assert %HookResult{decision: :block, reason: "No active task"} = result
+    end
+
+    test "blocks subsequent fs_write_requested even when execution prompt was allowed" do
+      # Create a researching task
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "sess_fs_write_blocked",
+          owner_id: "agent_fs_write_blocked",
+          content: "Research task",
+          category: "researching",
+          permission_scope: ["read"]
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+
+      # fs_write_requested maps to :write permission, which should still be blocked
+      event =
+        Event.new(:fs_write_requested,
+          session_id: "sess_fs_write_blocked",
+          agent_id: "agent_fs_write_blocked",
+          payload: %{target_path: "lib/test.ex"}
+        )
+
+      # Even with approved flag, write actions should be blocked for researching category
+      result =
+        TaskEnforcementHook.on_event(event, %{
+          plan_mode: PlanMode.new(),
+          approved: true
+        })
+
+      assert %HookResult{decision: :block, reason: "Category permission denied"} = result
+    end
+
+    test "blocks :kiro_session_prompt in planning mode even when approved" do
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: "sess_planning_mode",
+          owner_id: "agent_planning_mode",
+          content: "Test task",
+          category: "acting"
+        })
+
+      {:ok, _} = TaskManager.activate(task.id)
+
+      event =
+        Event.new(:kiro_session_prompt,
+          session_id: "sess_planning_mode",
+          agent_id: "agent_planning_mode"
+        )
+
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+
+      # Plan mode gate should block executor dispatch in planning state
+      result =
+        TaskEnforcementHook.on_event(event, %{
+          plan_mode: plan_mode,
+          approved: true
+        })
+
+      assert %HookResult{decision: :block, reason: "Action blocked during planning"} = result
+    end
+  end
+
   describe "PlanModeFirstActionHook" do
     test "injects guidance on first action in planning mode" do
       event = Event.new(:read, session_id: "sess_1", agent_id: "agent_1")
