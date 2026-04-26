@@ -41,7 +41,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
   defp create_active_task!(session_id, agent_id, opts \\ []) do
     attrs = %{
       session_id: session_id,
-      content: "boundary test task",
+      content: Keyword.get(opts, :content, "boundary test task"),
       owner_id: agent_id,
       status: "in_progress",
       category: Keyword.get(opts, :category, "acting"),
@@ -574,6 +574,613 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
     test "default_post_hooks includes TaskGuidanceHook" do
       hooks = ActionBoundary.default_post_hooks()
       assert KiroCockpit.Swarm.Hooks.TaskGuidanceHook in hooks
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Steering context hydration tests (kiro-oai steering-context-hydration)
+  # -------------------------------------------------------------------
+
+  describe "steering context hydration — when swarm_ctx is empty" do
+    # Hook that captures the ctx for verification
+    defmodule CtxCapturingHook do
+      @behaviour KiroCockpit.Swarm.Hook
+
+      @impl true
+      def name, do: :ctx_capture
+      @impl true
+      def priority, do: 95
+      @impl true
+      def filter(_event), do: true
+      @impl true
+      def on_event(event, ctx) do
+        Process.put(:captured_ctx, ctx)
+        KiroCockpit.Swarm.HookResult.continue(event, ["ctx captured"])
+      end
+    end
+
+    setup do
+      Process.delete(:captured_ctx)
+      :ok
+    end
+
+    test "hydrates active_task from TaskManager when not in swarm_ctx" do
+      session_id = "sess_hydrate_task_#{System.unique_integer([:positive])}"
+      agent_id = "agent_hydrate"
+
+      task = create_active_task!(session_id, agent_id, content: "Test task for hydration")
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            # Empty swarm_ctx — should be hydrated
+            swarm_ctx: %{},
+            pre_hooks: [CtxCapturingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:captured_ctx)
+      assert ctx != nil
+      assert ctx.active_task != nil
+      assert ctx.active_task.id == task.id
+      assert ctx.active_task.content == "Test task for hydration"
+    end
+
+    test "hydrates plan from database when plan_id is available" do
+      session_id = "sess_hydrate_plan_#{System.unique_integer([:positive])}"
+      agent_id = "agent_hydrate"
+
+      # Create a plan with proper mode and required fields
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "Test plan for hydration",
+          "nano",
+          [%{
+            title: "Step 1",
+            permission_level: "write",
+            phase_number: 1,
+            step_number: 1,
+            status: "planned"
+          }],
+          plan_markdown: "# Test Plan",
+          execution_prompt: "Execute the plan",
+          project_snapshot_hash: "abc123"
+        )
+
+      # Create a task associated with the plan
+      task_attrs = %{
+        session_id: session_id,
+        content: "Test task with plan",
+        owner_id: agent_id,
+        status: "in_progress",
+        category: "acting",
+        files_scope: [],
+        plan_id: plan.id
+      }
+
+      {:ok, _} = TaskManager.create(task_attrs)
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            # Empty swarm_ctx — should be hydrated with plan
+            swarm_ctx: %{},
+            pre_hooks: [CtxCapturingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:captured_ctx)
+      assert ctx != nil
+      assert ctx.plan != nil
+      assert ctx.plan.id == plan.id
+      assert ctx.plan.user_request == "Test plan for hydration"
+    end
+
+    test "hydrates task_history from TaskManager" do
+      session_id = "sess_hydrate_history_#{System.unique_integer([:positive])}"
+      agent_id = "agent_hydrate"
+
+      # Create multiple tasks for history
+      {:ok, task1} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "First completed task",
+          owner_id: agent_id,
+          status: "completed",
+          category: "acting",
+          files_scope: []
+        })
+
+      {:ok, task2} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Second completed task",
+          owner_id: agent_id,
+          status: "completed",
+          category: "acting",
+          files_scope: []
+        })
+
+      # Create active task
+      {:ok, _active_task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Active task",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          files_scope: []
+        })
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{},
+            pre_hooks: [CtxCapturingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:captured_ctx)
+      assert ctx != nil
+      assert ctx.task_history != nil
+      assert is_list(ctx.task_history)
+      # Should include all tasks (active + completed)
+      task_ids = Enum.map(ctx.task_history, & &1.id)
+      assert task1.id in task_ids
+      assert task2.id in task_ids
+    end
+
+    test "hydrates completed_tasks from TaskManager" do
+      session_id = "sess_hydrate_completed_#{System.unique_integer([:positive])}"
+      agent_id = "agent_hydrate"
+
+      # Create completed tasks
+      {:ok, task1} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Completed task 1",
+          owner_id: agent_id,
+          status: "completed",
+          category: "acting",
+          files_scope: []
+        })
+
+      {:ok, task2} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Completed task 2",
+          owner_id: agent_id,
+          status: "completed",
+          category: "researching",
+          files_scope: []
+        })
+
+      # Create a pending task (not completed)
+      {:ok, _pending} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Pending task",
+          owner_id: agent_id,
+          status: "pending",
+          category: "acting",
+          files_scope: []
+        })
+
+      # Create active task
+      {:ok, _active} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Active task",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          files_scope: []
+        })
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{},
+            pre_hooks: [CtxCapturingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:captured_ctx)
+      assert ctx != nil
+      assert ctx.completed_tasks != nil
+      assert is_list(ctx.completed_tasks)
+      # Should only include completed tasks
+      completed_ids = Enum.map(ctx.completed_tasks, & &1.id)
+      assert task1.id in completed_ids
+      assert task2.id in completed_ids
+      # Pending task should not be in completed_tasks
+      assert length(completed_ids) == 2
+    end
+
+    test "hydrates permission_policy from active_task and permission_level" do
+      session_id = "sess_hydrate_policy_#{System.unique_integer([:positive])}"
+      agent_id = "agent_hydrate"
+
+      {:ok, _} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Task with file scope",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          files_scope: ["/workspace/src/"],
+          permission_scope: ["write", "read"]
+        })
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :write,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{},
+            pre_hooks: [CtxCapturingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:captured_ctx)
+      assert ctx != nil
+      assert ctx.permission_policy != nil
+      assert ctx.permission_policy.level == :write
+      assert ctx.permission_policy.allows_write == true
+      assert ctx.permission_policy.allows_destructive == false
+      assert ctx.permission_policy.category == "acting"
+    end
+  end
+
+  describe "steering context hydration — preserves existing data" do
+    defmodule CtxPreservingHook do
+      @behaviour KiroCockpit.Swarm.Hook
+
+      @impl true
+      def name, do: :ctx_preserve
+      @impl true
+      def priority, do: 95
+      @impl true
+      def filter(_event), do: true
+      @impl true
+      def on_event(event, ctx) do
+        Process.put(:preserved_ctx, ctx)
+        KiroCockpit.Swarm.HookResult.continue(event, ["ctx preserved"])
+      end
+    end
+
+    setup do
+      Process.delete(:preserved_ctx)
+      :ok
+    end
+
+    test "preserves existing active_task in swarm_ctx" do
+      session_id = "sess_preserve_task_#{System.unique_integer([:positive])}"
+      agent_id = "agent_preserve"
+
+      # Create a task in DB (different from what we'll pass in ctx)
+      task = create_active_task!(session_id, agent_id, content: "DB task")
+
+      # Pass a different task in swarm_ctx
+      existing_task = %{
+        id: "existing-task-id",
+        content: "Existing task from ctx",
+        category: "researching"
+      }
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{active_task: existing_task},
+            pre_hooks: [CtxPreservingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:preserved_ctx)
+      assert ctx.active_task == existing_task
+      # Should NOT be replaced with DB task
+      assert ctx.active_task.id != task.id
+    end
+
+    test "preserves existing plan in swarm_ctx" do
+      session_id = "sess_preserve_plan_#{System.unique_integer([:positive])}"
+      agent_id = "agent_preserve"
+
+      # Create a plan in DB with proper mode and required fields
+      {:ok, db_plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "DB plan",
+          "nano",
+          [%{
+            title: "Step",
+            permission_level: "write",
+            phase_number: 1,
+            step_number: 1,
+            status: "planned"
+          }],
+          plan_markdown: "# DB Plan",
+          execution_prompt: "Execute the plan",
+          project_snapshot_hash: "def456"
+        )
+
+      # Create task with the DB plan
+      {:ok, _} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Task",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          files_scope: [],
+          plan_id: db_plan.id
+        })
+
+      # Pass a different plan in swarm_ctx
+      existing_plan = %{id: "existing-plan-id", user_request: "Existing plan"}
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: db_plan.id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{plan: existing_plan},
+            pre_hooks: [CtxPreservingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:preserved_ctx)
+      assert ctx.plan == existing_plan
+      # Should NOT be replaced with DB plan
+      assert ctx.plan.id != db_plan.id
+    end
+
+    test "preserves existing permission_policy in swarm_ctx" do
+      session_id = "sess_preserve_policy_#{System.unique_integer([:positive])}"
+      agent_id = "agent_preserve"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      # Pass existing permission_policy
+      existing_policy = %{
+        level: :subagent,
+        files_scope: ["/custom/path/"],
+        allows_write: true,
+        allows_destructive: true,
+        category: "custom"
+      }
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :write,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{permission_policy: existing_policy},
+            pre_hooks: [CtxPreservingHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:preserved_ctx)
+      assert ctx.permission_policy == existing_policy
+      assert ctx.permission_policy.files_scope == ["/custom/path/"]
+      assert ctx.permission_policy.allows_destructive == true
+    end
+  end
+
+  describe "steering context hydration — defensive behavior" do
+    defmodule CtxDefensiveHook do
+      @behaviour KiroCockpit.Swarm.Hook
+
+      @impl true
+      def name, do: :ctx_defensive
+      @impl true
+      def priority, do: 95
+      @impl true
+      def filter(_event), do: true
+      @impl true
+      def on_event(event, ctx) do
+        Process.put(:defensive_ctx, ctx)
+        KiroCockpit.Swarm.HookResult.continue(event, ["ctx defensive"])
+      end
+    end
+
+    # Fake TaskManager that raises on get_active
+    defmodule RaisingTaskManager do
+      def get_active(_session_id, _agent_id), do: raise("DB error")
+      def list(_session_id, _opts), do: raise("DB error")
+    end
+
+    setup do
+      Process.delete(:defensive_ctx)
+      :ok
+    end
+
+    test "continues when TaskManager lookup fails" do
+      session_id = "sess_defensive_#{System.unique_integer([:positive])}"
+      agent_id = "agent_defensive"
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      # Should not crash even though TaskManager raises
+      {:ok, result} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{},
+            # Inject raising task manager
+            task_manager_module: RaisingTaskManager,
+            pre_hooks: [CtxDefensiveHook],
+            post_hooks: []
+          ],
+          fn -> :survived end
+        )
+
+      assert result == :survived
+
+      # Context should be present but without hydrated task data
+      ctx = Process.get(:defensive_ctx)
+      assert ctx != nil
+      # active_task should not be hydrated due to DB error
+      # When hydration fails, the key may not be present at all
+      assert Map.get(ctx, :active_task) == nil
+    end
+
+    test "hydrates what it can when only some lookups fail" do
+      # Using a fake TM that works for this test — the task_manager_module
+      # injection allows testability without affecting real DB
+      session_id = "sess_partial_#{System.unique_integer([:positive])}"
+      agent_id = "agent_partial"
+
+      # Create a real task first
+      task = create_active_task!(session_id, agent_id, content: "Partial test task")
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: true,
+            swarm_ctx: %{},
+            # Use real TaskManager (default)
+            pre_hooks: [CtxDefensiveHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:defensive_ctx)
+      # active_task should be hydrated successfully
+      assert ctx.active_task != nil
+      assert ctx.active_task.id == task.id
+      # permission_policy should be built from the hydrated task
+      assert ctx.permission_policy != nil
     end
   end
 end

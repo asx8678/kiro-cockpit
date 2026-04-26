@@ -12,11 +12,12 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
 
     1. Build or hydrate the Event with correlation from active task when possible
     2. Compute trusted stale context if plan_id + project_dir are available
-    3. Run HookManager.run(event, pre_hooks, ctx, :pre)
-    4. If blocked → return `{:error, {:swarm_blocked, reason, messages}}`
-    5. If allowed → execute the zero-arity fun
-    6. Run HookManager.run(event, post_hooks, ctx, :post) for Bronze post trace
-    7. Return executor result (post block does not undo execution)
+    3. Hydrate steering context (active_task, plan, history) when swarm_ctx is empty
+    4. Run HookManager.run(event, pre_hooks, ctx, :pre)
+    5. If blocked → return `{:error, {:swarm_blocked, reason, messages}}`
+    6. If allowed → execute the zero-arity fun
+    7. Run HookManager.run(event, post_hooks, ctx, :post) for Bronze post trace
+    8. Return executor result (post block does not undo execution)
 
   ## Configuration
 
@@ -28,6 +29,21 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   HookManager persists hook_trace rows on every run (mandatory §27.11 inv. 7).
   Blocked attempts also persist a full trace — the boundary never silently
   drops a blocked event.
+
+  ## Steering context hydration
+
+  When `swarm_ctx` lacks steering-critical keys (`:active_task`, `:plan`,
+  `:task_history`, `:completed_tasks`), the boundary hydrates these from
+  the canonical database:
+
+    - `:active_task` — looked up via `TaskManager.get_active/2`
+    - `:plan` — loaded via `KiroCockpit.Plans.get_plan/1` when `plan_id` is available
+    - `:task_history` / `:completed_tasks` — loaded from task manager
+    - `:permission_policy` — built from task scope and permission level
+
+  This ensures `SteeringPreActionHook` and `SteeringAgent` always receive
+  full context for LLM-backed steering decisions, even when callers don't
+  provide `swarm_ctx`.
   """
 
   alias KiroCockpit.NanoPlanner.Staleness
@@ -103,11 +119,11 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     # Build event, hydrating correlation from active task when possible
     event = build_event(action, opts, tm)
 
-    # Build trusted context: merge caller ctx + stale plan context.
+    # Build trusted context: merge caller ctx + stale plan context + steering context.
     # Use event.plan_id (which may be hydrated from active task) rather than
     # only opts[:plan_id] so that stale context computation works when the
     # active task carries a plan_id but the caller didn't supply one.
-    ctx = build_ctx(opts, event, staleness_mod)
+    ctx = build_ctx(opts, event, staleness_mod, tm)
 
     pre_hooks = Keyword.get(opts, :pre_hooks, @default_pre_hooks)
     post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
@@ -187,7 +203,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     _ -> nil
   end
 
-  defp build_ctx(opts, event, staleness_mod) do
+  defp build_ctx(opts, event, staleness_mod, tm) do
     base_ctx = Keyword.get(opts, :swarm_ctx, %{})
     plan_mode = Keyword.get(opts, :plan_mode)
 
@@ -234,6 +250,9 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
         end
       end)
 
+    # Hydrate steering context when empty/incomplete (kiro-oai steering-context-hydration)
+    ctx = maybe_hydrate_steering_context(ctx, opts, event, tm)
+
     ctx
   end
 
@@ -256,6 +275,133 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     # Plan lookup/snapshot checks may fail (e.g. DB down); don't crash the
     # runtime. Surface a trusted fail-closed stale context to hooks.
     _ -> Map.merge(ctx, %{stale_plan?: true, reason: :stale_plan_unknown})
+  end
+
+  # -------------------------------------------------------------------
+  # Steering context hydration (kiro-oai steering-context-hydration)
+  # -------------------------------------------------------------------
+
+  # Hydrates steering-critical context keys when swarm_ctx is empty or incomplete.
+  # This ensures SteeringPreActionHook and SteeringAgent receive full context
+  # for LLM-backed steering decisions.
+  #
+  # Keys hydrated:
+  #   - :active_task — from TaskManager.get_active/2 (if not in ctx)
+  #   - :plan — from KiroCockpit.Plans.get_plan/1 when plan_id available (if not in ctx)
+  #   - :task_history — list of recent tasks for the session (if not in ctx)
+  #   - :completed_tasks — list of completed tasks for scope summary (if not in ctx)
+  #   - :permission_policy — built from task scope and permission level (if not in ctx)
+  #
+  # All DB lookups are defensive — failures are rescued and the boundary continues.
+  defp maybe_hydrate_steering_context(ctx, opts, event, tm) do
+    ctx
+    |> maybe_hydrate_active_task(opts, event, tm)
+    |> maybe_hydrate_plan(opts, event)
+    |> maybe_hydrate_task_history(opts, event, tm)
+    |> maybe_hydrate_completed_tasks(opts, event, tm)
+    |> maybe_hydrate_permission_policy(opts, event)
+  end
+
+  # Hydrate :active_task from TaskManager if not already in ctx
+  defp maybe_hydrate_active_task(ctx, _opts, event, tm) do
+    if Map.has_key?(ctx, :active_task) do
+      ctx
+    else
+      case safe_get_active(tm, event.session_id, event.agent_id) do
+        nil -> ctx
+        task -> Map.put(ctx, :active_task, task)
+      end
+    end
+  end
+
+  # Hydrate :plan from Plans.get_plan/1 if plan_id is available and not in ctx
+  defp maybe_hydrate_plan(ctx, _opts, event) do
+    if Map.has_key?(ctx, :plan) do
+      ctx
+    else
+      case event.plan_id do
+        nil ->
+          ctx
+
+        plan_id ->
+          case safe_get_plan(plan_id) do
+            nil -> ctx
+            plan -> Map.put(ctx, :plan, plan)
+          end
+      end
+    end
+  end
+
+  # Hydrate :task_history — recent tasks for the session (for steering context)
+  defp maybe_hydrate_task_history(ctx, _opts, event, tm) do
+    if Map.has_key?(ctx, :task_history) do
+      ctx
+    else
+      case safe_list_tasks(tm, event.session_id, limit: 10) do
+        nil -> ctx
+        tasks -> Map.put(ctx, :task_history, tasks)
+      end
+    end
+  end
+
+  # Hydrate :completed_tasks — completed tasks for scope/permission summaries
+  defp maybe_hydrate_completed_tasks(ctx, _opts, event, tm) do
+    if Map.has_key?(ctx, :completed_tasks) do
+      ctx
+    else
+      case safe_list_tasks(tm, event.session_id, status: "completed", limit: 5) do
+        nil -> ctx
+        tasks -> Map.put(ctx, :completed_tasks, tasks)
+      end
+    end
+  end
+
+  # Hydrate :permission_policy — permission/scope summary from active task and level
+  defp maybe_hydrate_permission_policy(ctx, opts, _event) do
+    if Map.has_key?(ctx, :permission_policy) do
+      ctx
+    else
+      permission_level = Keyword.get(opts, :permission_level)
+      active_task = Map.get(ctx, :active_task)
+
+      policy = build_permission_policy(permission_level, active_task)
+      Map.put(ctx, :permission_policy, policy)
+    end
+  end
+
+  # Build permission policy map from permission level and active task scope
+  defp build_permission_policy(permission_level, active_task) when is_map(active_task) do
+    %{
+      level: permission_level,
+      files_scope: Map.get(active_task, :files_scope, []),
+      category: Map.get(active_task, :category, "unknown"),
+      allows_write: permission_level in [:write, :destructive, :subagent],
+      allows_destructive: permission_level in [:destructive, :subagent]
+    }
+  end
+
+  defp build_permission_policy(permission_level, _active_task) do
+    %{
+      level: permission_level,
+      files_scope: [],
+      category: "unknown",
+      allows_write: permission_level in [:write, :destructive, :subagent],
+      allows_destructive: permission_level in [:destructive, :subagent]
+    }
+  end
+
+  # Safe wrapper for Plans.get_plan/1 — returns nil on any failure
+  defp safe_get_plan(plan_id) do
+    KiroCockpit.Plans.get_plan(plan_id)
+  rescue
+    _ -> nil
+  end
+
+  # Safe wrapper for TaskManager.list/2 — returns nil on any failure
+  defp safe_list_tasks(tm, session_id, list_opts) do
+    tm.list(session_id, list_opts)
+  rescue
+    _ -> nil
   end
 
   @doc """
@@ -291,7 +437,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       staleness_mod = Keyword.get(opts, :staleness_module, Staleness)
 
       event = build_event(action, opts, tm)
-      ctx = build_ctx(opts, event, staleness_mod)
+      ctx = build_ctx(opts, event, staleness_mod, tm)
       post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
 
       _ = hm.run(event, post_hooks, ctx, :post)
