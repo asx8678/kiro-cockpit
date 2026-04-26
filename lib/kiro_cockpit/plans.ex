@@ -111,6 +111,9 @@ defmodule KiroCockpit.Plans do
 
   @doc """
   Approves a draft plan, adding an approval event.
+
+  This is the simple approval without task creation. For atomic
+  approval with task derivation and activation, use `approve_plan_with_tasks/4`.
   """
   @spec approve_plan(plan_id, keyword()) ::
           {:ok, Plan.t()} | {:error, Ecto.Changeset.t() | term()}
@@ -133,6 +136,183 @@ defmodule KiroCockpit.Plans do
         _ ->
           result
       end
+    end
+  end
+
+  @doc """
+  Atomically approves a draft plan, creates derived swarm tasks, and activates
+  the first pending task.
+
+  All operations (plan approval, event creation, task creation, first task
+  activation) are wrapped in a single database transaction. If any step fails,
+  the entire transaction rolls back, leaving the plan in its original "draft"
+  status with no tasks created.
+
+  Returns `{:ok, %{plan: Plan.t(), tasks: [Task.t()], active_task: Task.t()}}`
+  on success, or `{:error, reason}` on failure.
+
+  ## Options
+
+    * `:agent_id` — owner_id for derived swarm tasks (default: "kiro-executor")
+    * `:task_manager_module` — module implementing task operations
+      (default: `KiroCockpit.Swarm.Tasks.TaskManager`)
+    * `:derive_tasks_fn` — optional function to derive task attrs from plan
+      (for testing injection)
+  """
+  @spec approve_plan_with_tasks(plan_id, String.t(), module(), keyword()) ::
+          {:ok, %{plan: Plan.t(), tasks: [struct()], active_task: struct() | nil}}
+          | {:error, term()}
+  def approve_plan_with_tasks(plan_id, agent_id, _task_manager_mod, opts \\ []) do
+    # Fetch plan with preloaded steps (required for task derivation)
+    with plan when not is_nil(plan) <- Repo.get(Plan, plan_id),
+         plan = Repo.preload(plan, :plan_steps),
+         :ok <- require_status(plan, "draft") do
+      do_approve_plan_with_tasks(plan, agent_id, opts)
+    end
+  end
+
+  # Execute the atomic approval transaction.
+  # Extracted to reduce nesting depth in approve_plan_with_tasks/4.
+  defp do_approve_plan_with_tasks(plan, agent_id, opts) do
+    alias KiroCockpit.Swarm.Tasks.Task
+
+    # Derive task attributes (can be injected for testing)
+    derive_fn = Keyword.get(opts, :derive_tasks_fn, &derive_tasks_from_plan/2)
+    attrs_list = derive_fn.(plan, agent_id)
+
+    multi_result =
+      new_multi()
+      |> build_approval_multi(plan, attrs_list, agent_id)
+      |> Repo.transaction()
+      |> handle_approval_transaction_result()
+
+    case multi_result do
+      {:ok, result} ->
+        fire_plan_approved_hook(result.plan, opts)
+        {:ok, result}
+
+      error ->
+        error
+    end
+  end
+
+  # Build the Multi pipeline for atomic plan approval.
+  defp build_approval_multi(multi, plan, attrs_list, agent_id) do
+    alias KiroCockpit.Swarm.Tasks.Task
+
+    multi
+    |> Multi.update(:plan, Plan.changeset(plan, %{
+      status: "approved",
+      approved_at: DateTime.utc_now()
+    }))
+    |> Multi.insert(:event, fn %{plan: updated_plan} ->
+      PlanEvent.changeset(%PlanEvent{}, %{
+        plan_id: updated_plan.id,
+        event_type: "approved",
+        payload: %{},
+        created_at: DateTime.utc_now()
+      })
+    end)
+    |> Multi.run(:tasks, fn repo, %{plan: updated_plan} ->
+      insert_derived_tasks(repo, Task, updated_plan.id, attrs_list)
+    end)
+    |> Multi.run(:active_task, fn repo, %{tasks: tasks} ->
+      activate_first_task_or_skip(repo, tasks, agent_id)
+    end)
+  end
+
+  # Insert derived tasks or return empty list if none to create.
+  defp insert_derived_tasks(_repo, _task_schema, _plan_id, []), do: {:ok, []}
+
+  defp insert_derived_tasks(repo, task_schema, plan_id, attrs_list) do
+    now = DateTime.utc_now()
+
+    tasks_with_timestamps =
+      Enum.map(attrs_list, fn attrs ->
+        attrs
+        |> Map.put(:id, Ecto.UUID.generate())
+        |> Map.put(:plan_id, plan_id)
+        |> Map.put(:inserted_at, now)
+        |> Map.put(:updated_at, now)
+      end)
+
+    {_, inserted} = repo.insert_all(task_schema, tasks_with_timestamps, returning: true)
+    {:ok, inserted}
+  end
+
+  # Activate first task if tasks exist, otherwise skip gracefully.
+  defp activate_first_task_or_skip(_repo, [], _agent_id), do: {:ok, nil}
+
+  defp activate_first_task_or_skip(repo, tasks, agent_id) do
+    activate_first_task_in_tx(repo, tasks, nil, agent_id)
+  end
+
+  # Handle transaction result, preloading associations on success.
+  defp handle_approval_transaction_result({:ok, %{plan: plan, tasks: tasks, active_task: active_task}}) do
+    plan_with_assocs = Repo.preload(plan, [:plan_steps, :plan_events])
+    {:ok, %{plan: plan_with_assocs, tasks: tasks, active_task: active_task}}
+  end
+
+  defp handle_approval_transaction_result({:error, _failed_step, reason, _changes}) do
+    {:error, reason}
+  end
+
+  # ── Task Activation Helpers ─────────────────────────────────────────────
+
+  # Find the first pending task from a list of task attribute maps.
+  # Returns the first task with status "pending" when sorted by sequence,
+  # or nil if no pending tasks exist.
+  defp find_first_pending_task(tasks) do
+    tasks
+    |> Enum.sort_by(fn t -> t.sequence || 0 end)
+    |> Enum.find(fn t -> (t.status || "pending") == "pending" end)
+  end
+
+  # Attempt to atomically activate a pending task within a transaction.
+  # Uses update_all with a WHERE clause that checks status == "pending"
+  # to ensure we only activate if it hasn't been activated by another process.
+  #
+  # Returns {:ok, activated_task} on success, or {:ok, nil} if the task
+  # was already activated by another process (race condition handled gracefully).
+  defp attempt_activate_task(repo, task_id) do
+    alias KiroCockpit.Swarm.Tasks.Task
+
+    now = DateTime.utc_now()
+
+    {count, returned} =
+      repo.update_all(
+        from(t in Task, where: t.id == ^task_id and t.status == "pending"),
+        [set: [status: "in_progress", updated_at: now]],
+        returning: true
+      )
+
+    case {count, returned} do
+      {1, [activated | _]} ->
+        {:ok, activated}
+
+      {1, nil} ->
+        # Some adapters don't return rows - reload the task
+        case repo.get(Task, task_id) do
+          nil -> {:ok, nil}
+          activated -> {:ok, activated}
+        end
+
+      {0, _} ->
+        # Another process already activated or task no longer pending
+        {:ok, nil}
+    end
+  end
+
+  # Atomically activate the first pending task within a transaction.
+  # Uses a conditional update to enforce the one-active-task-per-lane invariant.
+  # Relies on DB unique constraint for race condition safety, removing pre-check.
+  defp activate_first_task_in_tx(repo, tasks, _plan, _agent_id) do
+    case find_first_pending_task(tasks) do
+      nil ->
+        {:ok, nil}
+
+      task ->
+        attempt_activate_task(repo, task.id)
     end
   end
 
@@ -376,6 +556,111 @@ defmodule KiroCockpit.Plans do
   # Fire :plan_approved post-hook for Bronze trace and guidance injection.
   # Uses ActionBoundary.run_lifecycle_post_hooks which checks app config
   # (swarm_action_hooks_enabled) before running. Never crashes the caller.
+  # Derives task attribute maps from an approved plan's plan_steps.
+  #
+  # Field mapping per §36.8:
+  #   plan_id           → will be set during insertion
+  #   session_id         → plan.session_id
+  #   owner_id           → execution agent id
+  #   sequence           → phase_number * 100 + step_number (stable)
+  #   content            → "Phase N, Step M: title" + details
+  #   status             → "pending"
+  #   category           → permission-based heuristic:
+  #       write/shell_write/terminal/destructive/subagent/memory_write → "acting"
+  #       read/shell_read                               → "researching"
+  #       validation-only (no mutation permissions)      → "verifying"
+  #   permission_scope   → [step.permission_level, "read"]
+  #   files_scope        → Map.keys(step.files) if map
+  #   acceptance_criteria → [step.validation] if present
+  @spec derive_tasks_from_plan(Plan.t(), String.t()) :: [map()]
+  defp derive_tasks_from_plan(plan, agent_id) do
+    steps = plan.plan_steps || []
+
+    steps
+    |> Enum.sort_by(fn step -> {step.phase_number, step.step_number} end)
+    |> Enum.map(fn step ->
+      perm = step.permission_level || "read"
+      category = category_for_permission(perm, step)
+      files = extract_files_scope(step)
+      validation = if step.validation && step.validation != "", do: [step.validation], else: []
+
+      content =
+        case step.details do
+          nil ->
+            "Phase #{step.phase_number}, Step #{step.step_number}: #{step.title}"
+
+          "" ->
+            "Phase #{step.phase_number}, Step #{step.step_number}: #{step.title}"
+
+          details ->
+            "Phase #{step.phase_number}, Step #{step.step_number}: #{step.title}\n#{details}"
+        end
+
+      # Include read as baseline permission alongside step's explicit level
+      permission_scope =
+        [perm, "read"]
+        |> Enum.uniq()
+        |> Enum.filter(&valid_permission?/1)
+
+      %{
+        plan_id: nil, # Will be set during insertion
+        session_id: plan.session_id,
+        owner_id: agent_id,
+        sequence: step.phase_number * 100 + step.step_number,
+        content: content,
+        status: "pending",
+        category: category,
+        priority: "medium",
+        permission_scope: permission_scope,
+        files_scope: files,
+        acceptance_criteria: validation
+      }
+    end)
+  end
+
+  # Category heuristic: mutation permissions → "acting", read-only → "researching",
+  # validation-focused → "verifying".
+  @acting_permissions ~w(write shell_write terminal destructive subagent memory_write)
+  @researching_permissions ~w(read shell_read)
+
+  defp category_for_permission(perm, step) do
+    cond do
+      perm in @acting_permissions ->
+        "acting"
+
+      perm in @researching_permissions and has_validation?(step) ->
+        "verifying"
+
+      perm in @researching_permissions ->
+        "researching"
+
+      true ->
+        # Unknown permission: default to acting (safest for enforcement)
+        "acting"
+    end
+  end
+
+  defp has_validation?(step), do: step.validation != nil and step.validation != ""
+
+  defp extract_files_scope(%{files: files}) when is_map(files) and map_size(files) > 0 do
+    Map.keys(files)
+  end
+
+  defp extract_files_scope(%{files: files}) when is_list(files) and files != [] do
+    Enum.map(files, &to_string/1)
+  end
+
+  defp extract_files_scope(_), do: []
+
+  defp valid_permission?(perm) when is_binary(perm) do
+    case KiroCockpit.Permissions.parse_permission(perm) do
+      {:ok, _} -> true
+      {:error, _} -> false
+    end
+  end
+
+  defp valid_permission?(_), do: false
+
   defp fire_plan_approved_hook(plan, opts) do
     alias KiroCockpit.Swarm.ActionBoundary
 

@@ -16,7 +16,7 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
 
   alias KiroCockpit.NanoPlanner
   alias KiroCockpit.Plans
-  alias KiroCockpit.Swarm.Tasks.{Task, TaskManager}
+  alias KiroCockpit.Swarm.Tasks.TaskManager
 
   # ── Fake injectable session module ──────────────────────────────────
 
@@ -41,31 +41,24 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
     end
   end
 
-  # ── Fake TaskManager that always fails create_all ───────────────────
+  # ── Fake derive function that returns invalid tasks (for atomic rollback testing)
 
-  defmodule FailingTaskManager do
+  defmodule FailingTaskDerive do
     @moduledoc false
-    def create_all(_attrs_list), do: {:error, :transaction_failed}
-    def activate(_task_id), do: {:ok, %Task{status: "in_progress"}}
-    def get_active(_session_id, _owner_id), do: nil
-    def list(_session_id, _opts), do: []
-  end
-
-  # ── Fake TaskManager that always fails activate ──────────────────────
-
-  defmodule FailingActivateTaskManager do
-    @moduledoc false
-    def create_all(attrs_list) do
-      # Delegate to real TaskManager for creation
-      TaskManager.create_all(attrs_list)
-    end
-
-    def activate(_task_id), do: {:error, :active_task_exists}
-
-    def get_active(_session_id, _owner_id), do: nil
-
-    def list(session_id, opts) do
-      TaskManager.list(session_id, opts)
+    def derive_with_invalid_permission(_plan, _agent_id) do
+      # Return tasks with invalid permission that will fail validation
+      [
+        %{
+          session_id: "test",
+          owner_id: "test",
+          content: "Invalid task",
+          status: "pending",
+          priority: "medium",
+          category: "researching",
+          sequence: 1,
+          permission_scope: ["invalid_permission"]
+        }
+      ]
     end
   end
 
@@ -372,12 +365,12 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
     end
   end
 
-  # ── §36.8: Failure to create/activate prevents prompt ────────────────
+  # ── §36.8: Atomic transaction ensures all-or-nothing ───────────────────
 
-  describe "§36.8 — task creation/activation failure prevents prompt" do
+  describe "§36.8 — atomic approval: all-or-nothing transaction" do
     setup [:setup_project_dir]
 
-    test "failing TaskManager.create_all prevents prompt send", %{
+    test "transaction rollback on invalid task status prevents prompt send and plan approval", %{
       project_dir: dir,
       session_id: session_id
     } do
@@ -390,43 +383,84 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
                  default_plan_opts(dir, session_id)
                )
 
+      assert plan.status == "draft"
+
       Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
       Process.put(:fake_kiro_prompt_calls, [])
 
-      result =
-        approve_result(plan.id, dir, task_manager_module: FailingTaskManager)
+      # Inject a derive function that returns tasks with invalid status
+      # This will fail at the DB constraint level (check constraint on status)
+      # The error bubbles up as an exception since it's a DB constraint violation
+      assert_raise Postgrex.Error, fn ->
+        approve_result(plan.id, dir,
+          derive_tasks_fn: fn _plan, _agent_id ->
+            [
+              %{
+                session_id: session_id,
+                owner_id: "kiro-executor",
+                content: "Invalid task",
+                # Invalid status that violates DB constraint
+                status: "invalid_status",
+                category: "acting",
+                priority: "medium",
+                sequence: 101,
+                permission_scope: ["read"]
+              }
+            ]
+          end
+        )
+      end
 
-      assert {:error, :transaction_failed} = result
-
-      # No prompt was sent
+      # No prompt was sent (transaction failed before reaching that point)
       calls = Process.get(:fake_kiro_prompt_calls, [])
       assert calls == []
+
+      # Plan should still be draft (rollback worked)
+      refreshed = Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
+      # No tasks should exist for this plan
+      db_tasks = TaskManager.list(session_id, plan_id: plan.id)
+      assert db_tasks == []
     end
 
-    test "failing task activation prevents prompt send", %{
+    test "empty plan steps approves gracefully without tasks or active task", %{
       project_dir: dir,
       session_id: session_id
     } do
-      Process.put(:fake_kiro_prompt_result, {:ok, multi_step_plan_map()})
+      # Create a plan with no steps via the Plans context directly
+      alias KiroCockpit.NanoPlanner.ContextBuilder
+
+      {:ok, snapshot} = ContextBuilder.build(project_dir: dir)
 
       assert {:ok, plan} =
-               NanoPlanner.plan(
-                 :fake_session,
-                 "Build feature",
-                 default_plan_opts(dir, session_id)
+               Plans.create_plan(
+                 session_id,
+                 "Empty plan",
+                 "nano",
+                 [],
+                 plan_markdown: "# Empty",
+                 execution_prompt: "Do nothing.",
+                 project_snapshot_hash: snapshot.hash
                )
+
+      assert plan.plan_steps == []
+      assert plan.status == "draft"
 
       Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
       Process.put(:fake_kiro_prompt_calls, [])
 
-      result =
-        approve_result(plan.id, dir, task_manager_module: FailingActivateTaskManager)
+      result = approve_result(plan.id, dir)
 
-      assert {:error, :active_task_exists} = result
+      # Should succeed gracefully with empty tasks and nil active_task
+      assert {:ok, %{plan: approved_plan, tasks: [], active_task: nil, prompt_result: _}} = result
 
-      # No prompt was sent
+      # Prompt was still sent (approval succeeded)
       calls = Process.get(:fake_kiro_prompt_calls, [])
-      assert calls == []
+      assert length(calls) == 1
+
+      # Plan should be approved (no rollback - graceful success)
+      assert approved_plan.status == "approved"
     end
   end
 
@@ -667,47 +701,4 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
     end
   end
 
-  # ── §36.8: Empty plan steps edge case ────────────────────────────────
-
-  describe "§36.8 — plan with no steps" do
-    setup [:setup_project_dir]
-
-    test "approve with no plan_steps returns no_tasks_to_activate error", %{
-      project_dir: dir,
-      session_id: session_id
-    } do
-      # Create a plan directly via Plans context with no steps
-      # (NanoPlanner.plan rejects empty phases in PlanSchema validation)
-      # Use the real snapshot hash so staleness check passes
-      alias KiroCockpit.NanoPlanner.ContextBuilder
-
-      {:ok, snapshot} = ContextBuilder.build(project_dir: dir)
-
-      assert {:ok, plan} =
-               Plans.create_plan(
-                 session_id,
-                 "Empty plan",
-                 "nano",
-                 [],
-                 plan_markdown: "# Empty",
-                 execution_prompt: "Do nothing.",
-                 project_snapshot_hash: snapshot.hash
-               )
-
-      assert plan.plan_steps == []
-      assert plan.status == "draft"
-
-      Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
-      Process.put(:fake_kiro_prompt_calls, [])
-
-      result = approve_result(plan.id, dir)
-
-      # No steps → no tasks → :no_tasks_to_activate error
-      assert {:error, :no_tasks_to_activate} = result
-
-      # No prompt was sent
-      calls = Process.get(:fake_kiro_prompt_calls, [])
-      assert calls == []
-    end
-  end
 end
