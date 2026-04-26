@@ -3,7 +3,17 @@ defmodule KiroCockpit.Swarm.HookTrace do
   Helper functions for hook tracing and normalization.
 
   Converts hook execution results into trace-card-friendly maps and
-  optionally persists hook trace summaries to Bronze swarm events.
+  persists hook trace summaries to Bronze swarm events.
+
+  ## Mandatory Bronze capture (kiro-f77)
+
+  Per §27.10 / §27.11 invariant 7, Bronze capture is **mandatory** for
+  every runtime hook execution, including blocked attempts.
+  `maybe_persist_trace/3` always attempts persistence regardless of
+  any opt-in flag. The function name is retained for API compatibility.
+
+  Persistence is crash-safe: errors during `Events.create_event/1` are
+  caught and emitted as telemetry metadata; the hook chain never crashes.
   """
 
   alias KiroCockpit.Swarm.{Event, HookResult}
@@ -56,42 +66,45 @@ defmodule KiroCockpit.Swarm.HookTrace do
   end
 
   @doc """
-  Persist hook trace summary to Bronze swarm events when requested.
+  Persist hook trace summary to Bronze swarm events (mandatory).
 
-  The `ctx` may contain `persist_hook_trace?: true`. If not, this is a no-op.
+  Per §27.11 invariant 7, this **always** attempts persistence for every
+  runtime hook execution — including blocked events. The old
+  `ctx[:persist_hook_trace?]` opt-in flag is ignored; it may still be
+  present in `ctx` for backwards compatibility but has no effect.
+
   Persistence errors are caught and emitted as telemetry metadata.
+  The hook chain never crashes due to persistence failures.
   """
   @spec maybe_persist_trace(Event.t(), map(), map()) :: :ok
   def maybe_persist_trace(event, trace_summary, ctx) do
-    if ctx[:persist_hook_trace?] do
-      try do
-        # Prepare attributes for Bronze event
-        attrs = %{
-          session_id: event.session_id,
-          plan_id: event.plan_id,
-          task_id: event.task_id,
-          agent_id: event.agent_id,
-          event_type: "hook_trace",
-          phase: to_string(ctx[:phase] || :lifecycle),
-          payload: %{},
-          raw_payload: %{},
-          hook_results: trace_summary
-        }
+    try do
+      attrs = %{
+        session_id: event.session_id,
+        plan_id: event.plan_id,
+        task_id: event.task_id,
+        agent_id: event.agent_id,
+        event_type: "hook_trace",
+        phase: to_string(ctx[:phase] || :lifecycle),
+        payload: safe_map(trace_summary["payload"]),
+        raw_payload: safe_map(trace_summary["raw_payload"]),
+        hook_results: trace_summary
+      }
 
-        case Events.create_event(attrs) do
-          {:ok, _} -> :ok
-          {:error, changeset} -> emit_persistence_error(changeset)
-        end
-      rescue
-        exception ->
-          emit_persistence_error(exception)
+      case Events.create_event(attrs) do
+        {:ok, _} -> :ok
+        {:error, changeset} -> emit_persistence_error(changeset)
       end
-    else
-      :ok
+    rescue
+      exception ->
+        emit_persistence_error(exception)
     end
   end
 
   # Internal helpers
+
+  defp safe_map(value) when is_map(value), do: value
+  defp safe_map(_), do: %{}
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

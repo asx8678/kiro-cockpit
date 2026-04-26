@@ -204,8 +204,44 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
       assert meta.span_id == trace_ctx.span_id
     end
 
-    test "HookTrace.maybe_persist_trace inserts Bronze event when ctx[:persist_hook_trace?] is true" do
-      session_id = "sess_#{System.unique_integer([:positive])}"
+    test "HookTrace.maybe_persist_trace inserts Bronze event without persist_hook_trace? opt-in (kiro-f77)" do
+      session_id = "sess_mandatory_#{System.unique_integer([:positive])}"
+      plan_id = Ecto.UUID.generate()
+      task_id = Ecto.UUID.generate()
+
+      event =
+        Event.new(:test_action,
+          session_id: session_id,
+          plan_id: plan_id,
+          task_id: task_id,
+          agent_id: "agent"
+        )
+
+      hook_results = [%{"hook" => "block_hook", "decision" => "block"}]
+      trace_summary = HookTrace.chain_summary(event, hook_results, :blocked, "blocked by test", 0)
+      # No persist_hook_trace? flag — mandatory Bronze capture ignores it
+      ctx = %{phase: :pre}
+
+      assert :ok = HookTrace.maybe_persist_trace(event, trace_summary, ctx)
+
+      events = Events.list_by_session(session_id, limit: 10)
+      assert length(events) == 1
+      bronze_event = List.first(events)
+      assert bronze_event.event_type == "hook_trace"
+      assert bronze_event.session_id == session_id
+      assert bronze_event.plan_id == plan_id
+      assert bronze_event.task_id == task_id
+      assert bronze_event.agent_id == "agent"
+      assert bronze_event.phase == "pre"
+      assert is_map(bronze_event.hook_results)
+      assert is_list(bronze_event.hook_results["hook_results"])
+      hook_result = List.first(bronze_event.hook_results["hook_results"])
+      assert hook_result["hook"] == "block_hook"
+      assert hook_result["decision"] == "block"
+    end
+
+    test "HookTrace.maybe_persist_trace still works when legacy persist_hook_trace? is true" do
+      session_id = "sess_legacy_#{System.unique_integer([:positive])}"
       plan_id = Ecto.UUID.generate()
       task_id = Ecto.UUID.generate()
 
@@ -221,26 +257,13 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
       trace_summary = HookTrace.chain_summary(event, hook_results, :blocked, "blocked by test", 0)
       ctx = %{persist_hook_trace?: true, phase: :pre}
 
-      # This should insert a Bronze event
       assert :ok = HookTrace.maybe_persist_trace(event, trace_summary, ctx)
 
-      # Verify a Bronze event was inserted
       events = Events.list_by_session(session_id, limit: 10)
       assert length(events) == 1
       bronze_event = List.first(events)
       assert bronze_event.event_type == "hook_trace"
       assert bronze_event.session_id == session_id
-      assert bronze_event.plan_id == plan_id
-      assert bronze_event.task_id == task_id
-      assert bronze_event.agent_id == "agent"
-      assert bronze_event.phase == "pre"
-      assert is_map(bronze_event.hook_results)
-      # hook_results column stores the trace summary map (which includes hook_results list)
-      assert is_map(bronze_event.hook_results)
-      assert is_list(bronze_event.hook_results["hook_results"])
-      hook_result = List.first(bronze_event.hook_results["hook_results"])
-      assert hook_result["hook"] == "block_hook"
-      assert hook_result["decision"] == "block"
     end
 
     test "HookTrace.chain_summary omits nil phase and includes explicit phase" do
@@ -279,19 +302,17 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
       event = Event.new(:test_action)
       trace_summary = HookTrace.chain_summary(event, [], :blocked, "missing correlation")
 
-      assert :ok =
-               HookTrace.maybe_persist_trace(event, trace_summary, %{
-                 persist_hook_trace?: true,
-                 phase: :pre
-               })
+      # No opt-in needed — mandatory persistence, but missing session_id/agent_id
+      # triggers validation error that must be caught
+      assert :ok = HookTrace.maybe_persist_trace(event, trace_summary, %{phase: :pre})
 
       assert_receive {:telemetry, ^persistence_exception, measurements, metadata}
       assert measurements.count == 1
       assert metadata == %{}
     end
 
-    test "HookManager.run persists hook trace when ctx[:persist_hook_trace?] is true" do
-      session_id = "sess_#{System.unique_integer([:positive])}"
+    test "HookManager.run persists hook trace without opt-in ctx (kiro-f77 mandatory)" do
+      session_id = "sess_run_mandatory_#{System.unique_integer([:positive])}"
       plan_id = Ecto.UUID.generate()
       task_id = Ecto.UUID.generate()
 
@@ -304,13 +325,12 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
         )
 
       hooks = [BlockHook]
-      ctx = %{persist_hook_trace?: true}
+      # Empty ctx — no persist_hook_trace? flag
+      ctx = %{}
 
-      # Run the hook chain; blocked event should trigger persistence
       assert {:blocked, _final_event, _reason, _messages} =
                HookManager.run(event, hooks, ctx, :pre)
 
-      # Verify a Bronze event was inserted
       events = Events.list_by_session(session_id, limit: 10)
       assert length(events) == 1
       bronze_event = List.first(events)
@@ -321,15 +341,41 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
       assert bronze_event.agent_id == "agent"
       assert bronze_event.phase == "pre"
       assert is_map(bronze_event.hook_results)
-      # The hook_results column contains the trace summary map
       assert is_list(bronze_event.hook_results["hook_results"])
       hook_result = List.first(bronze_event.hook_results["hook_results"])
       assert hook_result["hook"] == "block_hook"
       assert hook_result["decision"] == "block"
     end
 
-    test "Bronze capture records blocked events with correlation IDs and reason (§36.1)" do
-      session_id = "sess_bronze_s36_#{System.unique_integer([:positive])}"
+    test "HookManager.run persists continue outcome without opt-in" do
+      session_id = "sess_run_continue_#{System.unique_integer([:positive])}"
+      plan_id = Ecto.UUID.generate()
+      task_id = Ecto.UUID.generate()
+
+      event =
+        Event.new(:test_action,
+          session_id: session_id,
+          plan_id: plan_id,
+          task_id: task_id,
+          agent_id: "agent"
+        )
+
+      hooks = [ContinueHook]
+      ctx = %{}
+
+      assert {:ok, _final_event, _messages} =
+               HookManager.run(event, hooks, ctx, :pre)
+
+      events = Events.list_by_session(session_id, limit: 10)
+      assert length(events) == 1
+      bronze_event = List.first(events)
+      assert bronze_event.event_type == "hook_trace"
+      assert bronze_event.phase == "pre"
+      assert bronze_event.hook_results["outcome"] == "ok"
+    end
+
+    test "Blocked capture records reason, phase, session_id, plan_id, task_id, agent_id, hook_results (kiro-f77)" do
+      session_id = "sess_bronze_kf77_#{System.unique_integer([:positive])}"
       plan_id = Ecto.UUID.generate()
       task_id = Ecto.UUID.generate()
 
@@ -342,11 +388,11 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
         )
 
       hooks = [BlockHook]
-      ctx = %{persist_hook_trace?: true}
+      # No opt-in — mandatory capture per §27.11 inv. 7
+      ctx = %{}
 
       {:blocked, _event, reason, _messages} = HookManager.run(event, hooks, ctx, :pre)
 
-      # Bronze event captures the blocked action's full context
       [bronze] = Events.list_by_session(session_id, limit: 10)
       assert bronze.event_type == "hook_trace"
       assert bronze.session_id == session_id
@@ -354,12 +400,45 @@ defmodule KiroCockpit.Swarm.HookTracingTest do
       assert bronze.task_id == task_id
       assert bronze.agent_id == "bronze_agent"
       assert bronze.phase == "pre"
-      # The trace summary includes the block reason and hook_results
+      # Blocked reason and hook_results are fully captured
       assert bronze.hook_results["outcome"] == "blocked"
       assert bronze.hook_results["reason"] == reason
       assert is_list(bronze.hook_results["hook_results"])
       [hr] = bronze.hook_results["hook_results"]
+      assert hr["hook"] == "block_hook"
       assert hr["decision"] == "block"
+    end
+
+    test "HookManager.run persists without opt-in for continue outcome (§36.1)" do
+      session_id = "sess_bronze_continue_#{System.unique_integer([:positive])}"
+      plan_id = Ecto.UUID.generate()
+      task_id = Ecto.UUID.generate()
+
+      event =
+        Event.new(:file_read,
+          session_id: session_id,
+          plan_id: plan_id,
+          task_id: task_id,
+          agent_id: "reader_agent"
+        )
+
+      hooks = [ContinueHook]
+      ctx = %{}
+
+      {:ok, _event, _messages} = HookManager.run(event, hooks, ctx, :post)
+
+      [bronze] = Events.list_by_session(session_id, limit: 10)
+      assert bronze.event_type == "hook_trace"
+      assert bronze.session_id == session_id
+      assert bronze.plan_id == plan_id
+      assert bronze.task_id == task_id
+      assert bronze.agent_id == "reader_agent"
+      assert bronze.phase == "post"
+      assert bronze.hook_results["outcome"] == "ok"
+      assert is_list(bronze.hook_results["hook_results"])
+      [hr] = bronze.hook_results["hook_results"]
+      assert hr["hook"] == "continue_hook"
+      assert hr["decision"] == "continue"
     end
   end
 end
