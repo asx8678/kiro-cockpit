@@ -39,6 +39,17 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     :nano_plan_approve
   ]
 
+  # Control-plane executor dispatch actions. These represent approved
+  # execution prompt dispatch through KiroSession.prompt and must not
+  # be blocked by read-first task category/scope just because the task
+  # scope lacks :subagent. They still require an active task and
+  # approved plan, but bypass category permission checks for the
+  # dispatch itself. Subsequent callback/tool actions (fs_write, shell,
+  # etc.) remain fully gated by active task/category/scope.
+  @executor_dispatch_actions [
+    :kiro_session_prompt
+  ]
+
   @action_permissions %{
     file_read_requested: :read,
     read_file: :read,
@@ -57,7 +68,7 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     memory_promote: :memory_write,
     memory_write: :memory_write,
     # KiroSession prompt and callback action mappings (kiro-00j)
-    kiro_session_prompt: :subagent,
+    kiro_session_prompt: :executor_dispatch,
     fs_read_requested: :read,
     fs_write_requested: :write,
     nano_plan_run: :write,
@@ -194,36 +205,52 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     end
   end
 
-  # Check if the task's category allows the action
+  # Check if the task's category allows the action.
+  #
+  # Executor dispatch actions (:kiro_session_prompt) represent approved
+  # execution prompt dispatch through KiroSession.prompt. These are
+  # control-plane actions that must not be blocked by read-first task
+  # category/scope just because the task scope lacks :subagent. They
+  # still require an active task and approved plan, but bypass category
+  # permission checks for the dispatch itself. Subsequent callback/tool
+  # actions (fs_write, shell, etc.) remain fully gated.
   defp check_category_permission(event, ctx) do
     active_task = get_active_task(event)
 
     if active_task do
       permission = permission_for_event(event)
 
-      case TaskScope.permission_allowed?(
-             active_task,
-             permission,
-             approval_opts(event, ctx, active_task)
-           ) do
-        {:ok, :allowed} ->
-          :ok
+      # Executor dispatch is a control-plane action that bypasses
+      # category/scope checks when plan is approved and active task exists.
+      # This allows KiroSession.prompt to dispatch execution prompts even
+      # when the task category is "researching" and lacks :subagent scope.
+      if executor_dispatch_action?(event) and execution_prompt_dispatch_allowed?(ctx) do
+        :ok
+      else
+        case TaskScope.permission_allowed?(
+               active_task,
+               permission,
+               approval_opts(event, ctx, active_task)
+             ) do
+          {:ok, :allowed} ->
+            :ok
 
-        {:error, :category_denied} ->
-          category = active_task.category
-          guidance = "Category '#{category}' does not allow #{permission} actions."
-          {:blocked, "Category permission denied", guidance}
+          {:error, :category_denied} ->
+            category = active_task.category
+            guidance = "Category '#{category}' does not allow #{permission} actions."
+            {:blocked, "Category permission denied", guidance}
 
-        {:error, :scope_denied} ->
-          guidance = "Task permission scope does not allow #{permission} actions."
-          {:blocked, "Task scope permission denied", guidance}
+          {:error, :scope_denied} ->
+            guidance = "Task permission scope does not allow #{permission} actions."
+            {:blocked, "Task scope permission denied", guidance}
 
-        {:error, :needs_approval} ->
-          guidance =
-            "Category '#{active_task.category}' allows #{permission} with approval. " <>
-              "Request approval before proceeding."
+          {:error, :needs_approval} ->
+            guidance =
+              "Category '#{active_task.category}' allows #{permission} with approval. " <>
+                "Request approval before proceeding."
 
-          {:blocked, "Permission requires approval", guidance}
+            {:blocked, "Permission requires approval", guidance}
+        end
       end
     else
       :ok
@@ -351,5 +378,19 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
         _ -> []
       end
     end)
+  end
+
+  # Executor dispatch actions are control-plane actions for approved
+  # execution prompt dispatch through KiroSession.prompt.
+  defp executor_dispatch_action?(%Event{action_name: action}) do
+    action in @executor_dispatch_actions
+  end
+
+  # Execution prompt dispatch is allowed when:
+  #   1. Plan is approved (trusted ctx flag)
+  #   2. There is an active task for the plan (checked upstream)
+  # Never trust event payload/metadata for this decision.
+  defp execution_prompt_dispatch_allowed?(ctx) do
+    truthy?(trusted_lookup(ctx, :approved))
   end
 end
