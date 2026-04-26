@@ -576,4 +576,473 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
       assert KiroCockpit.Swarm.Hooks.TaskGuidanceHook in hooks
     end
   end
+
+  # -- kiro-4dk: Pre-hook modification threading tests -----------------------
+
+  describe "kiro-4dk: pre-hook modify threading" do
+    defmodule ModifyEventHook do
+      @behaviour KiroCockpit.Swarm.Hook
+
+      @impl true
+      def name, do: :modify_event
+      @impl true
+      def priority, do: 100
+      @impl true
+      def filter(_event), do: true
+      @impl true
+      def on_event(event, _ctx) do
+        # Modify the event by adding to metadata
+        modified_metadata = Map.put(event.metadata, :modified_by, :modify_event_hook)
+        modified_event = %{event | metadata: modified_metadata}
+        KiroCockpit.Swarm.HookResult.modify(modified_event, ["event modified"])
+      end
+    end
+
+    defmodule VerifyModifiedEventHook do
+      @behaviour KiroCockpit.Swarm.Hook
+
+      @impl true
+      def name, do: :verify_modified
+      @impl true
+      def priority, do: 50
+      @impl true
+      def filter(_event), do: true
+      @impl true
+      def on_event(event, _ctx) do
+        # Verify the event was modified by the previous hook
+        if event.metadata[:modified_by] == :modify_event_hook do
+          KiroCockpit.Swarm.HookResult.continue(event, ["verified: event was modified"])
+        else
+          KiroCockpit.Swarm.HookResult.block(event, "event not modified", [
+            "error: original event received"
+          ])
+        end
+      end
+    end
+
+    test "pre-hook modify changes event visible to a later post-hook" do
+      session_id = "sess_modify_thread_#{System.unique_integer([:positive])}"
+
+      # Track which event the post-hook received using an atom-based ETS table
+      :ets.new(:post_hook_event, [:set, :public, :named_table])
+
+      defmodule PostHookCapture do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :post_capture
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          # Store the event metadata for verification
+          if event.metadata[:modified_by] == :modify_event_hook do
+            :ets.insert(:post_hook_event, {:modified, true})
+          else
+            :ets.insert(:post_hook_event, {:modified, false})
+          end
+
+          KiroCockpit.Swarm.HookResult.continue(event)
+        end
+      end
+
+      {:ok, result} =
+        ActionBoundary.run(
+          :test_action,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "agent",
+            pre_hooks: [ModifyEventHook, VerifyModifiedEventHook],
+            post_hooks: [PostHookCapture]
+          ],
+          fn -> :success end
+        )
+
+      assert result == :success
+
+      # Verify the post-hook received the modified event
+      assert [modified: true] = :ets.lookup(:post_hook_event, :modified)
+
+      :ets.delete(:post_hook_event)
+    end
+
+    test "arity-1 executor receives modified event and messages in context" do
+      session_id = "sess_arity1_#{System.unique_integer([:positive])}"
+
+      # Hook that modifies the event and adds messages
+      defmodule ModifyWithGuidanceHook do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :modify_with_guidance
+        @impl true
+        def priority, do: 100
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          modified_metadata = Map.put(event.metadata, :guidance_applied, true)
+          modified_event = %{event | metadata: modified_metadata}
+
+          guidance_messages = [
+            "🧭 PlanMode: You are in plan mode (planning). Focus on read-only discovery.",
+            "⚡ Steering: slight drift detected - consider the main task."
+          ]
+
+          KiroCockpit.Swarm.HookResult.modify(modified_event, guidance_messages)
+        end
+      end
+
+      # Arity-1 executor that captures the context
+      captured_context = :ets.new(:captured_context, [:set, :public, :named_table])
+
+      executor_fn = fn ctx ->
+        :ets.insert(captured_context, {:ctx, ctx})
+
+        # Verify context structure
+        assert ctx.event != nil
+        assert is_list(ctx.messages)
+        assert is_list(ctx.hook_messages)
+        assert ctx.messages == ctx.hook_messages
+        assert length(ctx.messages) == 2
+        assert ctx.event.metadata[:guidance_applied] == true
+
+        # Verify hook messages are present
+        [msg1, msg2] = ctx.messages
+        assert msg1 =~ "PlanMode"
+        assert msg2 =~ "Steering"
+
+        :executor_completed
+      end
+
+      {:ok, result} =
+        ActionBoundary.run(
+          :test_action,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "agent",
+            pre_hooks: [ModifyWithGuidanceHook],
+            post_hooks: []
+          ],
+          executor_fn
+        )
+
+      assert result == :executor_completed
+
+      # Verify context was passed correctly
+      assert [{:ctx, ctx}] = :ets.lookup(captured_context, :ctx)
+      assert ctx.event.metadata[:guidance_applied] == true
+      assert length(ctx.messages) == 2
+
+      :ets.delete(captured_context)
+    end
+
+    test "arity-0 executor still works with modified event metadata" do
+      session_id = "sess_arity0_#{System.unique_integer([:positive])}"
+
+      # Hook that adds guidance messages
+      defmodule AddGuidanceHook do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :add_guidance
+        @impl true
+        def priority, do: 100
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          guidance = "🧭 PlanMode: Focus on the current task scope."
+          KiroCockpit.Swarm.HookResult.modify(event, [guidance])
+        end
+      end
+
+      # Post-hook to verify the modified event with guidance in metadata
+      defmodule VerifyGuidanceInMetadata do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :verify_guidance
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          # For arity-0, hook guidance should be merged into event metadata
+          hook_guidance = event.metadata[:hook_guidance]
+
+          if is_list(hook_guidance) and length(hook_guidance) > 0 and
+               hd(hook_guidance) =~ "PlanMode" do
+            KiroCockpit.Swarm.HookResult.continue(event, ["guidance found in metadata"])
+          else
+            KiroCockpit.Swarm.HookResult.block(event, "guidance not in metadata", [
+              "hook_guidance missing"
+            ])
+          end
+        end
+      end
+
+      {:ok, result} =
+        ActionBoundary.run(
+          :test_action,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "agent",
+            pre_hooks: [AddGuidanceHook],
+            post_hooks: [VerifyGuidanceInMetadata]
+          ],
+          fn -> :arity0_success end
+        )
+
+      assert result == :arity0_success
+    end
+
+    test "steering focus/guide messages are surfaced via ActionBoundary context" do
+      session_id = "sess_steering_#{System.unique_integer([:positive])}"
+
+      # Simulate a steering hook that returns focus/guide messages
+      defmodule SteeringFocusHook do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :steering_focus
+        @impl true
+        def priority, do: 94
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          focus_message =
+            "⚡ Steering: slight drift - action may be off-task. Suggested: refocus on main objective."
+
+          KiroCockpit.Swarm.HookResult.modify(
+            event,
+            [focus_message],
+            hook_metadata: %{steering_decision: :focus, steering_source: :deterministic}
+          )
+        end
+      end
+
+      defmodule SteeringGuideHook do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :steering_guide
+        @impl true
+        def priority, do: 93
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          guide_message =
+            "🧭 Steering: Consider related context from memory. [refs: context_abc, context_def]"
+
+          KiroCockpit.Swarm.HookResult.modify(
+            event,
+            [guide_message],
+            hook_metadata: %{steering_decision: :guide, steering_source: :llm}
+          )
+        end
+      end
+
+      captured_ctx = :ets.new(:captured_steering, [:set, :public, :named_table])
+
+      executor_fn = fn ctx ->
+        :ets.insert(captured_ctx, {:ctx, ctx})
+
+        # Verify both steering messages are present
+        assert length(ctx.messages) == 2
+
+        focus_msg = Enum.find(ctx.messages, fn m -> m =~ "⚡ Steering" end)
+        guide_msg = Enum.find(ctx.messages, fn m -> m =~ "🧭 Steering" end)
+
+        assert focus_msg != nil, "Focus message not found"
+        assert guide_msg != nil, "Guide message not found"
+        assert focus_msg =~ "slight drift"
+        assert guide_msg =~ "memory"
+
+        # Verify event has hook_guidance merged into metadata for arity-0 compatibility
+        hook_guidance = ctx.event.metadata[:hook_guidance]
+        assert is_list(hook_guidance)
+        assert length(hook_guidance) == 2
+
+        :steering_received
+      end
+
+      {:ok, result} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "agent",
+            permission_level: :subagent,
+            pre_hooks: [SteeringFocusHook, SteeringGuideHook],
+            post_hooks: []
+          ],
+          executor_fn
+        )
+
+      assert result == :steering_received
+
+      :ets.delete(captured_ctx)
+    end
+
+    test "PlanModeFirstActionHook messages are surfaced via ActionBoundary context" do
+      session_id = "sess_planmode_#{System.unique_integer([:positive])}"
+
+      # Simulate a PlanMode hook that returns first-action guidance
+      defmodule PlanModeFirstActionSimulated do
+        @behaviour KiroCockpit.Swarm.Hook
+
+        @impl true
+        def name, do: :plan_mode_first_action_simulated
+        @impl true
+        def priority, do: 96
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          guidance =
+            "You are in plan mode (planning). Focus on read-only discovery and planning output. Direct reads are allowed; shell commands and mutations are blocked until the plan is approved."
+
+          modified_metadata = Map.put(event.metadata, :first_action_shown, true)
+          modified_event = %{event | metadata: modified_metadata}
+
+          KiroCockpit.Swarm.HookResult.modify(
+            modified_event,
+            [guidance],
+            hook_metadata: %{first_action_shown: true}
+          )
+        end
+      end
+
+      captured_ctx = :ets.new(:captured_planmode, [:set, :public, :named_table])
+
+      executor_fn = fn ctx ->
+        :ets.insert(captured_ctx, {:ctx, ctx})
+
+        # Verify PlanMode guidance is present
+        assert length(ctx.messages) == 1
+        [msg] = ctx.messages
+
+        assert msg =~ "plan mode (planning)"
+        assert msg =~ "read-only discovery"
+        assert msg =~ "blocked until the plan is approved"
+
+        # Verify metadata flags
+        assert ctx.event.metadata[:first_action_shown] == true
+
+        # Verify hook_guidance merged for arity-0 compatibility
+        hook_guidance = ctx.event.metadata[:hook_guidance]
+        assert is_list(hook_guidance)
+        assert length(hook_guidance) == 1
+        assert hd(hook_guidance) =~ "plan mode"
+
+        :planmode_received
+      end
+
+      {:ok, result} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "agent",
+            permission_level: :subagent,
+            pre_hooks: [PlanModeFirstActionSimulated],
+            post_hooks: []
+          ],
+          executor_fn
+        )
+
+      assert result == :planmode_received
+
+      :ets.delete(captured_ctx)
+    end
+
+    test "multiple hook messages accumulate correctly" do
+      session_id = "sess_multi_msg_#{System.unique_integer([:positive])}"
+
+      defmodule MessageHook1 do
+        @behaviour KiroCockpit.Swarm.Hook
+        @impl true
+        def name, do: :msg_hook_1
+        @impl true
+        def priority, do: 100
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          KiroCockpit.Swarm.HookResult.modify(event, ["message 1"])
+        end
+      end
+
+      defmodule MessageHook2 do
+        @behaviour KiroCockpit.Swarm.Hook
+        @impl true
+        def name, do: :msg_hook_2
+        @impl true
+        def priority, do: 99
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          KiroCockpit.Swarm.HookResult.modify(event, ["message 2", "message 3"])
+        end
+      end
+
+      defmodule ContinueHookWithMsg do
+        @behaviour KiroCockpit.Swarm.Hook
+        @impl true
+        def name, do: :continue_msg
+        @impl true
+        def priority, do: 98
+        @impl true
+        def filter(_event), do: true
+        @impl true
+        def on_event(event, _ctx) do
+          KiroCockpit.Swarm.HookResult.continue(event, ["message 4"])
+        end
+      end
+
+      captured_ctx = :ets.new(:captured_multi, [:set, :public, :named_table])
+
+      executor_fn = fn ctx ->
+        :ets.insert(captured_ctx, {:messages, ctx.messages})
+
+        # All messages should accumulate: 1 + 2 + 3 + 4
+        assert length(ctx.messages) == 4
+        assert "message 1" in ctx.messages
+        assert "message 2" in ctx.messages
+        assert "message 3" in ctx.messages
+        assert "message 4" in ctx.messages
+
+        :all_messages_received
+      end
+
+      {:ok, result} =
+        ActionBoundary.run(
+          :test_action,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "agent",
+            pre_hooks: [MessageHook1, MessageHook2, ContinueHookWithMsg],
+            post_hooks: []
+          ],
+          executor_fn
+        )
+
+      assert result == :all_messages_received
+
+      :ets.delete(captured_ctx)
+    end
+  end
 end
