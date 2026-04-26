@@ -238,6 +238,56 @@ defmodule KiroCockpit.Swarm.HookManagerTest do
       assert final_event.payload == %{redacted: true}
     end
 
+    test "modify threads event — later hooks receive modified event, not original (§36.1)" do
+      # A modify hook at 70 adds :threaded flag; a continue hook at 50
+      # asserts it sees the modified event, not the original.
+      defmodule ThreadVerifyA do
+        @behaviour Hook
+
+        @impl true
+        def name, do: :thread_a
+        @impl true
+        def priority, do: 70
+        @impl true
+        def filter(_), do: true
+        @impl true
+        def on_event(%Event{} = event, _ctx) do
+          HookResult.modify(
+            %{event | payload: Map.put(event.payload, :threaded, :a)},
+            ["thread_a modified"]
+          )
+        end
+      end
+
+      defmodule ThreadVerifyB do
+        @behaviour Hook
+
+        @impl true
+        def name, do: :thread_b
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(_), do: true
+        @impl true
+        def on_event(%Event{} = event, _ctx) do
+          # B must see the modification from A
+          assert event.payload[:threaded] == :a
+          HookResult.continue(event, ["thread_b saw modification"])
+        end
+      end
+
+      event = Event.new(:read, payload: %{})
+      hooks = [ThreadVerifyA, ThreadVerifyB]
+
+      {:ok, final_event, messages} = HookManager.run(event, hooks, %{}, :pre)
+
+      assert final_event.payload[:threaded] == :a
+      assert "thread_b saw modification" in messages
+    after
+      :code.delete(:"Elixir.KiroCockpit.Swarm.HookManagerTest.ThreadVerifyA")
+      :code.delete(:"Elixir.KiroCockpit.Swarm.HookManagerTest.ThreadVerifyB")
+    end
+
     test "chained modifications accumulate" do
       defmodule ChainModifyA do
         @behaviour Hook

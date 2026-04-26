@@ -56,6 +56,7 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   def on_event(event, ctx) do
     with :ok <- check_plan_mode(event, ctx),
          :ok <- check_active_task_requirement(event, ctx),
+         :ok <- check_stale_plan(event, ctx),
          :ok <- check_category_permission(event, ctx),
          :ok <- check_file_scope(event, ctx) do
       HookResult.continue(event)
@@ -73,6 +74,31 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     case PlanMode.check_action(plan_mode, permission) do
       :ok -> :ok
       {:blocked, reason, guidance} -> {:blocked, reason, guidance}
+    end
+  end
+
+  # Stale-plan gate (§36.2): block mutating actions when trusted ctx signals
+  # a stale active plan. Read-only and diagnostic actions (read, shell_read)
+  # remain unaffected. Explicit trusted override models the §32.3 "run anyway
+  # with confirmation" path. Never source this decision from untrusted event
+  # metadata/payload.
+  defp check_stale_plan(event, ctx) do
+    permission = permission_for_event(event)
+
+    cond do
+      not stale_plan?(ctx) ->
+        :ok
+
+      stale_plan_override?(ctx) ->
+        :ok
+
+      non_mutating_permission?(permission) ->
+        :ok
+
+      true ->
+        {:blocked, "Stale plan blocks mutating action",
+         "The active plan is stale. Refresh/reapprove it, diff the snapshot, " <>
+           "or explicitly confirm a run-anyway override before making changes."}
     end
   end
 
@@ -176,6 +202,12 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   defp read_only_permission?(:read), do: true
   defp read_only_permission?(_permission), do: false
 
+  # Non-mutating permissions: read + diagnostic shell_read (grep, git diff, log)
+  # These pass through the stale-plan gate unchanged (§36.2).
+  defp non_mutating_permission?(:read), do: true
+  defp non_mutating_permission?(:shell_read), do: true
+  defp non_mutating_permission?(_permission), do: false
+
   defp permission_for_event(%Event{permission_level: permission})
        when permission in @permissions do
     permission
@@ -210,6 +242,16 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
 
   defp trusted_lookup(ctx, key) do
     if Map.has_key?(ctx, key), do: Map.get(ctx, key), else: nil
+  end
+
+  defp stale_plan?(ctx) do
+    truthy?(trusted_lookup(ctx, :stale_plan?)) or truthy?(trusted_lookup(ctx, :stale_plan))
+  end
+
+  defp stale_plan_override?(ctx) do
+    truthy?(trusted_lookup(ctx, :stale_plan_override?)) or
+      truthy?(trusted_lookup(ctx, :stale_plan_override)) or
+      truthy?(trusted_lookup(ctx, :stale_plan_confirmed?))
   end
 
   defp truthy?(value), do: value in [true, "true", 1, "1", :yes, "yes"]
