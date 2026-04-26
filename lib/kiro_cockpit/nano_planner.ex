@@ -24,6 +24,7 @@ defmodule KiroCockpit.NanoPlanner do
 
   alias KiroCockpit.NanoPlanner.{ContextBuilder, PlanSchema, PromptBuilder, Staleness}
   alias KiroCockpit.Plans
+  alias KiroCockpit.Swarm.ActionBoundary
 
   @supported_modes [:nano, :nano_deep, :nano_fix]
   @mode_by_string Map.new(@supported_modes, fn mode -> {to_string(mode), mode} end)
@@ -76,13 +77,102 @@ defmodule KiroCockpit.NanoPlanner do
          session_mod = resolve_session_module(opts),
          {:ok, session_state} <- fetch_session_state(session_mod, session),
          {:ok, session_id} <- resolve_session_id(session_state, opts),
-         {:ok, project_dir} <- resolve_project_dir(session_state, opts),
-         {:ok, snapshot} <- build_snapshot(project_dir, opts),
+         {:ok, project_dir} <- resolve_project_dir(session_state, opts) do
+      boundary_opts =
+        plan_generate_boundary_opts(session_id, project_dir, mode, user_request, opts)
+
+      if boundary_enabled?(opts) do
+        case ActionBoundary.run(:nano_plan_generate, boundary_opts, fn ->
+               do_plan(
+                 session,
+                 user_request,
+                 mode,
+                 session_mod,
+                 session_state,
+                 session_id,
+                 project_dir,
+                 opts
+               )
+             end) do
+          {:ok, result} ->
+            result
+
+          {:error, {:swarm_blocked, reason, messages}} ->
+            {:error, {:swarm_blocked, reason, messages}}
+        end
+      else
+        do_plan(
+          session,
+          user_request,
+          mode,
+          session_mod,
+          session_state,
+          session_id,
+          project_dir,
+          opts
+        )
+      end
+    end
+  end
+
+  # Actual plan generation/persistence — extracted for boundary wrapping.
+  defp do_plan(
+         session,
+         user_request,
+         mode,
+         session_mod,
+         _session_state,
+         session_id,
+         project_dir,
+         opts
+       ) do
+    with {:ok, snapshot} <- build_snapshot(project_dir, opts),
          {:ok, prompt} <- build_prompt(user_request, snapshot, mode),
          {:ok, raw_result} <- run_planner(session_mod, session, prompt, opts),
          {:ok, raw_plan} <- parse_model_output(raw_result),
          {:ok, normalized} <- validate_plan(raw_plan) do
       persist_plan(session_id, user_request, mode, normalized, snapshot, raw_plan)
+    end
+  end
+
+  defp boundary_enabled?(opts) do
+    case Keyword.get(opts, :swarm_hooks) do
+      nil -> Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)
+      explicit -> explicit
+    end
+  end
+
+  defp plan_generate_boundary_opts(session_id, project_dir, mode, user_request, opts) do
+    agent_id = Keyword.get(opts, :agent_id, "nano-planner")
+    plan_mode = Keyword.get(opts, :plan_mode)
+    swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
+
+    [
+      session_id: session_id,
+      agent_id: agent_id,
+      permission_level: :subagent,
+      project_dir: project_dir,
+      payload: %{mode: mode, request_summary: truncate_request(user_request)},
+      plan_mode: plan_mode,
+      swarm_ctx: swarm_ctx,
+      enabled: boundary_enabled?(opts)
+    ]
+    |> maybe_put_opt(opts, :pre_hooks)
+    |> maybe_put_opt(opts, :post_hooks)
+    |> maybe_put_opt(opts, :hook_manager_module)
+    |> maybe_put_opt(opts, :task_manager_module)
+  end
+
+  defp truncate_request(request) when is_binary(request) and byte_size(request) > 200 do
+    String.slice(request, 0, 200) <> "…"
+  end
+
+  defp truncate_request(request), do: request
+
+  defp maybe_put_opt(kw, opts, key) do
+    case Keyword.get(opts, key) do
+      nil -> kw
+      value -> Keyword.put(kw, key, value)
     end
   end
 
@@ -119,16 +209,68 @@ defmodule KiroCockpit.NanoPlanner do
     session_mod = resolve_session_module(opts)
 
     with {:ok, plan} <- fetch_plan(plan_id),
-         {:ok, project_dir} <- resolve_project_dir_for_staleness(session_mod, session, opts),
-         :ok <- Staleness.check(plan, project_dir, opts) do
-      case Plans.approve_plan(plan_id) do
-        {:ok, approved_plan} ->
-          send_execution_prompt(session_mod, session, approved_plan, opts)
+         {:ok, project_dir} <- resolve_project_dir_for_staleness(session_mod, session, opts) do
+      boundary_opts = plan_approve_boundary_opts(plan, project_dir, opts)
+
+      # Staleness check remains outside boundary for now (kiro-ux7 will move
+      # it into the boundary executor). If stale, we skip the boundary
+      # entirely — the action never reaches hooks.
+      case Staleness.check(plan, project_dir, opts) do
+        :ok ->
+          if boundary_enabled?(opts) do
+            case ActionBoundary.run(:nano_plan_approve, boundary_opts, fn ->
+                   do_approve(session_mod, session, plan_id, opts)
+                 end) do
+              {:ok, result} ->
+                result
+
+              {:error, {:swarm_blocked, reason, messages}} ->
+                {:error, {:swarm_blocked, reason, messages}}
+            end
+          else
+            do_approve(session_mod, session, plan_id, opts)
+          end
 
         {:error, reason} ->
           {:error, reason}
       end
     end
+  end
+
+  # Actual approve + prompt send — extracted for boundary wrapping.
+  defp do_approve(session_mod, session, plan_id, opts) do
+    case Plans.approve_plan(plan_id) do
+      {:ok, approved_plan} ->
+        send_execution_prompt(session_mod, session, approved_plan, opts)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp plan_approve_boundary_opts(plan, project_dir, opts) do
+    session_id = Keyword.get(opts, :session_id, plan.session_id)
+    agent_id = Keyword.get(opts, :agent_id, "nano-planner")
+    plan_mode = Keyword.get(opts, :plan_mode)
+    swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
+
+    [
+      session_id: session_id,
+      agent_id: agent_id,
+      plan_id: plan.id,
+      permission_level: :write,
+      project_dir: project_dir,
+      payload: %{plan_id: plan.id, mode: plan.mode},
+      plan_mode: plan_mode,
+      swarm_ctx: swarm_ctx,
+      enabled: boundary_enabled?(opts)
+    ]
+    |> maybe_put_opt(opts, :pre_hooks)
+    |> maybe_put_opt(opts, :post_hooks)
+    |> maybe_put_opt(opts, :hook_manager_module)
+    |> maybe_put_opt(opts, :task_manager_module)
+    |> maybe_put_opt(opts, :stale_plan_override?)
+    |> maybe_put_opt(opts, :stale_plan_confirmed?)
   end
 
   @doc """
