@@ -67,6 +67,18 @@ defmodule KiroCockpitWeb.SessionPlanLiveIntegrationTest do
     def revise(_session, _plan_id, _request, _opts), do: {:ok, %{id: "stub"}}
   end
 
+  defmodule SwarmBlockedPlanner do
+    @moduledoc false
+
+    def approve(_session, _plan_id, _opts) do
+      {:error, {:swarm_blocked, "snapshot drift detected", ["refresh plan"]}}
+    end
+
+    def plan(_session, _request, _opts), do: {:ok, %{id: "stub"}}
+
+    def revise(_session, _plan_id, _request, _opts), do: {:ok, %{id: "stub"}}
+  end
+
   # ── Failing planner that always errors ──────────────────────────────
 
   defmodule FailingPlanner do
@@ -374,6 +386,26 @@ defmodule KiroCockpitWeb.SessionPlanLiveIntegrationTest do
       assert refreshed.status == "draft"
 
       # Restore
+      Application.put_env(:kiro_cockpit, :nano_planner_module, RecordingFakePlanner)
+    end
+
+    test "approve_plan shows stale_plan error for {:swarm_blocked, reason, messages}", %{
+      conn: conn
+    } do
+      session_id = "int-swarm-blocked-#{System.unique_integer([:positive])}"
+      {:ok, plan} = create_rich_plan(session_id)
+
+      Application.put_env(:kiro_cockpit, :nano_planner_module, SwarmBlockedPlanner)
+
+      {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+      html = render_click(view, :approve_plan, %{"id" => plan.id})
+
+      assert html =~ "stale" or html =~ "Stale"
+
+      refreshed = Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
       Application.put_env(:kiro_cockpit, :nano_planner_module, RecordingFakePlanner)
     end
 

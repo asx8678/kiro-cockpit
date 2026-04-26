@@ -200,6 +200,16 @@ defmodule KiroCockpit.CLI.Commands.PlanTest do
       assert msg =~ "stale"
     end
 
+    test "maps {:swarm_blocked, reason, messages} to :stale_plan" do
+      Process.put(:approve_result, {:error, {:swarm_blocked, "branch drift detected", []}})
+
+      assert {:error, %{code: :stale_plan, plan_id: "abc", message: msg}} =
+               Plan.approve("abc", opts())
+
+      assert msg =~ "stale"
+      assert msg =~ "branch drift detected"
+    end
+
     test "maps :stale_plan_unknown" do
       Process.put(:approve_result, {:error, :stale_plan_unknown})
 
