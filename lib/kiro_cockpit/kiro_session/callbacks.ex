@@ -79,6 +79,20 @@ defmodule KiroCockpit.KiroSession.Callbacks do
   end
 
   @doc """
+  Map a callback method string to a stable `{action_atom, permission}` tuple.
+
+  Known methods map to descriptive action atoms; unknown methods map to
+  `:callback_requested` — **never** `String.to_atom/1` on external input.
+  The raw method string is preserved by the caller in event metadata/payload
+  for observability.
+  """
+  @spec action_mapping(String.t()) :: {atom(), atom()}
+  def action_mapping("fs/read_text_file"), do: {:fs_read_requested, :read}
+  def action_mapping("fs/write_text_file"), do: {:fs_write_requested, :write}
+  def action_mapping("terminal/" <> _), do: {:terminal_requested, :terminal}
+  def action_mapping(_method), do: {:callback_requested, :read}
+
+  @doc """
   Check if a method is a mutating (write/terminal) callback.
 
   Mutating methods are denied under the `:read_only` callback policy.
