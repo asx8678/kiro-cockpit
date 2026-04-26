@@ -46,7 +46,10 @@ defmodule KiroCockpit.Swarm.Hooks.SteeringPreActionHook do
     :verification_run,
     :memory_promote,
     :nano_plan_generate,
-    :nano_plan_approve
+    :nano_plan_approve,
+    :nano_plan_run,
+    :fs_read_requested,
+    :fs_write_requested
   ]
 
   @decision_by_string %{

@@ -507,6 +507,65 @@ defmodule KiroCockpit.PlansTest do
       refreshed = Plans.get_plan(approved.id)
       assert refreshed.status == "approved"
     end
+
+    test "run_plan boundary uses nano-planner default agent_id when none provided", %{
+      project_dir: dir
+    } do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess_default_agent",
+          "req",
+          :nano,
+          [],
+          Map.put(default_opts(), :project_snapshot_hash, compute_hash(dir))
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      # Run with swarm hooks enabled — agent_id defaults to "nano-planner"
+      assert {:ok, running} =
+               Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 swarm_hooks: true
+               )
+
+      assert running.status == "running"
+
+      # Verify Bronze trace has nano-planner as the top-level agent_id
+      events = KiroCockpit.Swarm.Events.list_by_session("sess_default_agent", limit: 10)
+      assert length(events) >= 1
+      trace = List.first(events)
+      assert trace.event_type == "hook_trace"
+      assert trace.agent_id == "nano-planner"
+    end
+
+    test "run_plan boundary uses explicit agent_id when provided", %{
+      project_dir: dir
+    } do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess_explicit",
+          "req",
+          :nano,
+          [],
+          Map.put(default_opts(), :project_snapshot_hash, compute_hash(dir))
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      assert {:ok, running} =
+               Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 swarm_hooks: true,
+                 agent_id: "custom-agent"
+               )
+
+      assert running.status == "running"
+
+      events = KiroCockpit.Swarm.Events.list_by_session("sess_explicit", limit: 10)
+      trace = List.first(events)
+      assert trace.agent_id == "custom-agent"
+    end
   end
 
   defp compute_hash(project_dir) do
