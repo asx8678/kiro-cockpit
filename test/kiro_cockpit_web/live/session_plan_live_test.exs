@@ -113,12 +113,35 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
     setup %{conn: conn} do
       session_id = "actions-#{System.unique_integer([:positive])}"
 
+      # Set up a real project dir for staleness checks
+      dir =
+        System.tmp_dir!()
+        |> Path.join("lv_actions_test_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "mix.exs"), "defmodule Test.Project do end")
+      File.write!(Path.join(dir, "README.md"), "# Test")
+
+      {:ok, snapshot} = KiroCockpit.NanoPlanner.ContextBuilder.build(project_dir: dir)
+
       {:ok, plan} =
-        create_test_plan(session_id, %{status: "draft", user_request: "Actionable plan"})
+        create_test_plan(session_id, %{
+          status: "draft",
+          user_request: "Actionable plan",
+          project_snapshot_hash: snapshot.hash
+        })
+
+      # Configure session resolver to return a map with project dir
+      Application.put_env(:kiro_cockpit, :kiro_session_resolver, fn _sid -> %{cwd: dir} end)
 
       {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
 
-      %{conn: conn, view: view, session_id: session_id, plan: plan}
+      on_exit(fn ->
+        Application.delete_env(:kiro_cockpit, :kiro_session_resolver)
+        File.rm_rf!(dir)
+      end)
+
+      %{conn: conn, view: view, session_id: session_id, plan: plan, project_dir: dir}
     end
 
     test "approves a draft plan", %{view: view, plan: plan} do
@@ -157,11 +180,44 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
   end
 
   describe "run plan action" do
-    test "runs an approved plan", %{conn: conn} do
+    test "runs an approved plan when not stale", %{conn: conn} do
       session_id = "run-#{System.unique_integer([:positive])}"
 
+      # Create a real project dir with matching hash
+      dir = setup_project_dir_for_run()
+      {:ok, snapshot} = KiroCockpit.NanoPlanner.ContextBuilder.build(project_dir: dir)
+
       {:ok, plan} =
-        create_test_plan(session_id, %{status: "approved", user_request: "Ready to run"})
+        create_test_plan(session_id, %{
+          status: "approved",
+          user_request: "Ready to run",
+          project_snapshot_hash: snapshot.hash
+        })
+
+      # Configure a session resolver that provides the project dir
+      Application.put_env(:kiro_cockpit, :kiro_session_resolver, fn _sid -> %{cwd: dir} end)
+
+      try do
+        {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+        html =
+          view
+          |> element("button[phx-click='run_plan'][phx-value-id='#{plan.id}']")
+          |> render_click()
+
+        assert html =~ "Plan execution started"
+        assert render(view) =~ "Running"
+      after
+        Application.delete_env(:kiro_cockpit, :kiro_session_resolver)
+        File.rm_rf!(dir)
+      end
+    end
+
+    test "refuses to run a stale plan", %{conn: conn} do
+      session_id = "run-stale-#{System.unique_integer([:positive])}"
+
+      {:ok, plan} =
+        create_test_plan(session_id, %{status: "approved", user_request: "Stale plan"})
 
       {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
 
@@ -170,8 +226,27 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
         |> element("button[phx-click='run_plan'][phx-value-id='#{plan.id}']")
         |> render_click()
 
-      assert html =~ "Plan execution started"
-      assert render(view) =~ "Running"
+      assert html =~ "stale"
+      # Plan should NOT be running
+      assert KiroCockpit.Plans.get_plan(plan.id).status == "approved"
+    end
+
+    test "refuses to run when staleness cannot be determined (no project dir)", %{conn: conn} do
+      session_id = "run-unknown-#{System.unique_integer([:positive])}"
+
+      {:ok, plan} =
+        create_test_plan(session_id, %{status: "approved", user_request: "No dir"})
+
+      {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+      html =
+        view
+        |> element("button[phx-click='run_plan'][phx-value-id='#{plan.id}']")
+        |> render_click()
+
+      assert html =~ "staleness cannot be determined"
+      # Plan should NOT be running
+      assert KiroCockpit.Plans.get_plan(plan.id).status == "approved"
     end
 
     test "refuses to run a draft plan from a forged event", %{conn: conn} do
@@ -184,6 +259,17 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
 
       assert Plans.get_plan(plan.id).status == "draft"
     end
+  end
+
+  defp setup_project_dir_for_run do
+    dir =
+      System.tmp_dir!()
+      |> Path.join("lv_run_test_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "mix.exs"), "defmodule Test.Project do end")
+    File.write!(Path.join(dir, "README.md"), "# Test")
+    dir
   end
 
   describe "plan selection and expansion" do
@@ -293,18 +379,20 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
   end
 
   describe "error handling" do
-    test "handles approve failure gracefully", %{conn: conn} do
+    test "handles approve failure gracefully (already approved)", %{conn: conn} do
       session_id = "error-approve-#{System.unique_integer([:positive])}"
       # Create already approved plan - can't approve again
       {:ok, plan} = create_test_plan(session_id, %{status: "approved"})
 
       {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
 
-      # Try to approve again
-      # Note: The button shouldn't be shown, but we can test the handler directly
+      # Try to approve again — staleness check will fail first (no project dir)
+      # or if a project dir were available, approve_plan would reject with
+      # :invalid_transition. Either way the UI should show an error.
       html = render_click(view, :approve_plan, %{"id" => plan.id})
 
-      assert html =~ "invalid status transition"
+      # Should show some error (stale_plan_unknown or invalid_transition)
+      assert html =~ "staleness cannot be determined" or html =~ "invalid status transition"
     end
 
     test "handles reject failure gracefully", %{conn: conn} do

@@ -7,6 +7,7 @@ defmodule KiroCockpit.Support.FakeNanoPlanner do
   """
 
   alias KiroCockpit.Plans
+  alias KiroCockpit.NanoPlanner.Staleness
 
   @doc """
   Fake plan/3 that creates a plan directly in the database.
@@ -49,14 +50,78 @@ defmodule KiroCockpit.Support.FakeNanoPlanner do
   end
 
   @doc """
-  Fake approve/3 that just delegates to Plans context.
+  Fake approve/3 that delegates to Plans context.
+
+  When `:kiro_session_resolver` is not configured, skips staleness
+  check (returns `{:error, :stale_plan_unknown}`). This mirrors
+  production LiveView behavior where no session resolver means
+  we cannot determine staleness.
   """
-  def approve(_session, plan_id, _opts \\ []) do
-    case Plans.approve_plan(plan_id) do
-      {:ok, plan} -> {:ok, %{plan: plan, prompt_result: %{"status" => "sent"}}}
-      {:error, reason} -> {:error, reason}
+  def approve(_session, plan_id, opts \\ []) do
+    project_dir = Keyword.get(opts, :project_dir)
+    session_id = Keyword.get(opts, :session_id)
+
+    resolved_dir =
+      case project_dir do
+        nil -> resolve_cwd_from_config(session_id)
+        dir -> dir
+      end
+
+    if resolved_dir do
+      case Staleness.check(
+             Plans.get_plan(plan_id),
+             resolved_dir,
+             opts
+           ) do
+        :ok ->
+          case Plans.approve_plan(plan_id) do
+            {:ok, plan} -> {:ok, %{plan: plan, prompt_result: %{"status" => "sent"}}}
+            {:error, reason} -> {:error, reason}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      # No trusted project dir available — fail closed
+      {:error, :stale_plan_unknown}
     end
   end
+
+  defp resolve_cwd_from_config(session_id) do
+    case Application.get_env(:kiro_cockpit, :kiro_session_resolver) do
+      nil ->
+        nil
+
+      resolver when is_function(resolver, 1) ->
+        try do
+          resolver.(session_id)
+          |> fetch_cwd_from_session()
+        rescue
+          _ -> nil
+        end
+
+      {module, function} ->
+        try do
+          apply(module, function, [session_id])
+          |> fetch_cwd_from_session()
+        rescue
+          _ -> nil
+        end
+    end
+  end
+
+  defp fetch_cwd_from_session(session_ref) when is_pid(session_ref) do
+    case KiroCockpit.KiroSession.state(session_ref) do
+      %{cwd: cwd} when is_binary(cwd) -> cwd
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp fetch_cwd_from_session(%{cwd: cwd}) when is_binary(cwd), do: cwd
+  defp fetch_cwd_from_session(_), do: nil
 
   @doc """
   Fake revise/4 that creates a new plan version.

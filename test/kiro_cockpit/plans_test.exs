@@ -399,4 +399,118 @@ defmodule KiroCockpit.PlansTest do
       assert nil == Plans.stale_plan_hash(Ecto.UUID.generate())
     end
   end
+
+  describe "run_plan/2" do
+    setup do
+      dir =
+        System.tmp_dir!()
+        |> Path.join("plans_run_test_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "mix.exs"), "defmodule Test.Project do end")
+      File.write!(Path.join(dir, "README.md"), "# Test")
+
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      {:ok, project_dir: dir}
+    end
+
+    test "runs an approved plan when not stale", %{project_dir: dir} do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess",
+          "req",
+          :nano,
+          [],
+          Map.put(default_opts(), :project_snapshot_hash, compute_hash(dir))
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      assert {:ok, running} = Plans.run_plan(approved.id, project_dir: dir)
+      assert running.status == "running"
+    end
+
+    test "refuses to run a stale plan", %{project_dir: dir} do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess",
+          "req",
+          :nano,
+          [],
+          default_opts()
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      # The project snapshot_hash is "hash123" which won't match the real dir
+      assert {:error, :stale_plan} = Plans.run_plan(approved.id, project_dir: dir)
+    end
+
+    test "refuses to run when project_dir is nil" do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess",
+          "req",
+          :nano,
+          [],
+          default_opts()
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      assert {:error, :stale_plan_unknown} = Plans.run_plan(approved.id, [])
+    end
+
+    test "refuses to run a draft plan", %{project_dir: dir} do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess",
+          "req",
+          :nano,
+          [],
+          default_opts()
+        )
+
+      assert {:error, :invalid_transition} = Plans.run_plan(plan.id, project_dir: dir)
+    end
+
+    test "refuses to run a not-found plan", %{project_dir: dir} do
+      assert {:error, :not_found} =
+               Plans.run_plan(Ecto.UUID.generate(), project_dir: dir)
+    end
+
+    test "refuses to run when context builder fails", %{project_dir: dir} do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess",
+          "req",
+          :nano,
+          [],
+          Map.put(default_opts(), :project_snapshot_hash, compute_hash(dir))
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      defmodule PlansTestBrokenBuilder do
+        @moduledoc false
+        def build(_opts), do: {:error, :simulated_failure}
+      end
+
+      assert {:error, :stale_plan_unknown} =
+               Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 context_builder_module: PlansTestBrokenBuilder
+               )
+
+      # Plan should NOT be running
+      refreshed = Plans.get_plan(approved.id)
+      assert refreshed.status == "approved"
+    end
+  end
+
+  defp compute_hash(project_dir) do
+    {:ok, snapshot} = KiroCockpit.NanoPlanner.ContextBuilder.build(project_dir: project_dir)
+    snapshot.hash
+  end
 end

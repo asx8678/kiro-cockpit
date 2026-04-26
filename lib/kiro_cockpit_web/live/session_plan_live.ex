@@ -154,6 +154,14 @@ defmodule KiroCockpitWeb.SessionPlanLive do
       {:error, :invalid_transition} ->
         {:noreply, put_flash(socket, :error, "Cannot approve plan: invalid status transition")}
 
+      {:error, :stale_plan_unknown} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Plan staleness cannot be determined — project dir unavailable or snapshot failed."
+         )}
+
       {:error, {:prompt_failed, _plan, _reason}} ->
         # Plan was approved in DB but prompt send failed.
         # Still reflect the approved status and notify the user.
@@ -209,12 +217,35 @@ defmodule KiroCockpitWeb.SessionPlanLive do
 
   @impl true
   def handle_event("run_plan", %{"id" => plan_id}, socket) do
-    # Transition plan to running status
-    case Plans.update_status(plan_id, "running", %{"started_at" => DateTime.utc_now()}) do
+    project_dir = resolve_project_dir(socket)
+
+    case Plans.run_plan(plan_id, project_dir: project_dir) do
       {:ok, plan} ->
         broadcast_plan_update(socket.assigns.session_id, plan)
         socket = refresh_plans_and_notify(socket, "Plan execution started")
         {:noreply, socket}
+
+      {:error, :stale_plan} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Plan is stale — the project has changed since it was generated. Revise or regenerate."
+         )}
+
+      {:error, :stale_plan_unknown} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Plan staleness cannot be determined — project dir unavailable or snapshot failed."
+         )}
+
+      {:error, :invalid_transition} ->
+        {:noreply, put_flash(socket, :error, "Cannot run plan: only approved plans can be run")}
+
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Plan not found")}
 
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, "Failed to run plan: #{format_error(reason)}")}
@@ -230,6 +261,49 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   def handle_event("refresh_plans", _, socket) do
     {:noreply, refresh_plans(socket)}
   end
+
+  # ── Private helpers for staleness resolution ────────────────────────
+
+  defp resolve_project_dir(socket_or_session_id) do
+    session_id =
+      case socket_or_session_id do
+        %{assigns: %{session_id: sid}} -> sid
+        sid when is_binary(sid) -> sid
+      end
+
+    case Application.get_env(:kiro_cockpit, :kiro_session_resolver) do
+      nil ->
+        nil
+
+      resolver when is_function(resolver, 1) ->
+        try do
+          resolver.(session_id)
+          |> fetch_cwd_from_session()
+        rescue
+          _ -> nil
+        end
+
+      {module, function} ->
+        try do
+          apply(module, function, [session_id])
+          |> fetch_cwd_from_session()
+        rescue
+          _ -> nil
+        end
+    end
+  end
+
+  defp fetch_cwd_from_session(session_ref) when is_pid(session_ref) do
+    case KiroCockpit.KiroSession.state(session_ref) do
+      %{cwd: cwd} when is_binary(cwd) -> cwd
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp fetch_cwd_from_session(%{cwd: cwd}) when is_binary(cwd), do: cwd
+  defp fetch_cwd_from_session(_), do: nil
 
   # ── Async Handlers ───────────────────────────────────────────────────
 
@@ -459,26 +533,31 @@ defmodule KiroCockpitWeb.SessionPlanLive do
 
   defp approve_plan_for_session(plan_id, session_id) do
     planner_module = Application.get_env(:kiro_cockpit, :nano_planner_module, NanoPlanner)
+    session = resolve_planner_session(session_id)
+    project_dir = resolve_project_dir(session_id)
 
-    if route_approval_through_planner?(planner_module) do
-      session = resolve_planner_session(session_id)
-      planner_module.approve(session, plan_id, session_id: session_id)
-    else
-      Plans.approve_plan(plan_id)
-    end
+    planner_module.approve(session, plan_id,
+      session_id: session_id,
+      project_dir: project_dir
+    )
   end
-
-  defp route_approval_through_planner?(NanoPlanner) do
-    not is_nil(Application.get_env(:kiro_cockpit, :kiro_session_resolver))
-  end
-
-  defp route_approval_through_planner?(_planner_module), do: true
 
   defp resolve_planner_session(session_id) do
     case Application.get_env(:kiro_cockpit, :kiro_session_resolver) do
-      nil -> self()
-      resolver when is_function(resolver, 1) -> resolver.(session_id)
-      {module, function} -> apply(module, function, [session_id])
+      nil ->
+        self()
+
+      resolver when is_function(resolver, 1) ->
+        case resolver.(session_id) do
+          pid when is_pid(pid) -> pid
+          _ -> self()
+        end
+
+      {module, function} ->
+        case apply(module, function, [session_id]) do
+          pid when is_pid(pid) -> pid
+          _ -> self()
+        end
     end
   end
 
