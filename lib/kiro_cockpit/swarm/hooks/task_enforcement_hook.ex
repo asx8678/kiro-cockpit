@@ -28,6 +28,17 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     :plan_approved
   ]
 
+  # Lifecycle actions exempt from active-task requirement but still
+  # subject to stale/plan-mode checks. These actions initiate or
+  # advance the plan/task flow — requiring an active task would be
+  # circular (you need a plan to create a task, but the plan
+  # generation itself shouldn't need a task first).
+  @lifecycle_actions [
+    :nano_plan_run,
+    :nano_plan_generate,
+    :nano_plan_approve
+  ]
+
   @action_permissions %{
     file_read_requested: :read,
     read_file: :read,
@@ -49,7 +60,9 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
     kiro_session_prompt: :subagent,
     fs_read_requested: :read,
     fs_write_requested: :write,
-    nano_plan_run: :write
+    nano_plan_run: :write,
+    nano_plan_generate: :subagent,
+    nano_plan_approve: :write
   }
 
   @impl true
@@ -58,14 +71,13 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   @impl true
   def priority, do: 95
 
-  # nano_plan_run is only exempt from the active-task requirement, not
-  # from stale/plan-mode checks. Use filter: true so it still runs through
-  # the full hook chain; check_active_task_requirement special-cases it.
+  # nano_plan_run and other lifecycle actions are only exempt from the
+  # active-task requirement, not from stale/plan-mode checks. Use filter:
+  # true so they still run through the full hook chain;
+  # check_active_task_requirement special-cases them.
   @impl true
-  def filter(%Event{action_name: :nano_plan_run}), do: true
-
+  def filter(%Event{action_name: action}) when action in @lifecycle_actions, do: true
   def filter(%Event{action_name: action}) when action in @exempt_actions, do: false
-
   def filter(%Event{}), do: true
 
   @impl true
@@ -119,9 +131,12 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   end
 
   # Check if an active task is required for this action.
-  # :nano_plan_run is a lifecycle action — it is exempt from the
-  # active-task requirement but still subject to stale/plan-mode checks.
-  defp check_active_task_requirement(%Event{action_name: :nano_plan_run}, _ctx) do
+  # Lifecycle actions (nano_plan_run, nano_plan_generate, nano_plan_approve)
+  # are exempt from the active-task requirement but still subject to
+  # stale/plan-mode checks — these actions initiate or advance the
+  # plan/task flow.
+  defp check_active_task_requirement(%Event{action_name: action}, _ctx)
+       when action in @lifecycle_actions do
     :ok
   end
 
