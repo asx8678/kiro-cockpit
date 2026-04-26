@@ -66,7 +66,15 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   @read_only_permissions [:read]
 
-  @mutating_permissions [:write, :shell_write, :terminal, :external, :destructive]
+  @mutating_permissions [
+    :write,
+    :shell_write,
+    :terminal,
+    :external,
+    :destructive,
+    :subagent,
+    :memory_write
+  ]
 
   # ── Valid transitions table ───────────────────────────────────────────
   #
@@ -393,6 +401,16 @@ defmodule KiroCockpit.Swarm.PlanMode do
   defp guidance_for_blocked_permission(:destructive, state) do
     "Destructive actions are blocked during #{state}. " <>
       "These are never auto-approved; explicit operator approval is required."
+  end
+
+  defp guidance_for_blocked_permission(:subagent, state) do
+    "Subagent invocation is blocked during #{state}. " <>
+      "Approve the plan to unlock subagent delegation."
+  end
+
+  defp guidance_for_blocked_permission(:memory_write, state) do
+    "Memory write is blocked during #{state}. " <>
+      "Approve the plan to unlock memory promotion."
   end
 
   defp guidance_for_blocked_permission(_perm, state) do

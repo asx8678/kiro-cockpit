@@ -177,7 +177,6 @@ defmodule KiroCockpit.NanoPlanner.PlanSchema do
           permission_level:
             step
             |> extract_step_permission()
-            |> Permissions.normalize_permission()
             |> to_string(),
           validation: get_field(step, :validation),
           status: "planned"
@@ -331,18 +330,7 @@ defmodule KiroCockpit.NanoPlanner.PlanSchema do
     end
   end
 
-  @canonical_permissions Permissions.escalation_order()
-  @canonical_permission_strings Enum.map(@canonical_permissions, &to_string/1)
-  @permission_alias_strings ~w(shell shell_readonly)
-
-  defp valid_permission?(perm) when perm in @canonical_permissions, do: true
-
-  defp valid_permission?(perm) when is_binary(perm) do
-    normalized = String.downcase(perm)
-    normalized in @canonical_permission_strings or normalized in @permission_alias_strings
-  end
-
-  defp valid_permission?(_), do: false
+  defp valid_permission?(perm), do: Permissions.valid_permission?(perm)
 
   # ── Normalization ────────────────────────────────────────────────────
 
@@ -396,10 +384,13 @@ defmodule KiroCockpit.NanoPlanner.PlanSchema do
   end
 
   defp extract_step_permission(step) do
-    get_field(step, :permission_level) ||
-      get_field(step, :permission) ||
-      get_field(step, :permissions) ||
-      :read
+    perm =
+      get_field(step, :permission_level) ||
+        get_field(step, :permission) ||
+        get_field(step, :permissions) ||
+        :read
+
+    Permissions.normalize_step_permission(perm)
   end
 
   defp normalize_files(nil), do: %{}

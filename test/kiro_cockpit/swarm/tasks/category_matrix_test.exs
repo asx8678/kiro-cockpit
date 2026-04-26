@@ -844,4 +844,30 @@ defmodule KiroCockpit.Swarm.Tasks.CategoryMatrixTest do
                :ask
     end
   end
+
+  # -----------------------------------------------------------------
+  # Drift / consistency tests
+  # -----------------------------------------------------------------
+
+  describe "permission vocabulary drift" do
+    test "CategoryMatrix.permissions() == Permissions.permissions()" do
+      assert CategoryMatrix.permissions() == KiroCockpit.Permissions.permissions()
+    end
+
+    test "every matrix row covers every canonical permission" do
+      canonical = KiroCockpit.Permissions.permissions()
+
+      for cat <- CategoryMatrix.categories() do
+        row = CategoryMatrix.matrix()[cat]
+        assert row != nil, "Category #{cat} missing from matrix"
+
+        for perm <- canonical do
+          assert Map.has_key?(row, perm),
+                 "Category #{cat} missing permission #{perm} in matrix row"
+
+          assert %Decision{} = row[perm]
+        end
+      end
+    end
+  end
 end

@@ -252,7 +252,7 @@ defmodule KiroCockpit.NanoPlanner.PlanSchemaTest do
         PlanSchema.validate!(
           valid_plan(
             permissions_needed:
-              ~w(read write shell_read shell_write terminal external destructive)
+              ~w(read write shell_read shell_write terminal external destructive subagent memory_write)
           )
         )
 
@@ -263,13 +263,19 @@ defmodule KiroCockpit.NanoPlanner.PlanSchemaTest do
                :shell_write,
                :terminal,
                :external,
-               :destructive
+               :destructive,
+               :subagent,
+               :memory_write
              ]
     end
 
     test "normalizes atom permissions" do
-      result = PlanSchema.validate!(valid_plan(permissions_needed: [:read, :write]))
-      assert result.permissions_needed == [:read, :write]
+      result =
+        PlanSchema.validate!(
+          valid_plan(permissions_needed: [:read, :write, :subagent, :memory_write])
+        )
+
+      assert result.permissions_needed == [:read, :write, :subagent, :memory_write]
     end
 
     test "deduplicates and sorts permissions by escalation order" do
@@ -442,6 +448,93 @@ defmodule KiroCockpit.NanoPlanner.PlanSchemaTest do
 
         assert hd(steps).permission_level == to_string(perm)
       end
+    end
+
+    test "flattens subagent step permission correctly" do
+      plan =
+        valid_plan(
+          phases: [
+            %{number: 1, title: "P1", steps: [%{title: "Delegate task", permission: :subagent}]}
+          ]
+        )
+
+      result = PlanSchema.validate!(plan)
+      steps = PlanSchema.flatten_steps(result)
+
+      assert hd(steps).permission_level == "subagent"
+    end
+
+    test "flattens memory_write step permission correctly" do
+      plan =
+        valid_plan(
+          phases: [
+            %{
+              number: 1,
+              title: "P1",
+              steps: [%{title: "Save findings", permission: :memory_write}]
+            }
+          ]
+        )
+
+      result = PlanSchema.validate!(plan)
+      steps = PlanSchema.flatten_steps(result)
+
+      assert hd(steps).permission_level == "memory_write"
+    end
+
+    test "handles list-valued step permission by picking highest" do
+      plan =
+        valid_plan(
+          phases: [
+            %{
+              number: 1,
+              title: "P1",
+              steps: [%{title: "Multi-step", permission: ["read", "write"]}]
+            }
+          ]
+        )
+
+      result = PlanSchema.validate!(plan)
+      steps = PlanSchema.flatten_steps(result)
+
+      # List-valued permission should pick the highest (write > read)
+      assert hd(steps).permission_level == "write"
+    end
+
+    test "handles list-valued step permission with subagent" do
+      plan =
+        valid_plan(
+          phases: [
+            %{
+              number: 1,
+              title: "P1",
+              steps: [%{title: "Delegate", permission: ["subagent", "read"]}]
+            }
+          ]
+        )
+
+      result = PlanSchema.validate!(plan)
+      steps = PlanSchema.flatten_steps(result)
+
+      assert hd(steps).permission_level == "subagent"
+    end
+
+    test "handles list-valued permission_level field" do
+      plan =
+        valid_plan(
+          phases: [
+            %{
+              number: 1,
+              title: "P1",
+              steps: [%{title: "Step", permission_level: ["shell_read", "terminal"]}]
+            }
+          ]
+        )
+
+      result = PlanSchema.validate!(plan)
+      steps = PlanSchema.flatten_steps(result)
+
+      assert hd(steps).permission_level == "terminal"
     end
 
     test "output is compatible with Plans.create_plan/5 step shape" do

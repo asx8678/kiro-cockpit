@@ -134,6 +134,30 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManagerTest do
       assert {:ok, task} = TaskManager.create(attrs)
       assert task.plan_id == nil
     end
+
+    test "accepts canonical subagent and memory_write permission_scope values" do
+      attrs =
+        Map.put(@valid_attrs, :permission_scope, ["shell_write", "subagent", "memory_write"])
+
+      assert {:ok, task} = TaskManager.create(attrs)
+      assert task.permission_scope == ["shell_write", "subagent", "memory_write"]
+    end
+
+    test "normalizes permission_scope aliases before persistence" do
+      attrs = Map.put(@valid_attrs, :permission_scope, ["shell", "shell_readonly"])
+
+      assert {:ok, task} = TaskManager.create(attrs)
+      assert task.permission_scope == ["shell_write", "shell_read"]
+      refute "shell" in task.permission_scope
+      refute "shell_readonly" in task.permission_scope
+    end
+
+    test "rejects invalid permission_scope values" do
+      attrs = Map.put(@valid_attrs, :permission_scope, ["subagent", "banana"])
+
+      assert {:error, changeset} = TaskManager.create(attrs)
+      assert "contains invalid permissions" in errors_on(changeset).permission_scope
+    end
   end
 
   describe "create_all/1 — batch creation" do

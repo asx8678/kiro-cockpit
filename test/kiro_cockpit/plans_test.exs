@@ -69,6 +69,50 @@ defmodule KiroCockpit.PlansTest do
 
       assert %{mode: ["is invalid"]} = errors_on(changeset)
     end
+
+    test "persists plan steps with subagent permission_level" do
+      session_id = "sess_subagent"
+
+      steps = [
+        %{
+          phase_number: 1,
+          step_number: 1,
+          title: "Delegate task to subagent",
+          details: "Run subagent",
+          files: %{},
+          permission_level: "subagent",
+          status: "planned"
+        }
+      ]
+
+      assert {:ok, plan} =
+               Plans.create_plan(session_id, "request", :nano, steps, default_opts())
+
+      assert length(plan.plan_steps) == 1
+      assert hd(plan.plan_steps).permission_level == "subagent"
+    end
+
+    test "persists plan steps with memory_write permission_level" do
+      session_id = "sess_memory_write"
+
+      steps = [
+        %{
+          phase_number: 1,
+          step_number: 1,
+          title: "Promote findings to memory",
+          details: "Save memory",
+          files: %{},
+          permission_level: "memory_write",
+          status: "planned"
+        }
+      ]
+
+      assert {:ok, plan} =
+               Plans.create_plan(session_id, "request", :nano, steps, default_opts())
+
+      assert length(plan.plan_steps) == 1
+      assert hd(plan.plan_steps).permission_level == "memory_write"
+    end
   end
 
   describe "get_plan/1" do

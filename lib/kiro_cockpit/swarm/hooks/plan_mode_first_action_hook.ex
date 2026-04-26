@@ -12,9 +12,10 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
 
   @behaviour KiroCockpit.Swarm.Hook
 
+  alias KiroCockpit.Permissions
   alias KiroCockpit.Swarm.{Event, HookResult, PlanMode}
 
-  @permissions [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+  @permissions Permissions.permissions()
 
   @impl true
   def name, do: :plan_mode_first_action

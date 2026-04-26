@@ -3,12 +3,139 @@ defmodule KiroCockpit.PermissionsTest do
 
   alias KiroCockpit.Permissions
 
+  # ── Permission vocabulary API ─────────────────────────────────────────
+
+  describe "permissions/0" do
+    test "returns the closed list of 9 canonical permissions (§32.1)" do
+      perms = Permissions.permissions()
+
+      assert perms == [
+               :read,
+               :write,
+               :shell_read,
+               :shell_write,
+               :terminal,
+               :external,
+               :destructive,
+               :subagent,
+               :memory_write
+             ]
+    end
+  end
+
+  describe "canonical_permissions/0" do
+    test "aliases permissions/0" do
+      assert Permissions.canonical_permissions() == Permissions.permissions()
+    end
+  end
+
+  describe "permission_strings/0" do
+    test "returns string forms of all 9 canonical permissions" do
+      strings = Permissions.permission_strings()
+
+      assert strings == [
+               "read",
+               "write",
+               "shell_read",
+               "shell_write",
+               "terminal",
+               "external",
+               "destructive",
+               "subagent",
+               "memory_write"
+             ]
+    end
+  end
+
+  describe "parse_permission/1" do
+    test "returns {:ok, atom} for valid canonical atoms" do
+      for perm <- Permissions.permissions() do
+        assert {:ok, ^perm} = Permissions.parse_permission(perm)
+      end
+    end
+
+    test "returns {:ok, atom} for valid canonical strings" do
+      for perm <- Permissions.permission_strings() do
+        assert {:ok, parsed} = Permissions.parse_permission(perm)
+        assert parsed in Permissions.permissions()
+      end
+    end
+
+    test "resolves aliases" do
+      assert {:ok, :shell_write} = Permissions.parse_permission("shell")
+      assert {:ok, :shell_read} = Permissions.parse_permission("shell_readonly")
+    end
+
+    test "returns error for invalid strings" do
+      assert {:error, :invalid_permission} = Permissions.parse_permission("banana")
+      assert {:error, :invalid_permission} = Permissions.parse_permission("god_mode")
+    end
+
+    test "returns error for invalid atoms" do
+      assert {:error, :invalid_permission} = Permissions.parse_permission(:banana)
+    end
+
+    test "does not pollute atom table for arbitrary strings" do
+      # Parse should not create new atoms — unknown strings return error
+      Permissions.parse_permission("totally_made_up_permission_xyz")
+
+      refute :totally_made_up_permission_xyz in Permissions.permissions()
+    end
+
+    test "case-insensitive parsing" do
+      assert {:ok, :write} = Permissions.parse_permission("Write")
+      assert {:ok, :read} = Permissions.parse_permission("READ")
+      assert {:ok, :subagent} = Permissions.parse_permission("SUBAGENT")
+      assert {:ok, :memory_write} = Permissions.parse_permission("MEMORY_WRITE")
+    end
+  end
+
+  describe "valid_permission?/1" do
+    test "returns true for all canonical atoms" do
+      for perm <- Permissions.permissions() do
+        assert Permissions.valid_permission?(perm)
+      end
+    end
+
+    test "returns true for valid strings including aliases" do
+      assert Permissions.valid_permission?("read")
+      assert Permissions.valid_permission?("write")
+      assert Permissions.valid_permission?("subagent")
+      assert Permissions.valid_permission?("memory_write")
+      assert Permissions.valid_permission?("shell")
+      assert Permissions.valid_permission?("shell_readonly")
+    end
+
+    test "returns false for invalid atoms" do
+      refute Permissions.valid_permission?(:banana)
+    end
+
+    test "returns false for invalid strings" do
+      refute Permissions.valid_permission?("superuser")
+    end
+
+    test "returns false for non-atom non-string" do
+      refute Permissions.valid_permission?(123)
+      refute Permissions.valid_permission?(nil)
+    end
+  end
+
   # ── Escalation order ──────────────────────────────────────────────────
 
   describe "escalation_order/0" do
-    test "returns the canonical 7-level permission order" do
+    test "returns the canonical 9-level permission order" do
       assert Permissions.escalation_order() ==
-               [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+               [
+                 :read,
+                 :write,
+                 :shell_read,
+                 :shell_write,
+                 :terminal,
+                 :external,
+                 :destructive,
+                 :subagent,
+                 :memory_write
+               ]
     end
   end
 
@@ -21,8 +148,18 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.escalation_rank(:destructive) == 6
     end
 
+    test "returns 7 for :subagent" do
+      assert Permissions.escalation_rank(:subagent) == 7
+    end
+
+    test "returns 8 for :memory_write" do
+      assert Permissions.escalation_rank(:memory_write) == 8
+    end
+
     test "accepts string input" do
       assert Permissions.escalation_rank("write") == 1
+      assert Permissions.escalation_rank("subagent") == 7
+      assert Permissions.escalation_rank("memory_write") == 8
     end
   end
 
@@ -36,7 +173,19 @@ defmodule KiroCockpit.PermissionsTest do
     end
 
     test "returns full list for :destructive" do
-      assert Permissions.at_or_below(:destructive) == Permissions.escalation_order()
+      assert Permissions.at_or_below(:destructive) ==
+               [:read, :write, :shell_read, :shell_write, :terminal, :external, :destructive]
+    end
+
+    test "returns full list including subagent and memory_write for :memory_write" do
+      assert Permissions.at_or_below(:memory_write) == Permissions.escalation_order()
+    end
+
+    test "returns 8 permissions for :subagent" do
+      result = Permissions.at_or_below(:subagent)
+      assert length(result) == 8
+      assert :memory_write not in result
+      assert :subagent in result
     end
   end
 
@@ -65,6 +214,14 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.normalize_permission("destructive") == :destructive
     end
 
+    test "normalizes string 'subagent' to :subagent" do
+      assert Permissions.normalize_permission("subagent") == :subagent
+    end
+
+    test "normalizes string 'memory_write' to :memory_write" do
+      assert Permissions.normalize_permission("memory_write") == :memory_write
+    end
+
     test "falls back to :read for unknown strings" do
       assert Permissions.normalize_permission("banana") == :read
     end
@@ -86,11 +243,52 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.normalize_permission("READ") == :read
       assert Permissions.normalize_permission("Shell_Read") == :shell_read
       assert Permissions.normalize_permission("SHELL_WRITE") == :shell_write
+      assert Permissions.normalize_permission("SUBAGENT") == :subagent
+      assert Permissions.normalize_permission("MEMORY_WRITE") == :memory_write
     end
 
     test "arbitrary LLM string does not create atoms" do
       # Verifies no atom table pollution — unknown strings fall back to :read
       assert Permissions.normalize_permission("totally_made_up_permission") == :read
+    end
+  end
+
+  describe "normalize_step_permission/1" do
+    test "passes through scalar canonical atoms" do
+      assert Permissions.normalize_step_permission(:write) == :write
+      assert Permissions.normalize_step_permission(:subagent) == :subagent
+      assert Permissions.normalize_step_permission(:memory_write) == :memory_write
+    end
+
+    test "passes through scalar strings" do
+      assert Permissions.normalize_step_permission("write") == :write
+      assert Permissions.normalize_step_permission("subagent") == :subagent
+    end
+
+    test "handles list-valued permissions by picking highest" do
+      assert Permissions.normalize_step_permission(["read", "write"]) == :write
+      assert Permissions.normalize_step_permission(["write", "subagent"]) == :subagent
+      assert Permissions.normalize_step_permission(["memory_write", "read"]) == :memory_write
+    end
+
+    test "handles list with aliases" do
+      assert Permissions.normalize_step_permission(["shell", "read"]) == :shell_write
+    end
+
+    test "handles single-element list" do
+      assert Permissions.normalize_step_permission(["terminal"]) == :terminal
+    end
+
+    test "handles empty list gracefully (falls back to :read)" do
+      assert Permissions.normalize_step_permission([]) == :read
+    end
+
+    test "handles list with invalid values gracefully" do
+      assert Permissions.normalize_step_permission(["banana", "read"]) == :read
+    end
+
+    test "deduplicates list before picking highest" do
+      assert Permissions.normalize_step_permission(["write", "write", "read"]) == :write
     end
   end
 
@@ -103,6 +301,11 @@ defmodule KiroCockpit.PermissionsTest do
     test "handles mixed atoms and strings" do
       assert Permissions.normalize_permissions([:shell_write, "read", :terminal]) ==
                [:read, :shell_write, :terminal]
+    end
+
+    test "handles all 9 permissions" do
+      all = Permissions.normalize_permissions(Permissions.permission_strings())
+      assert all == Permissions.permissions()
     end
 
     test "returns empty list for empty input" do
@@ -179,6 +382,23 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.predict_permissions(plan) == [:read, :external]
     end
 
+    test "handles list-valued step permission field" do
+      plan = %{
+        "phases" => [
+          %{
+            "steps" => [
+              %{"permission" => ["subagent", "memory_write"]}
+            ]
+          }
+        ]
+      }
+
+      result = Permissions.predict_permissions(plan)
+      assert :subagent in result
+      assert :memory_write in result
+      assert :read in result
+    end
+
     test "combines top-level and step-level permissions" do
       plan = %{
         "permissions_needed" => ["read", "write"],
@@ -221,6 +441,17 @@ defmodule KiroCockpit.PermissionsTest do
       }
 
       assert Permissions.predict_permissions(plan) == [:read, :write]
+    end
+
+    test "predicts subagent and memory_write from plan" do
+      plan = %{
+        "permissions_needed" => ["subagent", "memory_write"],
+        "phases" => []
+      }
+
+      result = Permissions.predict_permissions(plan)
+      assert :subagent in result
+      assert :memory_write in result
     end
 
     test "heuristic: write permission from files with 'modify' keyword" do
@@ -331,8 +562,8 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.auto_allowed(:auto_allow_readonly) == [:read, :shell_read]
     end
 
-    test "auto_allow_all allows everything" do
-      assert Permissions.auto_allowed(:auto_allow_all) == Permissions.escalation_order()
+    test "auto_allow_all allows all 9 permissions" do
+      assert Permissions.auto_allowed(:auto_allow_all) == Permissions.permissions()
     end
   end
 
@@ -375,9 +606,31 @@ defmodule KiroCockpit.PermissionsTest do
       assert result == {:needs_approval, [:destructive]}
     end
 
+    test "returns needs_approval for subagent under auto_allow_readonly" do
+      result = Permissions.check_policy([:subagent], :auto_allow_readonly)
+      assert result == {:needs_approval, [:subagent]}
+    end
+
+    test "returns needs_approval for memory_write under auto_allow_readonly" do
+      result = Permissions.check_policy([:memory_write], :auto_allow_readonly)
+      assert result == {:needs_approval, [:memory_write]}
+    end
+
     test "returns :ok for all permissions under auto_allow_all" do
-      all = Permissions.escalation_order()
+      all = Permissions.permissions()
       assert Permissions.check_policy(all, :auto_allow_all) == :ok
+    end
+
+    test "subagent and memory_write need approval under read_only" do
+      assert {:needs_approval, [:subagent]} =
+               Permissions.check_policy([:subagent], :read_only)
+
+      assert {:needs_approval, [:memory_write]} =
+               Permissions.check_policy([:memory_write], :read_only)
+    end
+
+    test "subagent and memory_write pass under auto_allow_all" do
+      assert :ok = Permissions.check_policy([:subagent, :memory_write], :auto_allow_all)
     end
 
     test "multiple needing-approval permissions sorted by escalation" do
@@ -401,8 +654,16 @@ defmodule KiroCockpit.PermissionsTest do
       assert Permissions.requires_approval?([:write], :auto_allow_readonly)
     end
 
+    test "returns true when subagent under read_only" do
+      assert Permissions.requires_approval?([:subagent], :read_only)
+    end
+
+    test "returns true when memory_write under read_only" do
+      assert Permissions.requires_approval?([:memory_write], :read_only)
+    end
+
     test "returns false when all under auto_allow_all" do
-      refute Permissions.requires_approval?(Permissions.escalation_order(), :auto_allow_all)
+      refute Permissions.requires_approval?(Permissions.permissions(), :auto_allow_all)
     end
   end
 
@@ -431,6 +692,26 @@ defmodule KiroCockpit.PermissionsTest do
       plan = %{"permissions_needed" => ["read", "write"]}
       result = Permissions.gate_plan(plan, :read_only)
       assert {:needs_approval, _, [:write]} = result
+    end
+
+    test "gate_plan with subagent permission under read_only" do
+      plan = %{"permissions_needed" => ["read", "subagent"]}
+      result = Permissions.gate_plan(plan, :read_only)
+      assert {:needs_approval, _, needing} = result
+      assert :subagent in needing
+    end
+
+    test "gate_plan with memory_write permission under read_only" do
+      plan = %{"permissions_needed" => ["read", "memory_write"]}
+      result = Permissions.gate_plan(plan, :read_only)
+      assert {:needs_approval, _, needing} = result
+      assert :memory_write in needing
+    end
+
+    test "gate_plan with all 9 permissions under auto_allow_all" do
+      plan = %{"permissions_needed" => Permissions.permission_strings()}
+      assert {:ok, perms} = Permissions.gate_plan(plan, :auto_allow_all)
+      assert length(perms) == 9
     end
   end
 
