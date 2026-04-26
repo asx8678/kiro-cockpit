@@ -45,6 +45,15 @@ defmodule KiroCockpit.CLI.Commands.PlanTest do
       )
     end
 
+    def run_plan(id, opts) do
+      record(:run_plan, [id, opts])
+
+      Process.get(
+        :run_plan_result,
+        {:ok, %{default_plan(id) | status: "running"}}
+      )
+    end
+
     defp default_plan(id, session_id \\ "sess-1") do
       %{
         id: id,
@@ -113,12 +122,14 @@ defmodule KiroCockpit.CLI.Commands.PlanTest do
 
   defp planner_calls(key), do: Process.get({:fakeplanner, key}, [])
   defp plans_calls(key), do: Process.get({:fakeplans, key}, [])
+  defp run_plan_calls(), do: Process.get({:fakeplans, :run_plan}, [])
 
   setup do
     Process.put({:fakeplans, :get_plan}, [])
     Process.put({:fakeplans, :list_plans}, [])
     Process.put({:fakeplans, :reject_plan}, [])
     Process.put({:fakeplans, :update_status}, [])
+    Process.put({:fakeplans, :run_plan}, [])
     Process.put({:fakeplanner, :approve}, [])
     Process.put({:fakeplanner, :revise}, [])
     :ok
@@ -187,6 +198,15 @@ defmodule KiroCockpit.CLI.Commands.PlanTest do
                Plan.approve("abc", opts())
 
       assert msg =~ "stale"
+    end
+
+    test "maps :stale_plan_unknown" do
+      Process.put(:approve_result, {:error, :stale_plan_unknown})
+
+      assert {:error, %{code: :stale_plan_unknown, plan_id: "abc", message: msg}} =
+               Plan.approve("abc", opts())
+
+      assert msg =~ "staleness cannot be determined"
     end
 
     test "maps :invalid_transition" do
@@ -332,60 +352,71 @@ defmodule KiroCockpit.CLI.Commands.PlanTest do
   # ── run/2 ────────────────────────────────────────────────────────────
 
   describe "run/2" do
-    test "transitions an approved plan to running" do
+    test "transitions an approved plan to running via run_plan" do
       Process.put(
-        {:get_plan, "abc"},
-        %{id: "abc", status: "approved", mode: "nano", plan_steps: [], plan_events: []}
+        :run_plan_result,
+        {:ok, %{id: "abc", status: "running", mode: "nano", plan_steps: [], plan_events: []}}
       )
 
       assert {:ok, %{kind: :plan_running, plan_id: "abc", status: "running"}} =
                Plan.run("abc", opts())
 
-      assert [["abc", "running", %{"source" => "cli"}]] = plans_calls(:update_status)
+      assert [["abc", opts]] = run_plan_calls()
+      assert Keyword.get(opts, :project_dir) != nil
     end
 
-    test "refuses to run a draft plan" do
-      Process.put(
-        {:get_plan, "abc"},
-        %{id: "abc", status: "draft", mode: "nano", plan_steps: [], plan_events: []}
-      )
+    test "refuses to run a stale plan" do
+      Process.put(:run_plan_result, {:error, :stale_plan})
 
-      assert {:error, %{code: :invalid_transition, plan_id: "abc", status: "draft", message: msg}} =
+      assert {:error, %{code: :stale_plan, plan_id: "abc", message: msg}} =
                Plan.run("abc", opts())
 
-      assert msg =~ "only `approved`"
-      assert plans_calls(:update_status) == []
+      assert msg =~ "stale"
     end
 
-    test "refuses to run a completed/superseded plan" do
-      Process.put(
-        {:get_plan, "abc"},
-        %{id: "abc", status: "superseded", mode: "nano", plan_steps: [], plan_events: []}
-      )
+    test "refuses to run when staleness is unknown" do
+      Process.put(:run_plan_result, {:error, :stale_plan_unknown})
 
-      assert {:error, %{code: :invalid_transition, status: "superseded"}} =
+      assert {:error, %{code: :stale_plan_unknown, plan_id: "abc", message: msg}} =
+               Plan.run("abc", opts())
+
+      assert msg =~ "staleness cannot be determined"
+    end
+
+    test "refuses to run a plan not in approved status" do
+      Process.put(:run_plan_result, {:error, :invalid_transition})
+
+      assert {:error, %{code: :invalid_transition, plan_id: "abc"}} =
                Plan.run("abc", opts())
     end
 
     test "returns :not_found when plan does not exist" do
-      Process.put({:get_plan, "missing"}, nil)
+      Process.put(:run_plan_result, {:error, :not_found})
 
       assert {:error, %{code: :not_found, plan_id: "missing"}} =
                Plan.run("missing", opts())
     end
 
-    test "maps update_status errors to :run_failed" do
-      Process.put(
-        {:get_plan, "abc"},
-        %{id: "abc", status: "approved", mode: "nano", plan_steps: [], plan_events: []}
-      )
-
-      Process.put(:update_result, {:error, :db_down})
+    test "maps other errors to :run_failed" do
+      Process.put(:run_plan_result, {:error, :db_down})
 
       assert {:error, %{code: :run_failed, plan_id: "abc", message: msg}} =
                Plan.run("abc", opts())
 
       assert msg =~ "db_down"
+    end
+
+    test "passes project_dir and context_builder_module through to run_plan" do
+      Process.put(
+        :run_plan_result,
+        {:ok, %{id: "abc", status: "running", mode: "nano", plan_steps: [], plan_events: []}}
+      )
+
+      Plan.run("abc", opts(project_dir: "/my/project", context_builder_module: SomeBuilder))
+
+      assert [["abc", run_opts]] = run_plan_calls()
+      assert Keyword.get(run_opts, :project_dir) == "/my/project"
+      assert Keyword.get(run_opts, :context_builder_module) == SomeBuilder
     end
   end
 end

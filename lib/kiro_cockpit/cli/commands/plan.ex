@@ -139,6 +139,13 @@ defmodule KiroCockpit.CLI.Commands.Plan do
           plan_id: id
         )
 
+      {:error, :stale_plan_unknown} ->
+        Result.error(
+          :stale_plan_unknown,
+          "plan #{id} staleness cannot be determined — project dir unavailable or snapshot failed; provide project_dir to proceed",
+          plan_id: id
+        )
+
       {:error, :invalid_transition} ->
         Result.error(
           :invalid_transition,
@@ -272,49 +279,86 @@ defmodule KiroCockpit.CLI.Commands.Plan do
   end
 
   @doc """
-  Marks an approved plan as `running`.
+  Marks an approved plan as `running`, after a staleness check.
 
   This is an explicit status transition — it does NOT generate a new
   prompt and does NOT bypass approval. To go from draft to running,
   use `/plan approve` (which approves and dispatches the execution
   prompt) or `/plan approve` followed by `/plan run`.
 
-  Optional opts:
+  **Fail-closed**: before transitioning, a staleness check is performed.
+  If the project has changed since the plan was created, the run is
+  blocked with `:stale_plan`. If staleness cannot be determined (e.g.
+  no `project_dir`), the run is blocked with `:stale_plan_unknown`.
+
+  ## Optional opts
 
     * `:plans_module` (default `KiroCockpit.Plans`) — injected for
-      tests. Must implement `get_plan/1` and `update_status/3`.
+      tests. Must implement `run_plan/2`.
+    * `:project_dir` — trusted project directory for staleness check.
+      Falls back to the current working directory if not provided.
+    * `:context_builder_module` — module implementing `build/1` for
+      staleness checks (forwarded to `Plans.run_plan/2`).
   """
   @spec run(String.t(), keyword()) :: KiroCockpit.CLI.result()
   def run(id, opts) do
-    {plans_mod, _} = pop_plans(opts)
+    {plans_mod, opts} = pop_plans(opts)
+    # Use provided project_dir or fall back to cwd
+    opts = Keyword.put_new(opts, :project_dir, File.cwd!())
 
-    case plans_mod.get_plan(id) do
-      nil ->
+    case plans_mod.run_plan(id, run_opts(opts)) do
+      {:ok, running_plan} ->
+        Result.ok(:plan_running, %{
+          plan: running_plan,
+          plan_id: running_plan.id,
+          status: running_plan.status,
+          message: "Plan #{running_plan.id} transitioned to running"
+        })
+
+      {:error, :not_found} ->
         Result.error(:not_found, "plan not found: #{id}", plan_id: id)
 
-      %{status: "approved"} ->
-        case plans_mod.update_status(id, "running", %{"source" => "cli"}) do
-          {:ok, running_plan} ->
-            Result.ok(:plan_running, %{
-              plan: running_plan,
-              plan_id: running_plan.id,
-              status: running_plan.status,
-              message: "Plan #{running_plan.id} transitioned to running"
-            })
+      {:error, :invalid_transition} ->
+        # Fetch current status for a helpful message
+        status = current_plan_status(plans_mod, id)
 
-          {:error, reason} ->
-            Result.error(:run_failed, "could not transition plan to running: #{inspect(reason)}",
-              plan_id: id
-            )
-        end
-
-      %{status: status} ->
         Result.error(
           :invalid_transition,
           "plan #{id} is in `#{status}` status — only `approved` plans can be run",
           plan_id: id,
           status: status
         )
+
+      {:error, :stale_plan} ->
+        Result.error(
+          :stale_plan,
+          "plan #{id} is stale — the project has changed since it was generated; revise or regenerate",
+          plan_id: id
+        )
+
+      {:error, :stale_plan_unknown} ->
+        Result.error(
+          :stale_plan_unknown,
+          "plan #{id} staleness cannot be determined — project dir unavailable or snapshot failed; provide project_dir to proceed",
+          plan_id: id
+        )
+
+      {:error, reason} ->
+        Result.error(:run_failed, "could not transition plan to running: #{inspect(reason)}",
+          plan_id: id
+        )
+    end
+  end
+
+  defp run_opts(opts) do
+    Keyword.take(opts, [:project_dir, :context_builder_module])
+    |> Keyword.put(:payload, %{"source" => "cli"})
+  end
+
+  defp current_plan_status(plans_mod, id) do
+    case plans_mod.get_plan(id) do
+      nil -> "unknown"
+      plan -> plan.status
     end
   end
 

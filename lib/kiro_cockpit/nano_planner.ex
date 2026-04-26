@@ -22,7 +22,7 @@ defmodule KiroCockpit.NanoPlanner do
   Any other mode returns `{:error, {:invalid_mode, mode}}`.
   """
 
-  alias KiroCockpit.NanoPlanner.{ContextBuilder, PlanSchema, PromptBuilder}
+  alias KiroCockpit.NanoPlanner.{ContextBuilder, PlanSchema, PromptBuilder, Staleness}
   alias KiroCockpit.Plans
 
   @supported_modes [:nano, :nano_deep, :nano_fix]
@@ -91,8 +91,9 @@ defmodule KiroCockpit.NanoPlanner do
 
   Before approval, checks whether the project snapshot has changed since
   the plan was created. If the hash differs, returns `{:error, :stale_plan}`.
-  If the current project dir is unavailable, the staleness check is skipped
-  rather than crashing.
+  If the current project dir is unavailable or the snapshot cannot be
+  computed, returns `{:error, :stale_plan_unknown}` — the check **fails
+  closed** rather than being skipped.
 
   After approval (`Plans.approve_plan/1`), the plan's `execution_prompt`
   is sent to Kiro via `prompt/3`.
@@ -102,6 +103,10 @@ defmodule KiroCockpit.NanoPlanner do
     * `:kiro_session_module` — module for `state/1` and `prompt/3`
       (default `KiroCockpit.KiroSession`).
     * `:planner_timeout` — timeout for the execution prompt call in ms.
+    * `:project_dir` — trusted project directory override.
+    * `:context_builder_module` — module implementing `build/1` for
+      staleness checks (default `ContextBuilder`). Useful for testing
+      snapshot-build failure scenarios.
 
   Returns `{:ok, %{plan: approved_plan, prompt_result: result}}` on success,
   or `{:error, reason}` on failure. If the prompt send fails after approval,
@@ -114,7 +119,8 @@ defmodule KiroCockpit.NanoPlanner do
     session_mod = resolve_session_module(opts)
 
     with {:ok, plan} <- fetch_plan(plan_id),
-         :ok <- check_not_stale(plan, session_mod, session, opts) do
+         {:ok, project_dir} <- resolve_project_dir_for_staleness(session_mod, session, opts),
+         :ok <- Staleness.check(plan, project_dir, opts) do
       case Plans.approve_plan(plan_id) do
         {:ok, approved_plan} ->
           send_execution_prompt(session_mod, session, approved_plan, opts)
@@ -480,40 +486,20 @@ defmodule KiroCockpit.NanoPlanner do
     end
   end
 
-  defp check_not_stale(plan, session_mod, session, opts) do
-    case safe_session_call(fn -> session_mod.state(session) end) do
-      {:ok, session_state} ->
-        project_dir = Keyword.get(opts, :project_dir) || Map.get(session_state, :cwd)
-        if project_dir, do: check_staleness(plan, project_dir, opts), else: :ok
+  # Resolves a trusted project directory for staleness checks.
+  # Fails closed: returns `{:error, :stale_plan_unknown}` when no
+  # project dir can be determined.
+  defp resolve_project_dir_for_staleness(session_mod, session, opts) do
+    case Keyword.get(opts, :project_dir) do
+      dir when is_binary(dir) and dir != "" ->
+        {:ok, dir}
 
-      {:error, _reason} ->
-        :ok
-    end
-  end
-
-  defp check_staleness(plan, project_dir, opts) do
-    case ContextBuilder.build(staleness_context_opts(project_dir, opts)) do
-      {:ok, current_snapshot} ->
-        if current_snapshot.hash == plan.project_snapshot_hash do
-          :ok
-        else
-          {:error, :stale_plan}
+      _ ->
+        case safe_session_call(fn -> session_mod.state(session) end) do
+          {:ok, %{cwd: cwd}} when is_binary(cwd) and cwd != "" -> {:ok, cwd}
+          _ -> {:error, :stale_plan_unknown}
         end
-
-      {:error, _} ->
-        :ok
     end
-  end
-
-  defp staleness_context_opts(project_dir, opts) do
-    [
-      project_dir: project_dir,
-      session_summary: Keyword.get(opts, :session_summary),
-      max_tree_lines: Keyword.get(opts, :max_tree_lines),
-      max_file_chars_per_file: Keyword.get(opts, :max_file_chars_per_file),
-      max_total_context_chars: Keyword.get(opts, :max_total_context_chars)
-    ]
-    |> Enum.reject(fn {_k, value} -> is_nil(value) end)
   end
 
   defp send_execution_prompt(session_mod, session, approved_plan, opts) do

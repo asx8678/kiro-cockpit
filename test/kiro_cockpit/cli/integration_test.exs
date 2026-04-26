@@ -61,6 +61,23 @@ defmodule KiroCockpit.CLI.IntegrationTest do
     plan
   end
 
+  defp create_real_plan_with_hash(hash, session_id \\ "sess-int") do
+    attrs = Map.put(default_plan_attrs(), :project_snapshot_hash, hash)
+    {:ok, plan} = Plans.create_plan(session_id, "build it", :nano, [], attrs)
+    plan
+  end
+
+  defp setup_integration_project_dir do
+    dir =
+      System.tmp_dir!()
+      |> Path.join("cli_int_test_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "mix.exs"), "defmodule Test.Project do end")
+    File.write!(Path.join(dir, "README.md"), "# Test")
+    dir
+  end
+
   defp opts(extra \\ []) do
     Keyword.merge(
       [
@@ -145,23 +162,44 @@ defmodule KiroCockpit.CLI.IntegrationTest do
   end
 
   describe "/plan run against real Plans module" do
-    test "transitions an approved plan to running" do
-      plan = create_real_plan()
+    test "transitions an approved plan to running when not stale" do
+      dir = setup_integration_project_dir()
+      {:ok, snapshot} = KiroCockpit.NanoPlanner.ContextBuilder.build(project_dir: dir)
+
+      plan = create_real_plan_with_hash(snapshot.hash)
       {:ok, _approved} = Plans.approve_plan(plan.id)
 
       assert {:ok, %{kind: :plan_running, status: "running"}} =
-               CLI.run("/plan run #{plan.id}", opts())
+               CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
 
       assert Plans.get_plan(plan.id).status == "running"
+
+      File.rm_rf!(dir)
+    end
+
+    test "refuses to run a stale plan" do
+      dir = setup_integration_project_dir()
+      plan = create_real_plan()
+      {:ok, _approved} = Plans.approve_plan(plan.id)
+
+      assert {:error, %{code: :stale_plan}} =
+               CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
+
+      assert Plans.get_plan(plan.id).status == "approved"
+
+      File.rm_rf!(dir)
     end
 
     test "refuses to run a draft plan" do
+      dir = setup_integration_project_dir()
       plan = create_real_plan()
 
-      assert {:error, %{code: :invalid_transition, status: "draft"}} =
-               CLI.run("/plan run #{plan.id}", opts())
+      assert {:error, %{code: :invalid_transition}} =
+               CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
 
       assert Plans.get_plan(plan.id).status == "draft"
+
+      File.rm_rf!(dir)
     end
   end
 end

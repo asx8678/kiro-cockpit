@@ -190,6 +190,53 @@ defmodule KiroCockpit.Plans do
   end
 
   @doc """
+  Runs an approved plan after verifying it is not stale.
+
+  This is the fail-closed entry point for plan execution. It checks:
+
+    1. The plan exists and is in `"approved"` status
+    2. The project snapshot has not changed (via `Staleness.check/3`)
+
+  If both checks pass, transitions the plan to `"running"`.
+
+  ## Options
+
+    * `:project_dir` — trusted project directory for staleness check
+      (required; returns `{:error, :stale_plan_unknown}` if absent)
+    * `:context_builder_module` — module implementing `build/1` for
+      staleness checks (default `NanoPlanner.ContextBuilder`)
+    * `:payload` — map merged into the status-change event payload
+      (default `%{"source" => "run"}`)
+
+  Returns `{:ok, Plan.t()}` on success, or one of:
+
+    * `{:error, :not_found}` — plan does not exist
+    * `{:error, :invalid_transition}` — plan is not in `"approved"` status
+    * `{:error, :stale_plan}` — project has changed since plan was created
+    * `{:error, :stale_plan_unknown}` — cannot determine staleness
+  """
+  @spec run_plan(plan_id(), keyword()) ::
+          {:ok, Plan.t()} | {:error, term()}
+  def run_plan(plan_id, opts \\ []) do
+    alias KiroCockpit.NanoPlanner.Staleness
+
+    with {:ok, plan} <- fetch_plan(plan_id),
+         :ok <- require_status(plan, "approved"),
+         {:ok, project_dir} <- resolve_project_dir(opts),
+         :ok <- Staleness.check(plan, project_dir, opts) do
+      payload = Keyword.get(opts, :payload, %{"source" => "run"})
+      update_plan_with_event(plan, %{status: "running"}, "running", payload)
+    end
+  end
+
+  defp resolve_project_dir(opts) do
+    case Keyword.get(opts, :project_dir) do
+      dir when is_binary(dir) and dir != "" -> {:ok, dir}
+      _ -> {:error, :stale_plan_unknown}
+    end
+  end
+
+  @doc """
   Updates a plan's status and adds an event.
   Used for running, completed, failed, superseded transitions.
   """

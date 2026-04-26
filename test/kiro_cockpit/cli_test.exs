@@ -94,6 +94,19 @@ defmodule KiroCockpit.CLITest do
       end
     end
 
+    def run_plan(plan_id, opts) do
+      record(:run_plan, {plan_id, opts})
+
+      case Process.get(:fake_run_plan_result) do
+        nil ->
+          # Default: assume approved and not stale
+          {:ok, fake_plan(%{id: plan_id, status: "running"})}
+
+        result ->
+          result
+      end
+    end
+
     defp fake_plan(overrides) do
       defaults = %{
         id: "plan-abc",
@@ -333,18 +346,12 @@ defmodule KiroCockpit.CLITest do
       assert [{"abc", nil}] = calls(:reject_plan)
     end
 
-    test "{:plan, :run, id} on approved plan calls update_status/3 with running" do
-      Process.put(:fake_get_plan_result, %{
-        id: "abc",
-        status: "approved",
-        mode: "nano",
-        plan_steps: []
-      })
-
+    test "{:plan, :run, id} on approved plan calls run_plan/2" do
       assert {:ok, %{kind: :plan_running, status: "running"}} =
                CLI.dispatch({:plan, :run, "abc"}, fake_opts())
 
-      assert [{"abc", "running", %{"source" => "cli"}}] = calls(:update_status)
+      assert [{"abc", opts}] = calls(:run_plan)
+      assert Keyword.get(opts, :project_dir) != nil
     end
   end
 

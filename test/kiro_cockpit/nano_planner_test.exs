@@ -451,6 +451,107 @@ defmodule KiroCockpit.NanoPlannerTest do
 
   # ── approve/3 ────────────────────────────────────────────────────────
 
+  describe "Staleness.check/3" do
+    alias KiroCockpit.NanoPlanner.Staleness
+
+    setup [:setup_project_dir]
+
+    test "returns :ok when hashes match", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      assert :ok = Staleness.check(plan, dir, [])
+    end
+
+    test "returns {:error, :stale_plan} when hashes differ", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      File.write!(Path.join(dir, "NEW_FILE.md"), "# Changed")
+
+      assert {:error, :stale_plan} = Staleness.check(plan, dir, [])
+    end
+
+    test "returns {:error, :stale_plan_unknown} when project_dir is nil" do
+      plan = %KiroCockpit.Plans.Plan{project_snapshot_hash: "abc123"}
+      assert {:error, :stale_plan_unknown} = Staleness.check(plan, nil, [])
+    end
+
+    test "returns {:error, :stale_plan_unknown} when project_dir is empty" do
+      plan = %KiroCockpit.Plans.Plan{project_snapshot_hash: "abc123"}
+      assert {:error, :stale_plan_unknown} = Staleness.check(plan, "", [])
+    end
+
+    test "returns {:error, :stale_plan_unknown} when snapshot build fails", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      # Remove the project dir so snapshot build fails
+      File.rm_rf!(dir)
+
+      assert {:error, :stale_plan_unknown} = Staleness.check(plan, dir, [])
+
+      File.mkdir_p!(dir)
+    end
+
+    test "returns {:error, :stale_plan_unknown} with injectable broken context_builder_module", %{
+      project_dir: dir
+    } do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      defmodule StalenessTestBrokenBuilder do
+        @moduledoc false
+        def build(_opts), do: {:error, :simulated_failure}
+      end
+
+      assert {:error, :stale_plan_unknown} =
+               Staleness.check(plan, dir, context_builder_module: StalenessTestBrokenBuilder)
+    end
+  end
+
+  describe "Staleness.trusted_context/3" do
+    alias KiroCockpit.NanoPlanner.Staleness
+
+    setup [:setup_project_dir]
+
+    test "returns %{stale_plan?: false} when fresh", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      assert %{stale_plan?: false} = Staleness.trusted_context(plan, dir, [])
+    end
+
+    test "returns %{stale_plan?: true, reason: :stale_plan} when stale", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      File.write!(Path.join(dir, "NEW_FILE.md"), "# Changed")
+
+      assert %{stale_plan?: true, reason: :stale_plan} =
+               Staleness.trusted_context(plan, dir, [])
+    end
+
+    test "returns %{stale_plan?: true, reason: :stale_plan_unknown} when dir is nil" do
+      plan = %KiroCockpit.Plans.Plan{project_snapshot_hash: "abc123"}
+
+      assert %{stale_plan?: true, reason: :stale_plan_unknown} =
+               Staleness.trusted_context(plan, nil, [])
+    end
+  end
+
   describe "approve/3 happy path" do
     setup [:setup_project_dir]
 
@@ -533,29 +634,93 @@ defmodule KiroCockpit.NanoPlannerTest do
                )
     end
 
-    test "skips staleness check when project dir is unavailable", %{project_dir: dir} do
+    test "fails closed when project dir is unavailable", %{project_dir: dir} do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
 
       assert {:ok, plan} =
                NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
 
-      # Modify the project
-      File.write!(Path.join(dir, "NEW_FILE.md"), "# Changed")
-
-      # Session state has no cwd
+      # Session state has no cwd, and no :project_dir opt
       Process.put(:fake_kiro_state, %{session_id: "test-session", cwd: nil})
-
-      # Approval should succeed because staleness check is skipped
-      Process.put(:fake_kiro_prompt_result, {:ok, %{"ok" => true}})
+      # Reset prompt calls from plan/3 — we only care about approve prompts
       Process.put(:fake_kiro_prompt_calls, [])
 
-      assert {:ok, %{plan: approved_plan}} =
+      # Approval must be blocked — fail closed
+      assert {:error, :stale_plan_unknown} =
                NanoPlanner.approve(:fake_session, plan.id, kiro_session_module: FakeKiroSession)
 
-      assert approved_plan.status == "approved"
+      # Plan should still be draft, not approved
+      refreshed = Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
+      # No prompt should have been sent during approve
+      calls = Process.get(:fake_kiro_prompt_calls, [])
+      assert calls == []
 
       # Restore state
       Process.put(:fake_kiro_state, %{session_id: "test-session", cwd: dir})
+    end
+
+    test "fails closed when snapshot build fails", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      # Delete the project dir so snapshot build fails
+      File.rm_rf!(dir)
+
+      # Reset prompt calls from plan/3
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # Approval must be blocked — fail closed
+      assert {:error, :stale_plan_unknown} =
+               NanoPlanner.approve(:fake_session, plan.id,
+                 kiro_session_module: FakeKiroSession,
+                 project_dir: dir
+               )
+
+      # Plan should still be draft
+      refreshed = Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
+      # No prompt should have been sent during approve
+      calls = Process.get(:fake_kiro_prompt_calls, [])
+      assert calls == []
+
+      # Re-create dir for on_exit cleanup (though it was already removed)
+      File.mkdir_p!(dir)
+    end
+
+    test "fails closed with injectable context_builder_module that errors", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      defmodule BrokenContextBuilder do
+        @moduledoc false
+        def build(_opts), do: {:error, :simulated_failure}
+      end
+
+      # Reset prompt calls from plan/3
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # Approval must be blocked when context builder fails
+      assert {:error, :stale_plan_unknown} =
+               NanoPlanner.approve(:fake_session, plan.id,
+                 kiro_session_module: FakeKiroSession,
+                 project_dir: dir,
+                 context_builder_module: BrokenContextBuilder
+               )
+
+      # Plan should still be draft
+      refreshed = Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
+      # No prompt should have been sent
+      calls = Process.get(:fake_kiro_prompt_calls, [])
+      assert calls == []
     end
   end
 
