@@ -431,10 +431,10 @@ defmodule KiroCockpit.PlansTest do
       assert running.status == "running"
     end
 
-    test "refuses to run a stale plan", %{project_dir: dir} do
+    test "refuses to run a stale plan via boundary when hooks enabled", %{project_dir: dir} do
       {:ok, plan} =
         Plans.create_plan(
-          "sess",
+          "sess_stale_run",
           "req",
           :nano,
           [],
@@ -443,8 +443,50 @@ defmodule KiroCockpit.PlansTest do
 
       {:ok, approved} = Plans.approve_plan(plan.id)
 
-      # The project snapshot_hash is "hash123" which won't match the real dir
-      assert {:error, :stale_plan} = Plans.run_plan(approved.id, project_dir: dir)
+      # The project snapshot_hash is "hash123" which won't match the real dir.
+      # With hooks enabled, staleness is checked inside ActionBoundary via
+      # TaskEnforcementHook, which blocks the run and persists a Bronze trace.
+      assert {:error, {:swarm_blocked, reason}} =
+               Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 swarm_hooks: true,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
+               )
+
+      assert reason =~ "Stale plan"
+
+      # Plan must NOT transition to running
+      refreshed = Plans.get_plan(approved.id)
+      assert refreshed.status == "approved"
+
+      # Bronze trace should be persisted for the blocked attempt
+      events = KiroCockpit.Swarm.Events.list_by_session("sess_stale_run", limit: 10)
+      assert length(events) >= 1
+      trace = List.first(events)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "blocked"
+      assert trace.hook_results["action"] == "nano_plan_run"
+    end
+
+    test "run_plan stale check skipped when hooks disabled (default test config)", %{
+      project_dir: dir
+    } do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess_stale_skip",
+          "req",
+          :nano,
+          [],
+          default_opts()
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      # With hooks disabled (default test config), staleness check is skipped
+      # and the plan transitions to running directly
+      assert {:ok, running} = Plans.run_plan(approved.id, project_dir: dir)
+      assert running.status == "running"
     end
 
     test "refuses to run when project_dir is nil" do
@@ -480,10 +522,10 @@ defmodule KiroCockpit.PlansTest do
                Plans.run_plan(Ecto.UUID.generate(), project_dir: dir)
     end
 
-    test "refuses to run when context builder fails", %{project_dir: dir} do
+    test "refuses to run when context builder fails via boundary", %{project_dir: dir} do
       {:ok, plan} =
         Plans.create_plan(
-          "sess",
+          "sess_cb_fail",
           "req",
           :nano,
           [],
@@ -497,11 +539,18 @@ defmodule KiroCockpit.PlansTest do
         def build(_opts), do: {:error, :simulated_failure}
       end
 
-      assert {:error, :stale_plan_unknown} =
+      # With hooks enabled, the broken context builder triggers stale_plan_unknown
+      # inside the boundary, which TaskEnforcementHook blocks.
+      assert {:error, {:swarm_blocked, reason}} =
                Plans.run_plan(approved.id,
                  project_dir: dir,
-                 context_builder_module: PlansTestBrokenBuilder
+                 swarm_hooks: true,
+                 context_builder_module: PlansTestBrokenBuilder,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
                )
+
+      assert reason =~ "Stale plan"
 
       # Plan should NOT be running
       refreshed = Plans.get_plan(approved.id)

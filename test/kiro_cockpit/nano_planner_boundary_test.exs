@@ -488,7 +488,7 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       assert reason =~ "Stale plan"
     end
 
-    test "nano_plan_approve blocked by pre-boundary Staleness.check", %{project_dir: dir} do
+    test "nano_plan_approve blocked by boundary stale check", %{project_dir: dir} do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
       session_id = "lifecycle-stale-approve-#{System.unique_integer([:positive])}"
 
@@ -516,10 +516,301 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
 
       result = NanoPlanner.approve(:fake_session, plan.id, approve_opts)
 
-      # Pre-boundary Staleness.check catches the stale snapshot
-      # and returns {:error, :stale_plan} before the boundary runs.
-      # (kiro-ux7 will move staleness into the boundary executor)
-      assert {:error, :stale_plan} = result
+      # Staleness is now checked inside the boundary via TaskEnforcementHook,
+      # which blocks the stale plan and returns {:error, {:swarm_blocked, ...}}
+      assert {:error, {:swarm_blocked, reason, _messages}} = result
+      assert reason =~ "Stale plan"
+
+      # Plan should still be draft (not approved)
+      refreshed = KiroCockpit.Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+
+      # No prompt should have been sent
+      calls = Process.get(:fake_kiro_prompt_calls, [])
+      assert calls == []
+
+      # Bronze trace should be persisted for the blocked attempt
+      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+
+      approve_traces =
+        Enum.filter(events, fn e ->
+          e.hook_results["action"] == "nano_plan_approve"
+        end)
+
+      assert length(approve_traces) >= 1
+      trace = List.first(approve_traces)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "blocked"
+    end
+  end
+
+  # ── Stale plan override tests ─────────────────────────────────────────
+
+  describe "stale plan trusted override for approve/3" do
+    setup [:setup_project_dir]
+
+    test "stale_plan_confirmed? allows stale approve through boundary", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "override-approve-#{System.unique_integer([:positive])}"
+
+      plan_opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+
+      assert {:ok, plan} = NanoPlanner.plan(:fake_session, "Build it", plan_opts)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "OVERRIDE_TEST.md"), "# Stale override test")
+
+      Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # Approve with stale_plan_confirmed? override — should succeed
+      approve_opts = [
+        kiro_session_module: FakeKiroSession,
+        project_dir: dir,
+        session_id: session_id,
+        swarm_hooks: true,
+        stale_plan_confirmed?: true,
+        pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+        post_hooks: []
+      ]
+
+      assert {:ok, %{plan: approved_plan}} =
+               NanoPlanner.approve(:fake_session, plan.id, approve_opts)
+
+      assert approved_plan.status == "approved"
+
+      # Bronze trace should show allowed outcome
+      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+
+      approve_traces =
+        Enum.filter(events, fn e ->
+          e.hook_results["action"] == "nano_plan_approve"
+        end)
+
+      assert length(approve_traces) >= 1
+      trace = List.first(approve_traces)
+      assert trace.event_type == "hook_trace"
+      assert trace.hook_results["outcome"] == "ok"
+    end
+
+    test "stale_plan_override? allows stale approve through boundary", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "override-approve2-#{System.unique_integer([:positive])}"
+
+      plan_opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+
+      assert {:ok, plan} = NanoPlanner.plan(:fake_session, "Build it", plan_opts)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "OVERRIDE2.md"), "# Stale override test 2")
+
+      Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      approve_opts = [
+        kiro_session_module: FakeKiroSession,
+        project_dir: dir,
+        session_id: session_id,
+        swarm_hooks: true,
+        stale_plan_override?: true,
+        pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+        post_hooks: []
+      ]
+
+      assert {:ok, %{plan: approved_plan}} =
+               NanoPlanner.approve(:fake_session, plan.id, approve_opts)
+
+      assert approved_plan.status == "approved"
+    end
+
+    test "payload/metadata cannot bypass stale check for approve", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "payload-stale-approve-#{System.unique_integer([:positive])}"
+
+      plan_opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+
+      assert {:ok, plan} = NanoPlanner.plan(:fake_session, "Build it", plan_opts)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "PAYLOAD_TEST.md"), "# Payload override attempt")
+
+      Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # Attempt override via payload — must be ignored by trusted ctx
+      approve_opts = [
+        kiro_session_module: FakeKiroSession,
+        project_dir: dir,
+        session_id: session_id,
+        swarm_hooks: true,
+        payload: %{stale_plan_override?: true, stale_plan_confirmed?: true},
+        pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+        post_hooks: []
+      ]
+
+      result = NanoPlanner.approve(:fake_session, plan.id, approve_opts)
+
+      # Should still be blocked — payload is not trusted for stale override
+      assert {:error, {:swarm_blocked, reason, _messages}} = result
+      assert reason =~ "Stale plan"
+
+      # Plan should still be draft
+      refreshed = KiroCockpit.Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+    end
+
+    test "metadata cannot bypass stale check for approve", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "meta-stale-approve-#{System.unique_integer([:positive])}"
+
+      plan_opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+
+      assert {:ok, plan} = NanoPlanner.plan(:fake_session, "Build it", plan_opts)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "META_TEST.md"), "# Metadata override attempt")
+
+      Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # Attempt override via metadata — must be ignored by trusted ctx
+      approve_opts = [
+        kiro_session_module: FakeKiroSession,
+        project_dir: dir,
+        session_id: session_id,
+        swarm_hooks: true,
+        metadata: %{stale_plan_override?: true, stale_plan_confirmed?: true},
+        pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+        post_hooks: []
+      ]
+
+      result = NanoPlanner.approve(:fake_session, plan.id, approve_opts)
+
+      # Should still be blocked — metadata is not trusted for stale override
+      assert {:error, {:swarm_blocked, reason, _messages}} = result
+      assert reason =~ "Stale plan"
+
+      # Plan should still be draft
+      refreshed = KiroCockpit.Plans.get_plan(plan.id)
+      assert refreshed.status == "draft"
+    end
+  end
+
+  describe "stale plan trusted override for run_plan" do
+    setup [:setup_project_dir]
+
+    test "stale_plan_confirmed? allows stale run through boundary", %{project_dir: dir} do
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          "override-run-sess",
+          "req",
+          :nano,
+          [],
+          %{
+            plan_markdown: "# Plan",
+            execution_prompt: "Execute",
+            raw_model_output: %{},
+            project_snapshot_hash: compute_hash(dir)
+          }
+        )
+
+      {:ok, approved} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "RUN_OVERRIDE.md"), "# Run stale override")
+
+      # Run with stale_plan_confirmed? override
+      assert {:ok, running} =
+               KiroCockpit.Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 session_id: "override-run-sess",
+                 swarm_hooks: true,
+                 stale_plan_confirmed?: true,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
+               )
+
+      assert running.status == "running"
+    end
+
+    test "stale_plan_override? allows stale run through boundary", %{project_dir: dir} do
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          "override-run-sess2",
+          "req",
+          :nano,
+          [],
+          %{
+            plan_markdown: "# Plan",
+            execution_prompt: "Execute",
+            raw_model_output: %{},
+            project_snapshot_hash: compute_hash(dir)
+          }
+        )
+
+      {:ok, approved} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "RUN_OVERRIDE2.md"), "# Run stale override 2")
+
+      assert {:ok, running} =
+               KiroCockpit.Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 session_id: "override-run-sess2",
+                 swarm_hooks: true,
+                 stale_plan_override?: true,
+                 pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+                 post_hooks: []
+               )
+
+      assert running.status == "running"
+    end
+
+    test "payload/metadata cannot bypass stale check for run", %{project_dir: dir} do
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          "payload-run-sess",
+          "req",
+          :nano,
+          [],
+          %{
+            plan_markdown: "# Plan",
+            execution_prompt: "Execute",
+            raw_model_output: %{},
+            project_snapshot_hash: compute_hash(dir)
+          }
+        )
+
+      {:ok, approved} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      # Make the project stale
+      File.write!(Path.join(dir, "PAYLOAD_RUN.md"), "# Payload run override attempt")
+
+      # Attempt override via payload in opts — must be ignored by trusted ctx
+      result =
+        KiroCockpit.Plans.run_plan(approved.id,
+          project_dir: dir,
+          session_id: "payload-run-sess",
+          swarm_hooks: true,
+          payload: %{stale_plan_override?: true, stale_plan_confirmed?: true},
+          pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+          post_hooks: []
+        )
+
+      assert {:error, {:swarm_blocked, reason}} = result
+      assert reason =~ "Stale plan"
+
+      # Plan should not transition
+      refreshed = KiroCockpit.Plans.get_plan(approved.id)
+      assert refreshed.status == "approved"
     end
   end
 
@@ -554,5 +845,12 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       # PlanMode blocks with "Action blocked during planning" or similar
       assert is_binary(reason)
     end
+  end
+
+  # ── Helpers ───────────────────────────────────────────────────────────
+
+  defp compute_hash(project_dir) do
+    {:ok, snapshot} = KiroCockpit.NanoPlanner.ContextBuilder.build(project_dir: project_dir)
+    snapshot.hash
   end
 end
