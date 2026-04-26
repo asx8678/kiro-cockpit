@@ -129,10 +129,20 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
     end
   end
 
+  # Default and max limits for list queries (per §27.11 inv. 7 Bronze sizing guidance)
+  @default_limit 50
+  @max_limit 100
+
   @doc """
   Lists tasks for a given session, optionally filtered by status or plan_id.
 
   Tasks are ordered by `sequence` then `inserted_at`.
+
+  ## Options
+
+    * `:status` - filter by task status (e.g., "pending", "in_progress", "completed")
+    * `:plan_id` - filter by plan ID
+    * `:limit` - max results to return (default #{@default_limit}, max #{@max_limit})
   """
   @spec list(session_id, keyword()) :: [Task.t()]
   def list(session_id, opts \\ []) do
@@ -155,8 +165,19 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
         query
       end
 
+    query =
+      if limit = Keyword.get(opts, :limit) do
+        limit(query, ^normalize_limit(limit))
+      else
+        query
+      end
+
     Repo.all(query)
   end
+
+  defp normalize_limit(limit) when is_integer(limit) and limit > @max_limit, do: @max_limit
+  defp normalize_limit(limit) when is_integer(limit) and limit > 0, do: limit
+  defp normalize_limit(_other), do: @default_limit
 
   @doc """
   Finds the currently active (`in_progress`) task for an execution lane.

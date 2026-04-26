@@ -315,20 +315,12 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   end
 
   # Hydrate :plan from Plans.get_plan/1 if plan_id is available and not in ctx
-  defp maybe_hydrate_plan(ctx, _opts, event) do
-    if Map.has_key?(ctx, :plan) do
-      ctx
-    else
-      case event.plan_id do
-        nil ->
-          ctx
-
-        plan_id ->
-          case safe_get_plan(plan_id) do
-            nil -> ctx
-            plan -> Map.put(ctx, :plan, plan)
-          end
-      end
+  defp maybe_hydrate_plan(ctx, _opts, _event) when is_map_key(ctx, :plan), do: ctx
+  defp maybe_hydrate_plan(ctx, _opts, %{plan_id: nil}), do: ctx
+  defp maybe_hydrate_plan(ctx, _opts, %{plan_id: plan_id}) do
+    case safe_get_plan(plan_id) do
+      nil -> ctx
+      plan -> Map.put(ctx, :plan, plan)
     end
   end
 
