@@ -95,6 +95,41 @@ defmodule KiroCockpit.Swarm.Hooks.TaskEnforcementHook do
   end
 
   # Apply the outer plan-mode gate before task/category checks.
+  #
+  # Lifecycle actions (:nano_plan_generate, :nano_plan_approve, :nano_plan_run)
+  # are special-cased: they are allowed through the plan-mode gate even when
+  # their permission level (e.g. :subagent for generate, :write for approve)
+  # would normally be blocked in planning/waiting_for_approval states.
+  #
+  # Allowed plan-mode states per lifecycle action:
+  #   :nano_plan_generate → :idle, :planning
+  #   :nano_plan_approve  → :waiting_for_approval, :approved (post-approval retry)
+  #   :nano_plan_run      → :approved, :executing
+  #
+  # Other actions fall through to the standard PlanMode.check_action/2 gate.
+  defp check_plan_mode(%Event{action_name: action} = event, ctx)
+       when action in [:nano_plan_generate, :nano_plan_approve, :nano_plan_run] do
+    plan_mode = Map.get(ctx, :plan_mode) || PlanMode.new()
+
+    allowed =
+      case action do
+        :nano_plan_generate -> plan_mode.state in [:idle, :planning]
+        :nano_plan_approve -> plan_mode.state in [:waiting_for_approval, :approved]
+        :nano_plan_run -> plan_mode.state in [:approved, :executing]
+      end
+
+    if allowed do
+      :ok
+    else
+      permission = permission_for_event(event)
+
+      case PlanMode.check_action(plan_mode, permission) do
+        :ok -> :ok
+        {:blocked, reason, guidance} -> {:blocked, reason, guidance}
+      end
+    end
+  end
+
   defp check_plan_mode(event, ctx) do
     plan_mode = Map.get(ctx, :plan_mode) || PlanMode.new()
     permission = permission_for_event(event)

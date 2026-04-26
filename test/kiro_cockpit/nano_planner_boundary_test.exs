@@ -836,14 +836,222 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
         |> Keyword.put(:pre_hooks, ActionBoundary.default_pre_hooks())
         |> Keyword.put(:post_hooks, ActionBoundary.default_post_hooks())
 
-      # nano_plan_generate (:subagent permission) should be blocked in
-      # planning-locked state because subagent is not a read-only permission
+      # nano_plan_generate is a lifecycle action, now special-cased in
+      # TaskEnforcementHook to be allowed in planning state even though
+      # its :subagent permission would normally be blocked.
       result = NanoPlanner.plan(:fake_session, "Build it", opts)
 
-      # PlanMode blocks subagent in planning state
-      assert {:error, {:swarm_blocked, reason, _messages}} = result
-      # PlanMode blocks with "Action blocked during planning" or similar
-      assert is_binary(reason)
+      # Should succeed: lifecycle action allowed through plan-mode gate
+      assert {:ok, plan} = result
+      assert plan.status == "draft"
+      assert plan.session_id == session_id
+    end
+  end
+
+  # ── Automatic plan_mode derivation tests (kiro-q9p) ───────────────────
+
+  describe "plan/3 automatic plan_mode derivation" do
+    setup [:setup_project_dir]
+
+    test "defaults to planning plan_mode without explicit opts", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "auto-pm-plan-#{System.unique_integer([:positive])}"
+
+      # Use a recording hook to capture the plan_mode in ctx
+      defmodule PlanModeRecordingHook do
+        @moduledoc false
+        @behaviour Hook
+
+        @impl true
+        def name, do: :plan_mode_recorder
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(_), do: true
+        @impl true
+        def on_event(event, ctx) do
+          Process.put(:recorded_plan_mode, Map.get(ctx, :plan_mode))
+          HookResult.continue(event)
+        end
+      end
+
+      opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+        |> Keyword.put(:swarm_hooks, true)
+        # Do NOT pass :plan_mode — should default to planning
+        |> Keyword.put(:pre_hooks, [PlanModeRecordingHook])
+        |> Keyword.put(:post_hooks, [])
+
+      assert {:ok, _plan} = NanoPlanner.plan(:fake_session, "Build it", opts)
+
+      recorded = Process.get(:recorded_plan_mode)
+      assert recorded != nil, "Expected plan_mode to be recorded in ctx"
+      assert recorded.state == :planning
+    after
+      Process.delete(:recorded_plan_mode)
+    end
+
+    test "explicit plan_mode overrides default", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "auto-pm-plan-explicit-#{System.unique_integer([:positive])}"
+
+      defmodule ExplicitPlanModeHook do
+        @moduledoc false
+        @behaviour Hook
+
+        @impl true
+        def name, do: :explicit_pm_recorder
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(_), do: true
+        @impl true
+        def on_event(event, ctx) do
+          Process.put(:recorded_explicit_pm, Map.get(ctx, :plan_mode))
+          HookResult.continue(event)
+        end
+      end
+
+      custom_pm = KiroCockpit.Swarm.PlanMode.new("custom-plan-id")
+
+      opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+        |> Keyword.put(:swarm_hooks, true)
+        |> Keyword.put(:plan_mode, custom_pm)
+        |> Keyword.put(:pre_hooks, [ExplicitPlanModeHook])
+        |> Keyword.put(:post_hooks, [])
+
+      assert {:ok, _plan} = NanoPlanner.plan(:fake_session, "Build it", opts)
+
+      recorded = Process.get(:recorded_explicit_pm)
+      assert recorded != nil
+      assert recorded.plan_id == "custom-plan-id"
+    after
+      Process.delete(:recorded_explicit_pm)
+    end
+  end
+
+  describe "approve/3 automatic plan_mode derivation" do
+    setup [:setup_project_dir]
+
+    test "defaults to waiting_for_approval plan_mode from draft plan", %{project_dir: dir} do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      session_id = "auto-pm-approve-#{System.unique_integer([:positive])}"
+
+      # First create a plan
+      plan_opts =
+        default_plan_opts(dir)
+        |> Keyword.put(:session_id, session_id)
+
+      assert {:ok, plan} = NanoPlanner.plan(:fake_session, "Build it", plan_opts)
+      assert plan.status == "draft"
+
+      # Use a recording hook to capture the plan_mode in ctx
+      defmodule ApprovePlanModeHook do
+        @moduledoc false
+        @behaviour Hook
+
+        @impl true
+        def name, do: :approve_pm_recorder
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(%KiroCockpit.Swarm.Event{action_name: :nano_plan_approve}), do: true
+        @impl true
+        def filter(_), do: false
+        @impl true
+        def on_event(event, ctx) do
+          Process.put(:recorded_approve_pm, Map.get(ctx, :plan_mode))
+          HookResult.continue(event)
+        end
+      end
+
+      Process.put(:fake_kiro_prompt_result, {:ok, %{}})
+
+      approve_opts = [
+        kiro_session_module: FakeKiroSession,
+        project_dir: dir,
+        session_id: session_id,
+        swarm_hooks: true,
+        # Do NOT pass :plan_mode — should default from plan status
+        pre_hooks: [ApprovePlanModeHook],
+        post_hooks: []
+      ]
+
+      assert {:ok, %{plan: approved_plan}} =
+               NanoPlanner.approve(:fake_session, plan.id, approve_opts)
+
+      assert approved_plan.status == "approved"
+
+      recorded = Process.get(:recorded_approve_pm)
+      assert recorded != nil, "Expected plan_mode to be recorded in ctx"
+      assert recorded.state == :waiting_for_approval
+      assert recorded.plan_id == plan.id
+    after
+      Process.delete(:recorded_approve_pm)
+    end
+  end
+
+  describe "run_plan/2 automatic plan_mode derivation" do
+    setup [:setup_project_dir]
+
+    test "defaults to approved plan_mode from approved plan", %{project_dir: dir} do
+      session_id = "auto-pm-run-#{System.unique_integer([:positive])}"
+
+      # Create and approve a plan
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "req",
+          :nano,
+          [],
+          %{
+            plan_markdown: "# Plan",
+            execution_prompt: "Execute",
+            raw_model_output: %{},
+            project_snapshot_hash: compute_hash(dir)
+          }
+        )
+
+      {:ok, approved} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      # Use a recording hook to capture the plan_mode in ctx
+      defmodule RunPlanModeHook do
+        @moduledoc false
+        @behaviour Hook
+
+        @impl true
+        def name, do: :run_pm_recorder
+        @impl true
+        def priority, do: 50
+        @impl true
+        def filter(%KiroCockpit.Swarm.Event{action_name: :nano_plan_run}), do: true
+        @impl true
+        def filter(_), do: false
+        @impl true
+        def on_event(event, ctx) do
+          Process.put(:recorded_run_pm, Map.get(ctx, :plan_mode))
+          HookResult.continue(event)
+        end
+      end
+
+      assert {:ok, running} =
+               KiroCockpit.Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 swarm_hooks: true,
+                 pre_hooks: [RunPlanModeHook],
+                 post_hooks: []
+               )
+
+      assert running.status == "running"
+
+      recorded = Process.get(:recorded_run_pm)
+      assert recorded != nil, "Expected plan_mode to be recorded in ctx"
+      assert recorded.state == :approved
+    after
+      Process.delete(:recorded_run_pm)
     end
   end
 

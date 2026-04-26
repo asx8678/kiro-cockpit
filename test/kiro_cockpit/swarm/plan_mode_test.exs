@@ -33,6 +33,82 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
     end
   end
 
+  # ── Derivation helpers ─────────────────────────────────────────────────
+
+  describe "from_plan/1" do
+    test "derives waiting_for_approval from draft plan" do
+      pm = PlanMode.from_plan(%{status: "draft", id: "plan-1"})
+      assert pm.state == :waiting_for_approval
+      assert pm.plan_id == "plan-1"
+    end
+
+    test "derives approved from approved plan" do
+      pm = PlanMode.from_plan(%{status: "approved", id: "plan-2"})
+      assert pm.state == :approved
+    end
+
+    test "derives executing from running plan" do
+      pm = PlanMode.from_plan(%{status: "running"})
+      assert pm.state == :executing
+    end
+
+    test "derives completed from completed plan" do
+      pm = PlanMode.from_plan(%{status: "completed"})
+      assert pm.state == :completed
+    end
+
+    test "derives rejected from rejected plan" do
+      pm = PlanMode.from_plan(%{status: "rejected"})
+      assert pm.state == :rejected
+    end
+
+    test "derives failed from failed plan" do
+      pm = PlanMode.from_plan(%{status: "failed"})
+      assert pm.state == :failed
+    end
+
+    test "derives rejected from superseded plan (terminal safe state)" do
+      pm = PlanMode.from_plan(%{status: "superseded"})
+      assert pm.state == :rejected
+    end
+
+    test "derives idle from unknown status" do
+      pm = PlanMode.from_plan(%{status: "unknown_status"})
+      assert pm.state == :idle
+    end
+
+    test "derives idle from nil plan_id" do
+      pm = PlanMode.from_plan(%{status: nil})
+      assert pm.state == :idle
+    end
+  end
+
+  describe "from_plan_status/1" do
+    test "derives waiting_for_approval from draft" do
+      assert PlanMode.from_plan_status("draft").state == :waiting_for_approval
+    end
+
+    test "derives approved from approved" do
+      assert PlanMode.from_plan_status("approved").state == :approved
+    end
+
+    test "derives executing from running" do
+      assert PlanMode.from_plan_status("running").state == :executing
+    end
+
+    test "derives idle from nil" do
+      assert PlanMode.from_plan_status(nil).state == :idle
+    end
+  end
+
+  describe "for_planning/0" do
+    test "returns a PlanMode in planning state" do
+      pm = PlanMode.for_planning()
+      assert pm.state == :planning
+      assert pm.plan_id == nil
+    end
+  end
+
   describe "planning_locked?/1" do
     test "returns true for planning" do
       {:ok, pm} = PlanMode.enter_plan_mode(PlanMode.new())

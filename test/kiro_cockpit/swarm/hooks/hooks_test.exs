@@ -1335,8 +1335,196 @@ defmodule KiroCockpit.Swarm.HooksTest do
 
       result = TaskEnforcementHook.on_event(event, ctx)
 
-      # In planning mode, write is blocked (not direct read discovery)
+      # In planning mode, nano_plan_run is not an allowed lifecycle phase
+      # (only approved/executing are), so it falls through to plan-mode gate
       assert %HookResult{decision: :block} = result
+    end
+  end
+
+  describe "TaskEnforcementHook — lifecycle action plan-mode allowance" do
+    test "nano_plan_generate is allowed in planning state" do
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+
+      event =
+        Event.new(:nano_plan_generate,
+          session_id: "sess_lifecycle_gen",
+          agent_id: "agent_lifecycle_gen",
+          permission_level: :subagent
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_generate is special-cased: allowed in planning state
+      # even though :subagent permission would normally be blocked
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "nano_plan_generate is allowed in idle state" do
+      plan_mode = PlanMode.new()
+
+      event =
+        Event.new(:nano_plan_generate,
+          session_id: "sess_lifecycle_gen_idle",
+          agent_id: "agent_lifecycle_gen_idle",
+          permission_level: :subagent
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_generate is allowed in idle state
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "nano_plan_generate is blocked in waiting_for_approval state" do
+      {:ok, plan_mode} =
+        PlanMode.new()
+        |> PlanMode.enter_plan_mode()
+        |> then(fn {:ok, pm} -> PlanMode.draft_generated(pm) end)
+
+      event =
+        Event.new(:nano_plan_generate,
+          session_id: "sess_lifecycle_gen_wait",
+          agent_id: "agent_lifecycle_gen_wait",
+          permission_level: :subagent
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_generate is NOT allowed in waiting_for_approval
+      # (only idle/planning), so it falls through to plan-mode gate
+      assert %HookResult{decision: :block} = result
+    end
+
+    test "nano_plan_approve is allowed in waiting_for_approval state" do
+      {:ok, plan_mode} =
+        PlanMode.new()
+        |> PlanMode.enter_plan_mode()
+        |> then(fn {:ok, pm} -> PlanMode.draft_generated(pm) end)
+
+      event =
+        Event.new(:nano_plan_approve,
+          session_id: "sess_lifecycle_appr",
+          agent_id: "agent_lifecycle_appr",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_approve is special-cased: allowed in waiting_for_approval
+      # even though :write permission would normally be blocked
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "nano_plan_approve is allowed in approved state (retry path)" do
+      {:ok, plan_mode} =
+        PlanMode.new()
+        |> PlanMode.enter_plan_mode()
+        |> then(fn {:ok, pm} -> PlanMode.draft_generated(pm) end)
+        |> then(fn {:ok, pm} -> PlanMode.approve(pm) end)
+
+      event =
+        Event.new(:nano_plan_approve,
+          session_id: "sess_lifecycle_appr_retry",
+          agent_id: "agent_lifecycle_appr_retry",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_approve is allowed in approved state (post-approval retry)
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "nano_plan_approve is blocked in planning state" do
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+
+      event =
+        Event.new(:nano_plan_approve,
+          session_id: "sess_lifecycle_appr_plan",
+          agent_id: "agent_lifecycle_appr_plan",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_approve is NOT allowed in planning state
+      # (only waiting_for_approval/approved), so falls through to plan-mode gate
+      assert %HookResult{decision: :block} = result
+    end
+
+    test "nano_plan_run is allowed in approved state" do
+      {:ok, plan_mode} =
+        PlanMode.new()
+        |> PlanMode.enter_plan_mode()
+        |> then(fn {:ok, pm} -> PlanMode.draft_generated(pm) end)
+        |> then(fn {:ok, pm} -> PlanMode.approve(pm) end)
+
+      event =
+        Event.new(:nano_plan_run,
+          session_id: "sess_lifecycle_run_appr",
+          agent_id: "agent_lifecycle_run_appr",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # nano_plan_run is allowed in approved state
+      assert %HookResult{decision: :continue} = result
+    end
+
+    test "ordinary write is blocked during planning with automatic plan_mode" do
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+
+      event =
+        Event.new(:write_file,
+          session_id: "sess_ord_write_plan",
+          agent_id: "agent_ord_write_plan",
+          permission_level: :write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # Ordinary write is blocked during planning
+      assert %HookResult{decision: :block} = result
+      assert result.reason =~ "Action blocked"
+    end
+
+    test "ordinary shell is blocked during waiting_for_approval with automatic plan_mode" do
+      {:ok, plan_mode} =
+        PlanMode.new()
+        |> PlanMode.enter_plan_mode()
+        |> then(fn {:ok, pm} -> PlanMode.draft_generated(pm) end)
+
+      event =
+        Event.new(:shell_write_requested,
+          session_id: "sess_ord_shell_wait",
+          agent_id: "agent_ord_shell_wait",
+          permission_level: :shell_write
+        )
+
+      ctx = %{plan_mode: plan_mode}
+
+      result = TaskEnforcementHook.on_event(event, ctx)
+
+      # Ordinary shell_write is blocked during waiting_for_approval
+      assert %HookResult{decision: :block} = result
+      assert result.reason =~ "Action blocked"
     end
   end
 

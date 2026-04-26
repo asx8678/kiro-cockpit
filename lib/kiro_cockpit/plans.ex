@@ -281,7 +281,8 @@ defmodule KiroCockpit.Plans do
     # Default agent_id to "nano-planner" so Bronze persistence can satisfy
     # the required agent_id field (kiro-00j issue 6).
     agent_id = Keyword.get(opts, :agent_id, "nano-planner")
-    plan_mode = Keyword.get(opts, :plan_mode)
+    # Default plan_mode from the fetched plan (approved => approved) unless caller overrides
+    plan_mode = Keyword.get(opts, :plan_mode, KiroCockpit.Swarm.PlanMode.from_plan(plan))
 
     [
       session_id: session_id,
