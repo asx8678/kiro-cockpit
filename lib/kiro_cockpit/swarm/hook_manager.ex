@@ -16,7 +16,8 @@ defmodule KiroCockpit.Swarm.HookManager do
   §27.11 Invariant 4: hook execution order is deterministic.
   """
 
-  alias KiroCockpit.Swarm.{Event, HookResult}
+  alias KiroCockpit.Swarm.{Event, HookResult, HookTrace, TraceContext}
+  alias KiroCockpit.Telemetry
 
   @type phase :: :pre | :post
 
@@ -38,21 +39,120 @@ defmodule KiroCockpit.Swarm.HookManager do
   """
   @spec run(Event.t(), [module()], map(), phase()) :: run_result()
   def run(event, hooks, ctx, phase) when is_atom(phase) do
-    hooks
-    |> filter_applicable(event)
-    |> sort_for_phase(phase)
-    |> Enum.reduce_while({:ok, event, []}, fn hook, {:ok, event_acc, messages} ->
-      case hook.on_event(event_acc, ctx) do
-        %HookResult{decision: :continue, event: evt, messages: msgs} ->
-          {:cont, {:ok, evt, messages ++ msgs}}
+    meta =
+      %{
+        session_id: event.session_id,
+        plan_id: event.plan_id,
+        task_id: event.task_id,
+        agent_id: event.agent_id,
+        action_name: event.action_name,
+        phase: phase
+      }
+      |> maybe_add_trace_ids(event.trace_context)
+      |> Telemetry.filter_metadata()
 
-        %HookResult{decision: :modify, event: evt, messages: msgs} ->
-          {:cont, {:ok, evt, messages ++ msgs}}
+    Telemetry.span(:hook, :chain, meta, fn ->
+      applicable_hooks = hooks |> filter_applicable(event) |> sort_for_phase(phase)
+      started_at = System.monotonic_time()
 
-        %HookResult{decision: :block, event: evt, reason: reason, messages: msgs} ->
-          {:halt, {:blocked, evt, reason, messages ++ msgs}}
+      result = run_applicable_hooks(applicable_hooks, event, ctx, meta)
+      persist_result(result, ctx, phase, duration_ms(started_at))
+    end)
+  end
+
+  defp run_applicable_hooks(hooks, event, ctx, meta) do
+    Enum.reduce_while(hooks, {:ok, event, [], []}, fn hook,
+                                                      {:ok, event_acc, messages, hook_results_acc} ->
+      hook_meta = Map.merge(meta, %{hook_name: hook.name(), priority: hook.priority()})
+
+      case run_hook_with_telemetry(hook, event_acc, ctx, hook_meta) do
+        {:ok, %HookResult{decision: decision, event: evt, messages: msgs} = hook_result}
+        when decision in [:continue, :modify] ->
+          new_hook_results = [
+            HookTrace.normalize_hook_result(hook.name(), hook_result) | hook_results_acc
+          ]
+
+          {:cont, {:ok, evt, messages ++ msgs, new_hook_results}}
+
+        {:ok,
+         %HookResult{decision: :block, event: evt, reason: reason, messages: msgs} = hook_result} ->
+          new_hook_results = [
+            HookTrace.normalize_hook_result(hook.name(), hook_result) | hook_results_acc
+          ]
+
+          {:halt, {:blocked, evt, reason, messages ++ msgs, new_hook_results}}
+
+        {:exception, reason} ->
+          new_hook_results = [
+            %{"hook" => to_string(hook.name()), "decision" => "exception", "reason" => reason}
+            | hook_results_acc
+          ]
+
+          {:halt, {:blocked, event_acc, reason, messages, new_hook_results}}
       end
     end)
+  end
+
+  defp run_hook_with_telemetry(hook, event, ctx, hook_meta) do
+    result =
+      Telemetry.span(:hook, :run, hook_meta, fn ->
+        hook_result = hook.on_event(event, ctx)
+        {hook_result, %{decision: hook_result.decision}}
+      end)
+
+    {:ok, result}
+  rescue
+    exception ->
+      {:exception, "Hook #{hook.name()} raised exception: #{Exception.message(exception)}"}
+  end
+
+  defp persist_result({:ok, final_event, messages, hook_results}, ctx, phase, duration_ms) do
+    trace_summary =
+      HookTrace.chain_summary(
+        final_event,
+        Enum.reverse(hook_results),
+        :ok,
+        nil,
+        duration_ms,
+        phase
+      )
+
+    HookTrace.maybe_persist_trace(final_event, trace_summary, Map.put(ctx, :phase, phase))
+    {{:ok, final_event, messages}, %{}}
+  end
+
+  defp persist_result(
+         {:blocked, final_event, reason, messages, hook_results},
+         ctx,
+         phase,
+         duration_ms
+       ) do
+    trace_summary =
+      HookTrace.chain_summary(
+        final_event,
+        Enum.reverse(hook_results),
+        :blocked,
+        reason,
+        duration_ms,
+        phase
+      )
+
+    HookTrace.maybe_persist_trace(final_event, trace_summary, Map.put(ctx, :phase, phase))
+    {{:blocked, final_event, reason, messages}, %{}}
+  end
+
+  defp duration_ms(started_at) do
+    System.monotonic_time()
+    |> Kernel.-(started_at)
+    |> System.convert_time_unit(:native, :millisecond)
+  end
+
+  defp maybe_add_trace_ids(meta, nil), do: meta
+
+  defp maybe_add_trace_ids(meta, %TraceContext{trace_id: trace_id, span_id: span_id}) do
+    meta
+    |> Map.put(:trace_id, trace_id)
+    |> Map.put(:span_id, span_id)
   end
 
   @doc """
