@@ -1106,8 +1106,7 @@ defmodule KiroCockpit.KiroSession do
         permission_level: :executor_dispatch,
         project_dir: state.cwd,
         plan_mode: plan_mode,
-        swarm_ctx: state.swarm_ctx,
-        approved: truthy_lookup(state.swarm_ctx, :approved)
+        swarm_ctx: state.swarm_ctx
       ],
       opts
     )
@@ -1125,20 +1124,6 @@ defmodule KiroCockpit.KiroSession do
         {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
     end
   end
-
-  defp truthy_lookup(map, key) when is_map(map) do
-    case Map.get(map, key) do
-      true -> true
-      "true" -> true
-      1 -> true
-      "1" -> true
-      :yes -> true
-      "yes" -> true
-      _ -> false
-    end
-  end
-
-  defp truthy_lookup(_nil_or_not_map, _key), do: false
 
   # -- Auto callback handling (kiro-4ff) ------------------------------------
 
@@ -1276,22 +1261,34 @@ defmodule KiroCockpit.KiroSession do
   end
 
   # Derive plan_mode from durable plan status when a plan_id is available.
-  # Checks opts first, then state.swarm_plan_id. Returns nil if no plan_id
-  # is found or the plan cannot be loaded (fail-safe to nil so callers fall
-  # back to PlanMode.new() / idle behavior).
+  # Checks opts first, then state.swarm_plan_id.
+  #
+  # kiro-6dw: Fail-closed — when a plan_id exists but the plan cannot
+  # be loaded from the durable store, return a locked PlanMode instead
+  # of nil/idle. Unknown/missing durable plan state for plan-correlated
+  # execution must fail closed. Only when no plan_id exists at all does
+  # the function return nil (no plan → no plan-mode restriction).
   defp derive_plan_mode(opts, state) do
     plan_id =
       Keyword.get(opts, :plan_id) || Keyword.get(opts, :swarm_plan_id) || state.swarm_plan_id
 
-    if plan_id do
-      case Plans.get_plan(plan_id) do
-        nil -> nil
-        plan -> PlanMode.from_plan(plan)
-      end
+    do_derive_plan_mode(plan_id)
+  end
+
+  defp do_derive_plan_mode(nil), do: nil
+
+  defp do_derive_plan_mode(plan_id) do
+    case Plans.get_plan(plan_id) do
+      nil ->
+        # Plan referenced but not found — fail closed (kiro-6dw)
+        PlanMode.locked(plan_id, :plan_not_found)
+
+      %{status: status} = plan when is_binary(status) ->
+        PlanMode.from_plan(plan)
     end
   rescue
-    # DB or plan lookup failures should not crash the session
-    _ -> nil
+    # DB/plan lookup failure during plan-correlated execution — fail closed
+    _ -> PlanMode.locked(plan_id, :plan_lookup_failed)
   end
 
   # fs/* methods are fast file operations — handle synchronously.

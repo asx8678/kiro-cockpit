@@ -48,7 +48,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
 
   alias KiroCockpit.NanoPlanner.Staleness
   alias KiroCockpit.Swarm.{DataPipeline, Event, HookManager}
-  alias KiroCockpit.Swarm.Tasks.TaskManager
+  alias KiroCockpit.Swarm.Tasks.{TaskManager, TaskScope}
 
   @default_pre_hooks [
     KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook,
@@ -357,20 +357,116 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       |> Enum.filter(fn {k, _v} -> k in [:stale_plan_override?, :stale_plan_confirmed?] end)
       |> Enum.reduce(ctx, fn {k, v}, acc -> Map.put(acc, k, v) end)
 
-    # Copy approved/policy flags from opts into ctx for TaskEnforcementHook
+    # kiro-6dw: Derive trusted provenance flags from durable server-side state
+    # instead of blindly copying from caller opts. Approval/policy/root-cause
+    # flags must come from:
+    #   - Durable plan/task/approval state in the database
+    #   - Trusted internal swarm_ctx (set by NanoPlanner.approve, a trusted call site)
+    # Arbitrary caller opts are NOT a trusted source for these flags.
     ctx =
-      [:approved, :policy_allows_write, :root_cause_stated, :fixing_test_fixture, :docs_scoped]
-      |> Enum.reduce(ctx, fn key, acc ->
-        case Keyword.get(opts, key) do
-          nil -> acc
-          value -> Map.put(acc, key, value)
-        end
-      end)
+      ctx
+      |> derive_approved_from_durable_state(event)
+      |> derive_policy_allows_write_from_durable_state(event)
+
+    # kiro-6dw: root_cause_stated, fixing_test_fixture, docs_scoped are
+    # category-conditional flags. They may come from:
+    #   - Trusted internal swarm_ctx (set by NanoPlanner.approve)
+    #   - CategoryMatrix path analysis (fallback in TaskEnforcementHook)
+    # They must NOT be blindly accepted from arbitrary caller opts.
+    # Only preserve these if they already exist in swarm_ctx (base_ctx);
+    # do NOT lift them from top-level opts keys.
+    #
+    # Note: swarm_ctx values are already in ctx from base_ctx above.
+    # The old code copied these from opts top-level keys — that path is
+    # removed. TaskEnforcementHook.approval_opts/3 still has CategoryMatrix
+    # fallbacks for these flags.
 
     # Hydrate steering context when empty/incomplete (kiro-oai steering-context-hydration)
     ctx = maybe_hydrate_steering_context(ctx, opts, event, tm)
 
     ctx
+  end
+
+  # kiro-6dw: Derive the :approved flag from durable plan state.
+  #
+  # Only two trusted sources:
+  #   1. swarm_ctx already contains :approved from NanoPlanner.approve
+  #      (trusted internal call site) — preserve it.
+  #   2. The plan's durable status is "approved" or "running" — derive
+  #      :approved = true from the canonical DB row.
+  #
+  # Never trust arbitrary caller opts for this flag.
+  defp derive_approved_from_durable_state(ctx, event) do
+    cond do
+      # Already set in swarm_ctx by trusted internal caller (NanoPlanner.approve)
+      Map.has_key?(ctx, :approved) ->
+        ctx
+
+      # Derive from durable plan status
+      event.plan_id != nil ->
+        approved = plan_status_approved?(event.plan_id)
+        Map.put(ctx, :approved, approved)
+
+      true ->
+        Map.put(ctx, :approved, false)
+    end
+  end
+
+  # kiro-6dw: Derive :policy_allows_write from durable state.
+  #
+  # policy_allows_write is true when the plan is approved/running AND
+  # the active task's permission scope includes :write. This must be
+  # derived from durable state, not from caller opts.
+  defp derive_policy_allows_write_from_durable_state(ctx, event) do
+    cond do
+      # Already set in swarm_ctx by trusted internal caller
+      Map.has_key?(ctx, :policy_allows_write) ->
+        ctx
+
+      # Derive: plan must be approved/running AND task must allow write
+      Map.get(ctx, :approved) == true and event.task_id != nil ->
+        policy = task_allows_write?(event.task_id)
+        Map.put(ctx, :policy_allows_write, policy)
+
+      true ->
+        Map.put(ctx, :policy_allows_write, false)
+    end
+  end
+
+  # Check if the plan's durable status is approved or running.
+  defp plan_status_approved?(plan_id) do
+    case safe_get_plan(plan_id) do
+      %{status: status} when status in ["approved", "running"] -> true
+      _ -> false
+    end
+  end
+
+  # Check if the task's permission scope allows write.
+  defp task_allows_write?(task_id) do
+    # Delegate to TaskScope with only the :approved flag; no other
+    # caller-supplied flags — TaskEnforcementHook adds CategoryMatrix
+    # fallbacks for root_cause_stated/fixing_test_fixture/docs_scoped.
+    task = safe_get_task(task_id)
+
+    if task do
+      case TaskScope.permission_allowed?(
+             task,
+             :write,
+             approved: true
+           ) do
+        {:ok, :allowed} -> true
+        _ -> false
+      end
+    else
+      false
+    end
+  end
+
+  # Safe wrapper for task lookup by ID.
+  defp safe_get_task(task_id) do
+    KiroCockpit.Repo.get(KiroCockpit.Swarm.Tasks.Task, task_id)
+  rescue
+    _ -> nil
   end
 
   # Compute trusted stale context from the plan and merge into ctx.
