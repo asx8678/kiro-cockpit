@@ -93,14 +93,14 @@ defmodule KiroCockpit.Swarm.DataPipeline do
   defdelegate record_acp_update(attrs), to: BronzeAcp
 
   @doc """
-  Record an ACP request (outgoing).
+  Record an ACP request (JSON-RPC request message, either direction).
 
   See `BronzeAcp.record_acp_request/4` for details.
   """
   defdelegate record_acp_request(session_id, agent_id, payload, opts \\ []), to: BronzeAcp
 
   @doc """
-  Record an ACP response (incoming).
+  Record an ACP response (JSON-RPC response/error message, either direction).
 
   See `BronzeAcp.record_acp_response/4` for details.
   """

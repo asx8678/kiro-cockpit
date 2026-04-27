@@ -515,7 +515,8 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
             "integration-agent",
             payload,
             method: "tools/call",
-            rpc_id: "42"
+            rpc_id: "42",
+            direction: :client_to_agent
           )
 
         # Verify raw_acp_message row exists
@@ -532,6 +533,7 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
         assert first_acp.event_type == "acp_request"
         assert first_acp.session_id == session_id
         assert first_acp.agent_id == "integration-agent"
+        assert first_acp.hook_results["direction"] == "client_to_agent"
       end)
     end
 
@@ -559,7 +561,8 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
             session_id,
             "integration-agent",
             payload,
-            rpc_id: "42"
+            rpc_id: "42",
+            direction: :agent_to_client
           )
 
         # Verify raw_acp_message row exists
@@ -574,6 +577,32 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
         assert [_ | _] = acp_events
         first_acp = hd(acp_events)
         assert first_acp.event_type == "acp_response"
+        assert first_acp.hook_results["direction"] == "agent_to_client"
+      end)
+    end
+
+    test "agent_to_client JSON-RPC error preserves acp_response direction" do
+      session_id = "sess_atc_err_#{System.unique_integer([:positive])}"
+
+      payload = %{
+        "jsonrpc" => "2.0",
+        "id" => 43,
+        "error" => %{"code" => -32_603, "message" => "Internal error"}
+      }
+
+      with_env(:bronze_acp_capture_enabled, true, fn ->
+        :ok =
+          BronzeAcp.record_acp_response(
+            session_id,
+            "integration-agent",
+            payload,
+            rpc_id: "43",
+            direction: :agent_to_client
+          )
+
+        assert [first_acp | _] = BronzeAcp.list_acp_events(session_id)
+        assert first_acp.event_type == "acp_response"
+        assert first_acp.hook_results["direction"] == "agent_to_client"
       end)
     end
 

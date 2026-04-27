@@ -161,10 +161,20 @@ defmodule KiroCockpit.Acp.InboundResponsePersistenceTest do
 
         assert [_ | _] = responses
 
-        # Bronze acp_response events should also exist
+        # Bronze acp_request/acp_response events should also exist with wire directions preserved
         acp_events = BronzeAcp.list_acp_events(sid)
+
+        request_events = Enum.filter(acp_events, &(&1.event_type == "acp_request"))
+
+        assert Enum.any?(request_events, fn event ->
+                 event.hook_results["direction"] == "client_to_agent"
+               end)
+
         response_events = Enum.filter(acp_events, &(&1.event_type == "acp_response"))
-        assert [_ | _] = response_events
+
+        assert Enum.any?(response_events, fn event ->
+                 event.hook_results["direction"] == "agent_to_client"
+               end)
       end)
     end
   end

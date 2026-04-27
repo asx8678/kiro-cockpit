@@ -105,9 +105,14 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
   end
 
   @doc """
-  Record an ACP request (outgoing from agent to client/environment).
+  Record an ACP request (JSON-RPC request message) in Bronze.
 
-  Captures tool calls, prompt requests, or any agent-initiated ACP activity.
+  A JSON-RPC message-type helper for requests in either direction.
+  The default `direction` is `:agent_to_client` (agent-initiated request)
+  for backward compatibility; callers may override via `opts[:direction]`
+  to capture e.g. a `:client_to_agent` outbound request.
+
+  Captures tool calls, prompt requests, or any ACP request activity.
   """
   @spec record_acp_request(String.t(), String.t(), map(), keyword()) :: :ok
   def record_acp_request(session_id, agent_id, payload, opts \\ []) do
@@ -119,19 +124,25 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
       event_type: "acp_request"
     }
 
-    # Merge optional correlation and metadata
+    # Merge optional correlation and metadata (including :direction override)
     attrs =
       opts
-      |> Keyword.take([:plan_id, :task_id, :method, :rpc_id, :safe, :truncate_at])
+      |> Keyword.take([:plan_id, :task_id, :method, :rpc_id, :direction, :safe, :truncate_at])
       |> Enum.reduce(base_attrs, fn {k, v}, acc -> Map.put(acc, k, v) end)
 
     record_acp_update(attrs)
   end
 
   @doc """
-  Record an ACP response (incoming to agent from client/environment).
+  Record an ACP response (JSON-RPC response/error message) in Bronze.
 
-  Captures tool results, prompt responses, or any environment response.
+  A JSON-RPC message-type helper for responses in either direction.
+  The default `direction` is `:client_to_agent` (environment replies to
+  agent) for backward compatibility; callers may override via
+  `opts[:direction]` to capture e.g. an `:agent_to_client` inbound
+  response.
+
+  Captures tool results, prompt responses, or any ACP response activity.
   """
   @spec record_acp_response(String.t(), String.t(), map(), keyword()) :: :ok
   def record_acp_response(session_id, agent_id, payload, opts \\ []) do
@@ -143,9 +154,10 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
       event_type: "acp_response"
     }
 
+    # Merge optional correlation and metadata (including :direction override)
     attrs =
       opts
-      |> Keyword.take([:plan_id, :task_id, :method, :rpc_id, :safe, :truncate_at])
+      |> Keyword.take([:plan_id, :task_id, :method, :rpc_id, :direction, :safe, :truncate_at])
       |> Enum.reduce(base_attrs, fn {k, v}, acc -> Map.put(acc, k, v) end)
 
     record_acp_update(attrs)
