@@ -11,7 +11,9 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
   These tests exercise the full boundary flow with Bronze persistence.
   """
 
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:bronze_action_capture_enabled,
+  # :bronze_acp_capture_enabled) which would race with concurrent async tests.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.EventStore
   alias KiroCockpit.Swarm.{ActionBoundary, DataPipeline, Event, Hook, HookResult}
@@ -69,8 +71,8 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
   end
 
   # Exception-safe Application env mutation: always restores original value
-  # even if the test body raises. Module is async: true, so we must not
-  # pollute other tests with stale config.
+  # even if the test body raises. Module is async: false, so global env
+  # mutations are serialized, but we still restore to keep things clean.
   defp with_env(key, value, fun) do
     original = Application.get_env(:kiro_cockpit, key, value)
     Application.put_env(:kiro_cockpit, key, value)

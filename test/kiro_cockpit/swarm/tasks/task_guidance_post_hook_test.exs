@@ -10,7 +10,9 @@ defmodule KiroCockpit.Swarm.Tasks.TaskGuidancePostHookTest do
   because the test config disables it by default.
   """
 
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:swarm_action_hooks_enabled)
+  # which would race with concurrent async tests.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.Swarm.Events
   alias KiroCockpit.Swarm.Tasks.TaskManager

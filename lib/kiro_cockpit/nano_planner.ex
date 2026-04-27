@@ -25,6 +25,7 @@ defmodule KiroCockpit.NanoPlanner do
   alias KiroCockpit.NanoPlanner.{ContextBuilder, PlanSchema, PromptBuilder}
   alias KiroCockpit.Plans
   alias KiroCockpit.Swarm.ActionBoundary
+  alias KiroCockpit.Swarm.PlanMode
   alias KiroCockpit.Swarm.Tasks.TaskManager
 
   @supported_modes [:nano, :nano_deep, :nano_fix]
@@ -83,37 +84,23 @@ defmodule KiroCockpit.NanoPlanner do
       boundary_opts =
         plan_generate_boundary_opts(session_id, project_dir, mode, user_request, opts)
 
-      if boundary_enabled?(opts) do
-        case ActionBoundary.run(:nano_plan_generate, boundary_opts, fn ->
-               do_plan(
-                 session,
-                 user_request,
-                 mode,
-                 session_mod,
-                 session_state,
-                 session_id,
-                 project_dir,
-                 opts
-               )
-             end) do
-          {:ok, result} ->
-            result
-
-          {:error, {:swarm_blocked, reason, messages}} ->
-            {:error, {:swarm_blocked, reason, messages}}
+      run_boundary_if_enabled(
+        :nano_plan_generate,
+        boundary_opts,
+        boundary_enabled?(opts),
+        fn ->
+          do_plan(
+            session,
+            user_request,
+            mode,
+            session_mod,
+            session_state,
+            session_id,
+            project_dir,
+            opts
+          )
         end
-      else
-        do_plan(
-          session,
-          user_request,
-          mode,
-          session_mod,
-          session_state,
-          session_id,
-          project_dir,
-          opts
-        )
-      end
+      )
     end
   end
 
@@ -144,10 +131,27 @@ defmodule KiroCockpit.NanoPlanner do
     end
   end
 
+  # Run action through boundary if hooks are enabled; otherwise invoke
+  # the fun directly. Unifies the if/case nesting pattern used by
+  # plan, approve, and other boundary-wrapped entry points.
+  defp run_boundary_if_enabled(action, boundary_opts, enabled?, fun) do
+    if enabled? do
+      case ActionBoundary.run(action, boundary_opts, fun) do
+        {:ok, result} ->
+          result
+
+        {:error, {:swarm_blocked, reason, messages}} ->
+          {:error, {:swarm_blocked, reason, messages}}
+      end
+    else
+      fun.()
+    end
+  end
+
   defp plan_generate_boundary_opts(session_id, project_dir, mode, user_request, opts) do
     agent_id = Keyword.get(opts, :agent_id, "nano-planner")
     # Default to planning state for plan generation unless caller explicitly provides plan_mode
-    plan_mode = Keyword.get(opts, :plan_mode, KiroCockpit.Swarm.PlanMode.for_planning())
+    plan_mode = Keyword.get(opts, :plan_mode, PlanMode.for_planning())
     swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
 
     [
@@ -245,19 +249,12 @@ defmodule KiroCockpit.NanoPlanner do
       # TaskEnforcementHook, which inspects trusted ctx computed from
       # Staleness.trusted_context/3. If blocked, Bronze trace captures
       # the blocked attempt with outcome "blocked".
-      if boundary_enabled?(opts) do
-        case ActionBoundary.run(:nano_plan_approve, boundary_opts, fn ->
-               do_approve(session_mod, session, plan_id, opts)
-             end) do
-          {:ok, result} ->
-            result
-
-          {:error, {:swarm_blocked, reason, messages}} ->
-            {:error, {:swarm_blocked, reason, messages}}
-        end
-      else
-        do_approve(session_mod, session, plan_id, opts)
-      end
+      run_boundary_if_enabled(
+        :nano_plan_approve,
+        boundary_opts,
+        boundary_enabled?(opts),
+        fn -> do_approve(session_mod, session, plan_id, opts) end
+      )
     end
   end
 
@@ -313,7 +310,7 @@ defmodule KiroCockpit.NanoPlanner do
     agent_id = Keyword.get(opts, :agent_id, "nano-planner")
 
     # Default plan_mode from the fetched plan (draft => waiting_for_approval) unless caller overrides
-    plan_mode = Keyword.get(opts, :plan_mode, KiroCockpit.Swarm.PlanMode.from_plan(plan))
+    plan_mode = Keyword.get(opts, :plan_mode, PlanMode.from_plan(plan))
     swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
 
     [
@@ -697,14 +694,15 @@ defmodule KiroCockpit.NanoPlanner do
   # project dir can be determined.
   defp resolve_project_dir_for_staleness(session_mod, session, opts) do
     case Keyword.get(opts, :project_dir) do
-      dir when is_binary(dir) and dir != "" ->
-        {:ok, dir}
+      dir when is_binary(dir) and dir != "" -> {:ok, dir}
+      _ -> resolve_project_dir_from_session(session_mod, session)
+    end
+  end
 
-      _ ->
-        case safe_session_call(fn -> session_mod.state(session) end) do
-          {:ok, %{cwd: cwd}} when is_binary(cwd) and cwd != "" -> {:ok, cwd}
-          _ -> {:error, :stale_plan_unknown}
-        end
+  defp resolve_project_dir_from_session(session_mod, session) do
+    case safe_session_call(fn -> session_mod.state(session) end) do
+      {:ok, %{cwd: cwd}} when is_binary(cwd) and cwd != "" -> {:ok, cwd}
+      _ -> {:error, :stale_plan_unknown}
     end
   end
 

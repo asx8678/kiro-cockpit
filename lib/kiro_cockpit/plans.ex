@@ -8,6 +8,8 @@ defmodule KiroCockpit.Plans do
   alias Ecto.Multi
   alias KiroCockpit.Plans.{Plan, PlanEvent, PlanStep}
   alias KiroCockpit.Repo
+  alias KiroCockpit.Swarm.ActionBoundary
+  alias KiroCockpit.Swarm.PlanMode
 
   @type plan_id :: Ecto.UUID.t()
   @type session_id :: String.t()
@@ -423,28 +425,29 @@ defmodule KiroCockpit.Plans do
   @spec run_plan(plan_id(), keyword()) ::
           {:ok, Plan.t()} | {:error, term()}
   def run_plan(plan_id, opts \\ []) do
-    alias KiroCockpit.Swarm.ActionBoundary
-
     with {:ok, plan} <- fetch_plan(plan_id),
          :ok <- require_status(plan, "approved"),
          {:ok, project_dir} <- resolve_project_dir(opts) do
-      # Run plan transition through the action boundary (kiro-ux7).
-      # Staleness checking happens inside the boundary via
-      # TaskEnforcementHook, which inspects trusted ctx computed from
-      # Staleness.trusted_context/3. If blocked, Bronze trace captures
-      # the blocked attempt with outcome "blocked".
-      if plan_run_boundary_enabled?(opts) do
-        boundary_opts = plan_run_boundary_opts(plan, project_dir, opts)
+      boundary_opts = plan_run_boundary_opts(plan, project_dir, opts)
 
-        case ActionBoundary.run(:nano_plan_run, boundary_opts, fn ->
-               do_run_plan_transition(plan, opts)
-             end) do
-          {:ok, result} -> result
-          {:error, {:swarm_blocked, reason, _messages}} -> {:error, {:swarm_blocked, reason}}
-        end
-      else
-        do_run_plan_transition(plan, opts)
+      run_plan_boundary_if_enabled(
+        boundary_opts,
+        plan_run_boundary_enabled?(opts),
+        fn -> do_run_plan_transition(plan, opts) end
+      )
+    end
+  end
+
+  # Run plan transition through the action boundary if hooks are enabled;
+  # otherwise invoke the fun directly.
+  defp run_plan_boundary_if_enabled(boundary_opts, enabled?, fun) do
+    if enabled? do
+      case ActionBoundary.run(:nano_plan_run, boundary_opts, fun) do
+        {:ok, result} -> result
+        {:error, {:swarm_blocked, reason, _messages}} -> {:error, {:swarm_blocked, reason}}
       end
+    else
+      fun.()
     end
   end
 
@@ -467,7 +470,7 @@ defmodule KiroCockpit.Plans do
     # the required agent_id field (kiro-00j issue 6).
     agent_id = Keyword.get(opts, :agent_id, "nano-planner")
     # Default plan_mode from the fetched plan (approved => approved) unless caller overrides
-    plan_mode = Keyword.get(opts, :plan_mode, KiroCockpit.Swarm.PlanMode.from_plan(plan))
+    plan_mode = Keyword.get(opts, :plan_mode, PlanMode.from_plan(plan))
 
     [
       session_id: session_id,

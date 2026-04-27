@@ -17,7 +17,9 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeSection35RegressionTest do
     * Persistence errors never crash the caller.
   """
 
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:bronze_action_capture_enabled,
+  # :bronze_acp_capture_enabled) which would race with concurrent async tests.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.Swarm.{DataPipeline, DataPipeline.BronzeAction, DataPipeline.BronzeAcp, Event}
 
@@ -531,25 +533,29 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeSection35RegressionTest do
     test "action_capture_enabled? respects configuration" do
       original = Application.get_env(:kiro_cockpit, :bronze_action_capture_enabled, true)
 
-      Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, false)
-      refute DataPipeline.action_capture_enabled?()
+      try do
+        Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, false)
+        refute DataPipeline.action_capture_enabled?()
 
-      Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, true)
-      assert DataPipeline.action_capture_enabled?()
-
-      Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, original)
+        Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, true)
+        assert DataPipeline.action_capture_enabled?()
+      after
+        Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, original)
+      end
     end
 
     test "acp_capture_enabled? respects configuration" do
       original = Application.get_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
 
-      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, false)
-      refute DataPipeline.acp_capture_enabled?()
+      try do
+        Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, false)
+        refute DataPipeline.acp_capture_enabled?()
 
-      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
-      assert DataPipeline.acp_capture_enabled?()
-
-      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, original)
+        Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+        assert DataPipeline.acp_capture_enabled?()
+      after
+        Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, original)
+      end
     end
   end
 end

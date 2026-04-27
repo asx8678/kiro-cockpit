@@ -1,5 +1,7 @@
 defmodule KiroCockpit.Swarm.ActionBoundaryTest do
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:bronze_action_capture_enabled)
+  # which would race with concurrent async tests that also toggle that flag.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.Swarm.{ActionBoundary, Hook, HookResult}
   alias KiroCockpit.Swarm.Tasks.TaskManager
@@ -36,6 +38,24 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
     end
   end
 
+  # -- Exception-safe Application env mutation for test isolation ---------------
+  # Concurrent tests (bronze_section35_regression_test, bronze_action_boundary_integration_test)
+  # temporarily set :bronze_action_capture_enabled to false via Application.put_env.
+  # Now that this module is async: false, global env mutations are serialized,
+  # but we still use this wrapper to guarantee the flag is true for tests that
+  # assert Bronze events (defence-in-depth against future regressions).
+  defp with_bronze_capture(fun) do
+    key = :bronze_action_capture_enabled
+    original = Application.get_env(:kiro_cockpit, key, true)
+    Application.put_env(:kiro_cockpit, key, true)
+
+    try do
+      fun.()
+    after
+      Application.put_env(:kiro_cockpit, key, original)
+    end
+  end
+
   # -- Helper to create an active task for boundary tests --------------------
 
   defp create_active_task!(session_id, agent_id, opts \\ []) do
@@ -67,76 +87,80 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
 
   describe "run/3 — boundary enabled with standard hooks" do
     test "no active task blocks executor and writes Bronze hook_trace" do
-      session_id = "sess_boundary_#{System.unique_integer([:positive])}"
-      agent_id = "agent_boundary"
+      with_bronze_capture(fn ->
+        session_id = "sess_boundary_#{System.unique_integer([:positive])}"
+        agent_id = "agent_boundary"
 
-      result =
-        ActionBoundary.run(
-          :kiro_session_prompt,
-          [
-            enabled: true,
-            session_id: session_id,
-            agent_id: agent_id,
-            permission_level: :subagent,
-            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
-            post_hooks: []
-          ],
-          fn -> :executed end
-        )
+        result =
+          ActionBoundary.run(
+            :kiro_session_prompt,
+            [
+              enabled: true,
+              session_id: session_id,
+              agent_id: agent_id,
+              permission_level: :subagent,
+              pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+              post_hooks: []
+            ],
+            fn -> :executed end
+          )
 
-      # TaskEnforcementHook blocks because no active task
-      assert {:error, {:swarm_blocked, reason, messages}} = result
-      assert reason =~ "No active task"
-      assert is_list(messages)
+        # TaskEnforcementHook blocks because no active task
+        assert {:error, {:swarm_blocked, reason, messages}} = result
+        assert reason =~ "No active task"
+        assert is_list(messages)
 
-      # Bronze events should be persisted: action_before, hook_trace, action_blocked
-      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
-      event_types = Enum.map(events, & &1.event_type)
-      assert "hook_trace" in event_types
-      # §35 Phase 3: action_before and action_blocked also persisted
-      assert "action_before" in event_types
-      assert "action_blocked" in event_types
-      hook_trace = Enum.find(events, &(&1.event_type == "hook_trace"))
-      assert hook_trace.phase == "pre"
+        # Bronze events should be persisted: action_before, hook_trace, action_blocked
+        events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+        event_types = Enum.map(events, & &1.event_type)
+        assert "hook_trace" in event_types
+        # §35 Phase 3: action_before and action_blocked also persisted
+        assert "action_before" in event_types
+        assert "action_blocked" in event_types
+        hook_trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+        assert hook_trace.phase == "pre"
+      end)
     end
 
     test "active task allows executor and writes post trace" do
-      session_id = "sess_boundary_ok_#{System.unique_integer([:positive])}"
-      agent_id = "agent_boundary_ok"
+      with_bronze_capture(fn ->
+        session_id = "sess_boundary_ok_#{System.unique_integer([:positive])}"
+        agent_id = "agent_boundary_ok"
 
-      _task = create_active_task!(session_id, agent_id)
+        _task = create_active_task!(session_id, agent_id)
 
-      # Build a plan_mode struct that is approved/executing
-      plan_mode = KiroCockpit.Swarm.PlanMode.new()
-      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
-      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
-      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+        # Build a plan_mode struct that is approved/executing
+        plan_mode = KiroCockpit.Swarm.PlanMode.new()
+        {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+        {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+        {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
 
-      result =
-        ActionBoundary.run(
-          :kiro_session_prompt,
-          [
-            enabled: true,
-            session_id: session_id,
-            agent_id: agent_id,
-            permission_level: :subagent,
-            plan_mode: plan_mode,
-            approved: true,
-            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
-            post_hooks: []
-          ],
-          fn -> :executed end
-        )
+        result =
+          ActionBoundary.run(
+            :kiro_session_prompt,
+            [
+              enabled: true,
+              session_id: session_id,
+              agent_id: agent_id,
+              permission_level: :subagent,
+              plan_mode: plan_mode,
+              approved: true,
+              pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+              post_hooks: []
+            ],
+            fn -> :executed end
+          )
 
-      assert {:ok, :executed} = result
+        assert {:ok, :executed} = result
 
-      # Pre-hook trace persisted (alongside §35 action events)
-      events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
-      event_types = Enum.map(events, & &1.event_type)
-      assert "hook_trace" in event_types
-      # §35 Phase 3: action_before and action_after also present
-      assert "action_before" in event_types
-      assert "action_after" in event_types
+        # Pre-hook trace persisted (alongside §35 action events)
+        events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
+        event_types = Enum.map(events, & &1.event_type)
+        assert "hook_trace" in event_types
+        # §35 Phase 3: action_before and action_after also present
+        assert "action_before" in event_types
+        assert "action_after" in event_types
+      end)
     end
 
     test "file scope blocks with out-of-scope target path" do

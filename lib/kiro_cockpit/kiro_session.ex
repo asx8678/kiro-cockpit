@@ -93,8 +93,10 @@ defmodule KiroCockpit.KiroSession do
   alias KiroCockpit.KiroSession.Callbacks
   alias KiroCockpit.KiroSession.StreamEvent
   alias KiroCockpit.KiroSession.TerminalManager
+  alias KiroCockpit.Plans
   alias KiroCockpit.Swarm.ActionBoundary
   alias KiroCockpit.Swarm.DataPipeline
+  alias KiroCockpit.Swarm.PlanMode
   alias KiroCockpit.Telemetry
 
   # ACP protocol defaults per kiro-acp-instructions.md
@@ -166,7 +168,9 @@ defmodule KiroCockpit.KiroSession do
           swarm_ctx: map()
         }
 
-  # Internal state
+  # Internal state — 37 fields: unavoidable GenServer state; splitting
+  # would scatter cohesive session state across sub-structs.
+  # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
   defstruct port_process: nil,
             port_ref: nil,
             subscriber: nil,
@@ -738,15 +742,13 @@ defmodule KiroCockpit.KiroSession do
     if state.swarm_hooks do
       boundary_opts = prompt_boundary_opts(state, opts)
 
-      case state.swarm_hooks_module.run(:kiro_session_prompt, boundary_opts, fn ->
-             do_start_prompt(prompt_or_blocks, opts, from, state)
-           end) do
-        {:ok, {:noreply, new_state}} ->
-          {:noreply, new_state}
-
-        {:error, {:swarm_blocked, reason, messages}} ->
-          {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
-      end
+      run_hooks_if_enabled(
+        state.swarm_hooks_module,
+        :kiro_session_prompt,
+        boundary_opts,
+        fn -> do_start_prompt(prompt_or_blocks, opts, from, state) end,
+        state
+      )
     else
       do_start_prompt(prompt_or_blocks, opts, from, state)
     end
@@ -1111,6 +1113,19 @@ defmodule KiroCockpit.KiroSession do
     )
   end
 
+  # Run hooks through the boundary module if enabled; otherwise invoke
+  # the fun directly. Unifies the if/case nesting pattern used by
+  # prompt and callback boundary entry points.
+  defp run_hooks_if_enabled(hooks_module, action, boundary_opts, fun, state) do
+    case hooks_module.run(action, boundary_opts, fun) do
+      {:ok, {:noreply, new_state}} ->
+        {:noreply, new_state}
+
+      {:error, {:swarm_blocked, reason, messages}} ->
+        {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
+    end
+  end
+
   defp truthy_lookup(map, key) when is_map(map) do
     case Map.get(map, key) do
       true -> true
@@ -1183,15 +1198,7 @@ defmodule KiroCockpit.KiroSession do
       callback_boundary_opts(state, action, permission, target_path, params, method)
 
     case state.swarm_hooks_module.run(action, boundary_opts, fn ->
-           # The executor runs inside the boundary — pre/post trace
-           # timestamps bracket the real action start.
-           if Callbacks.allowed_by_policy?(method, state.callback_policy) do
-             dispatch_callback(state, port_pid, id, method, params)
-           else
-             # Hooks allowed but policy denies — respond with denied_error
-             {:error, code, message, data} = Callbacks.denied_error(method)
-             PortProcess.respond_error(port_pid, id, code, message, data)
-           end
+           dispatch_if_policy_allows(state, port_pid, id, method, params)
          end) do
       {:ok, _result} ->
         :ok
@@ -1204,6 +1211,17 @@ defmodule KiroCockpit.KiroSession do
           "Action blocked by swarm boundary: #{reason}",
           nil
         )
+    end
+  end
+
+  # Dispatch callback if policy allows; otherwise respond with denied_error.
+  # Extracted from run_callback_with_boundary to reduce nesting depth.
+  defp dispatch_if_policy_allows(state, port_pid, id, method, params) do
+    if Callbacks.allowed_by_policy?(method, state.callback_policy) do
+      dispatch_callback(state, port_pid, id, method, params)
+    else
+      {:error, code, message, data} = Callbacks.denied_error(method)
+      PortProcess.respond_error(port_pid, id, code, message, data)
     end
   end
 
@@ -1266,9 +1284,9 @@ defmodule KiroCockpit.KiroSession do
       Keyword.get(opts, :plan_id) || Keyword.get(opts, :swarm_plan_id) || state.swarm_plan_id
 
     if plan_id do
-      case KiroCockpit.Plans.get_plan(plan_id) do
+      case Plans.get_plan(plan_id) do
         nil -> nil
-        plan -> KiroCockpit.Swarm.PlanMode.from_plan(plan)
+        plan -> PlanMode.from_plan(plan)
       end
     end
   rescue
