@@ -113,6 +113,22 @@ defmodule KiroCockpit.KiroSession do
   # introspection, not durability — storage owns truth, the runtime caches.
   @default_stream_buffer_limit 256
 
+  # kiro-8v5: Safe prompt opt keys — the whitelist of public opts that may
+  # pass through to `prompt_boundary_opts/2`.  Everything else is stripped
+  # because the merge `Keyword.merge(base, opts)` would let arbitrary caller
+  # opts override server-derived trust/authorization fields.
+  #
+  # Identifiers (plan_id, task_id, agent_id, swarm_plan_id) are allowed
+  # because they feed derivation/hydration, not direct authorization.
+  # Actual authorization is derived from durable DB state by ActionBoundary.
+  @safe_prompt_opt_keys [
+    :timeout,
+    :plan_id,
+    :task_id,
+    :agent_id,
+    :swarm_plan_id
+  ]
+
   # -- Types ----------------------------------------------------------------
 
   @typedoc """
@@ -1168,8 +1184,18 @@ defmodule KiroCockpit.KiroSession do
   # distinguish it from arbitrary subagent invocation. This is a control-plane
   # action that bypasses category/scope checks when plan is approved and
   # active task exists (kiro-rhk issue bd).
+  #
+  # kiro-8v5: Public prompt opts are sanitized before the merge so that
+  # untrusted caller keys cannot override server-derived trust/authorization
+  # fields.  Only keys in `@safe_prompt_opt_keys` survive.  Authorization
+  # flags (approved, policy_allows_write, plan_mode, permission_level,
+  # enabled, swarm_ctx, session_id, agent_id, project_dir, and hook/trust
+  # flags) are ALWAYS taken from server state — never from caller opts.
   defp prompt_boundary_opts(state, opts) do
+    # derive_plan_mode reads plan_id from raw opts (pre-sanitization)
+    # because it uses plan_id as a lookup key for DB derivation.
     plan_mode = state.plan_mode || derive_plan_mode(opts, state)
+    safe_opts = sanitize_prompt_opts(opts)
 
     Keyword.merge(
       [
@@ -1188,8 +1214,26 @@ defmodule KiroCockpit.KiroSession do
         # enables hooks.
         enabled: state.swarm_hooks
       ],
-      opts
+      safe_opts
     )
+  end
+
+  @doc """
+  Sanitizes public prompt opts by keeping only safe keys.
+
+  kiro-8v5: Untrusted caller opts passed to `prompt/3` must not be able
+  to override server-derived boundary fields (plan_mode, approved,
+  permission_level, etc.). This function strips every key NOT in the
+  `@safe_prompt_opt_keys` whitelist before the merge in
+  `prompt_boundary_opts/2`.
+
+  Authorization flags are always derived from server state or durable
+  DB state by `ActionBoundary`, never from caller opts.
+  """
+  @doc since: "0.1.0"
+  @spec sanitize_prompt_opts(keyword()) :: keyword()
+  def sanitize_prompt_opts(opts) when is_list(opts) do
+    Keyword.take(opts, @safe_prompt_opt_keys)
   end
 
   # Run hooks through the boundary module if enabled; otherwise invoke
