@@ -874,9 +874,14 @@ defmodule KiroCockpit.KiroSession do
     # the agent is waiting for a response), but Bronze action lifecycle
     # records are still emitted with correlation per §27.11 inv. 7.
     egress_result =
-      run_egress_if_hooks(state, :acp_egress_respond, [method: "callback_response"], fn ->
-        PortProcess.respond(port_pid, request_id, result)
-      end)
+      run_egress_if_hooks(
+        state,
+        :acp_egress_respond,
+        [method: "callback_response", request_id: request_id],
+        fn ->
+          PortProcess.respond(port_pid, request_id, result)
+        end
+      )
 
     # respond is exempt — always {:ok, _} when hooks enabled.
     _ = egress_result
@@ -902,7 +907,7 @@ defmodule KiroCockpit.KiroSession do
       run_egress_if_hooks(
         state,
         :acp_egress_respond_error,
-        [method: "callback_response_error"],
+        [method: "callback_response_error", request_id: request_id],
         fn -> PortProcess.respond_error(port_pid, request_id, code, message, data) end
       )
 
@@ -1195,7 +1200,9 @@ defmodule KiroCockpit.KiroSession do
   # Build boundary options for ACP egress actions.
   # Egress actions are client→agent messages; permission_level is :read
   # because they don't directly modify the environment (the agent decides
-  # how to act on them). Includes the ACP method in metadata for audit.
+  # how to act on them). Persists egress_type and method in payload and
+  # raw_payload (not metadata-only) so Bronze action capture records the
+  # ACP method. Mirrors callback_boundary_opts style (kiro-bih).
   defp egress_boundary_opts(state, extra) do
     plan_mode = state.plan_mode || derive_plan_mode([], state)
 
@@ -1210,15 +1217,37 @@ defmodule KiroCockpit.KiroSession do
         swarm_ctx: state.swarm_ctx
       ]
 
-    # Merge extra keyword pairs (e.g. method: "session/cancel")
-    # into metadata so they appear in Bronze records.
+    extra_map = Enum.into(extra, %{})
+    egress_method = Map.get(extra_map, :method)
+
+    # Metadata for hook context (not directly persisted in Bronze rows)
     metadata =
-      extra
-      |> Enum.into(%{})
+      extra_map
       |> Map.put(:egress_type, :acp_egress)
+
+    # Payload: egress_type + egress_method so Bronze payload summary
+    # captures the keys (and full values in safe mode).
+    payload = %{
+      egress_type: :acp_egress,
+      egress_method: egress_method
+    }
+
+    # Raw payload: method key so Bronze summarizer extracts it as
+    # method_hint in the raw_payload_summary. Include request_id as
+    # :id when present (safe correlation integer — avoids leaking
+    # full result/error payloads).
+    raw_payload = %{method: egress_method}
+
+    raw_payload =
+      case Map.get(extra_map, :request_id) do
+        nil -> raw_payload
+        request_id -> Map.put(raw_payload, :id, request_id)
+      end
 
     base
     |> Keyword.put(:metadata, metadata)
+    |> Keyword.put(:payload, payload)
+    |> Keyword.put(:raw_payload, raw_payload)
   end
 
   defp truthy_lookup(map, key) when is_map(map) do

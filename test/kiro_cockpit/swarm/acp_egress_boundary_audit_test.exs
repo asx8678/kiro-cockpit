@@ -22,6 +22,7 @@ defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
   # async: false — tests toggle global Application env (:bronze_action_capture_enabled)
   use KiroCockpit.DataCase, async: false
 
+  alias KiroCockpit.KiroSession
   alias KiroCockpit.Swarm.{ActionBoundary, Hook, HookResult}
   alias KiroCockpit.Swarm.DataPipeline.BronzeAction
   alias KiroCockpit.Swarm.Tasks.TaskManager
@@ -564,21 +565,329 @@ defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
     end
   end
 
-  # -- KiroSession integration -----------------------------------------------
+  # -- Bronze payload persistence (kiro-bih) ---------------------------------
+  #
+  # Verifies that ACP egress method/details are persisted in Bronze action
+  # capture payload/raw_payload, not metadata-only. This mirrors the
+  # callback_boundary_opts style where callback_method appears in payload
+  # and raw_payload.method is extracted as method_hint.
+
+  describe "run_egress/3 — Bronze payload persistence (kiro-bih)" do
+    setup do
+      session_id = "egress-persist-test-#{System.unique_integer([:positive])}"
+      agent_id = "egress-test-agent"
+      {:ok, session_id: session_id, agent_id: agent_id}
+    end
+
+    test "exempt egress (cancel) persists ACP method in Bronze raw_payload.method_hint",
+         %{session_id: sid, agent_id: aid} do
+      with_bronze_capture(fn ->
+        ActionBoundary.run_egress(
+          :acp_egress_cancel,
+          [
+            session_id: sid,
+            agent_id: aid,
+            pre_hooks: [],
+            post_hooks: [],
+            enabled: true,
+            payload: %{egress_type: :acp_egress, egress_method: "session/cancel"},
+            raw_payload: %{method: "session/cancel"}
+          ],
+          fn -> :ok end
+        )
+
+        actions = BronzeAction.list_actions(sid)
+        before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+
+        assert length(before_events) >= 1, "expected action_before for exempt egress"
+        before = List.last(before_events)
+
+        # Bronze raw_payload summary must include method_hint with the actual
+        # ACP method string — not just metadata (kiro-bih).
+        raw = before.raw_payload || %{}
+
+        assert raw["method_hint"] == "session/cancel",
+               "expected raw_payload.method_hint == 'session/cancel', got: #{inspect(raw)}"
+
+        # Bronze payload summary must include egress_type and egress_method keys
+        payload = before.payload || %{}
+        assert payload["type"] == "payload_summary"
+
+        assert "egress_type" in (payload["keys"] || []),
+               "expected egress_type in payload keys, got: #{inspect(payload)}"
+
+        assert "egress_method" in (payload["keys"] || []),
+               "expected egress_method in payload keys, got: #{inspect(payload)}"
+      end)
+    end
+
+    test "non-exempt egress (notify) persists ACP method in Bronze raw_payload.method_hint",
+         %{session_id: sid, agent_id: aid} do
+      with_bronze_capture(fn ->
+        ActionBoundary.run_egress(
+          :acp_egress_notify,
+          [
+            session_id: sid,
+            agent_id: aid,
+            pre_hooks: [AlwaysContinueHook],
+            post_hooks: [],
+            enabled: true,
+            payload: %{egress_type: :acp_egress, egress_method: "fs/read_text_file"},
+            raw_payload: %{method: "fs/read_text_file"}
+          ],
+          fn -> :ok end
+        )
+
+        actions = BronzeAction.list_actions(sid)
+        before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+
+        assert length(before_events) >= 1, "expected action_before for non-exempt egress"
+        before = List.last(before_events)
+
+        # Bronze raw_payload summary must include method_hint (kiro-bih)
+        raw = before.raw_payload || %{}
+
+        assert raw["method_hint"] == "fs/read_text_file",
+               "expected raw_payload.method_hint == 'fs/read_text_file', got: #{inspect(raw)}"
+
+        # Bronze payload summary must include egress keys
+        payload = before.payload || %{}
+        assert payload["type"] == "payload_summary"
+
+        assert "egress_type" in (payload["keys"] || []),
+               "expected egress_type in payload keys, got: #{inspect(payload)}"
+
+        assert "egress_method" in (payload["keys"] || []),
+               "expected egress_method in payload keys, got: #{inspect(payload)}"
+      end)
+    end
+
+    test "exempt egress (respond) with request_id preserves id_hint in raw_payload",
+         %{session_id: sid, agent_id: aid} do
+      with_bronze_capture(fn ->
+        ActionBoundary.run_egress(
+          :acp_egress_respond,
+          [
+            session_id: sid,
+            agent_id: aid,
+            pre_hooks: [],
+            post_hooks: [],
+            enabled: true,
+            payload: %{egress_type: :acp_egress, egress_method: "callback_response"},
+            raw_payload: %{method: "callback_response", id: 42}
+          ],
+          fn -> :ok end
+        )
+
+        actions = BronzeAction.list_actions(sid)
+        before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+
+        assert length(before_events) >= 1
+        before = List.last(before_events)
+
+        raw = before.raw_payload || %{}
+
+        assert raw["method_hint"] == "callback_response",
+               "expected method_hint == 'callback_response', got: #{inspect(raw)}"
+
+        # request_id appears as :id in raw_payload → id_hint "has_id"
+        assert raw["id_hint"] == "has_id",
+               "expected raw_payload.id_hint == 'has_id', got: #{inspect(raw)}"
+      end)
+    end
+
+    test "blocked non-exempt egress (notify) still persists method in Bronze records",
+         %{session_id: sid, agent_id: aid} do
+      with_bronze_capture(fn ->
+        ActionBoundary.run_egress(
+          :acp_egress_notify,
+          [
+            session_id: sid,
+            agent_id: aid,
+            pre_hooks: [AlwaysBlockHook],
+            enabled: true,
+            payload: %{egress_type: :acp_egress, egress_method: "fs/write_text_file"},
+            raw_payload: %{method: "fs/write_text_file"}
+          ],
+          fn -> :ok end
+        )
+
+        actions = BronzeAction.list_actions(sid)
+        blocked_events = Enum.filter(actions, &(&1.event_type == "action_blocked"))
+
+        assert length(blocked_events) >= 1, "expected action_blocked for blocked egress"
+        blocked = List.last(blocked_events)
+
+        # Even blocked egress must persist the method (kiro-bih)
+        raw = blocked.raw_payload || %{}
+
+        assert raw["method_hint"] == "fs/write_text_file",
+               "expected method_hint in blocked record, got: #{inspect(raw)}"
+
+        payload = blocked.payload || %{}
+
+        assert "egress_type" in (payload["keys"] || []),
+               "expected egress_type in blocked payload keys, got: #{inspect(payload)}"
+      end)
+    end
+  end
+
+  # -- KiroSession integration (kiro-bih) --------------------------------------
+  #
+  # Proves that KiroSession routes egress actions through
+  # ActionBoundary.run_egress/3 when swarm_hooks is enabled.
+  # Uses a mock swarm_hooks_module that records invocations.
 
   describe "KiroSession egress integration (kiro-bih)" do
-    @tag :integration
-    test "KiroSession.cancel routes through egress boundary" do
-      # This is an integration test that verifies the KiroSession.cancel/2
-      # handler actually delegates to ActionBoundary.run_egress/3.
-      # We verify by checking that the egress_boundary_opts helper
-      # constructs the right options (tested via the unit tests above)
-      # and that the boundary module is called (tested via mocks or
-      # direct boundary tests).
-      #
-      # The actual KiroSession integration is exercised in
-      # kiro_session_test.exs where a real agent subprocess is spawned.
-      # This test focuses on the boundary routing logic.
+    defmodule EgressSpy do
+      @moduledoc """
+      Spy module that records run_egress calls for KiroSession integration tests.
+      Implements the same public API as ActionBoundary (run/3, run_egress/3)
+      so it can be injected as swarm_hooks_module.
+      """
+      use Agent
+
+      def start_link(_opts \\ []), do: Agent.start_link(fn -> [] end, name: __MODULE__)
+
+      def get_calls, do: Agent.get(__MODULE__, & &1)
+
+      def reset, do: Agent.update(__MODULE__, fn _ -> [] end)
+
+      def run(action, opts, fun) do
+        Agent.update(__MODULE__, fn calls -> [{:run, action, opts} | calls] end)
+        {:ok, fun.()}
+      end
+
+      def run_egress(action, opts, fun) do
+        Agent.update(__MODULE__, fn calls -> [{:run_egress, action, opts} | calls] end)
+        {:ok, fun.()}
+      end
+
+      def run_lifecycle_post_hooks(_action, _opts), do: :ok
+    end
+
+    test "KiroSession.cancel routes through run_egress when swarm_hooks enabled" do
+      EgressSpy.start_link()
+      EgressSpy.reset()
+
+      elixir = System.find_executable("elixir") || flunk("elixir not on PATH")
+
+      ebin_dirs =
+        Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
+
+      fake_agent_entry = ~s|KiroCockpit.Test.Acp.FakeAgent.main()|
+
+      args =
+        Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+          ["-e", fake_agent_entry]
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          env: [{"FAKE_ACP_SCENARIO", "cancel"}],
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: false,
+          swarm_hooks: true,
+          swarm_hooks_module: EgressSpy
+        )
+
+      # Initialize + new_session so the session is ready for a prompt
+      assert {:ok, _} = KiroSession.initialize(session)
+      assert {:ok, _result} = KiroSession.new_session(session, File.cwd!())
+
+      # Start a prompt (sets turn_status to :running) — the cancel scenario
+      # agent emits one chunk then blocks reading stdin until cancel arrives
+      task = Task.async(fn -> KiroSession.prompt(session, "long-running") end)
+
+      # Wait for the initial chunk so the agent is in its blocking read
+      assert_receive {:kiro_stream_event, ^session, _}, 2_000
+
+      # Issue cancel — should route through EgressSpy.run_egress/3
+      :ok = KiroSession.cancel(session)
+
+      # Let the prompt complete so the session shuts down cleanly
+      Task.await(task, 5_000)
+
+      calls = EgressSpy.get_calls()
+
+      # Must have at least one run_egress call with the cancel action
+      egress_calls = Enum.filter(calls, &match?({:run_egress, _, _}, &1))
+      assert length(egress_calls) >= 1, "expected run_egress call, got: #{inspect(calls)}"
+
+      {_, action, _opts} = List.last(egress_calls)
+      assert action == :acp_egress_cancel, "expected :acp_egress_cancel, got: #{action}"
+
+      # Cleanup
+      KiroSession.stop(session)
+    end
+
+    test "KiroSession egress opts include method in payload and raw_payload" do
+      EgressSpy.start_link()
+      EgressSpy.reset()
+
+      elixir = System.find_executable("elixir") || flunk("elixir not on PATH")
+
+      ebin_dirs =
+        Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
+
+      fake_agent_entry = ~s|KiroCockpit.Test.Acp.FakeAgent.main()|
+
+      args =
+        Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+          ["-e", fake_agent_entry]
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          env: [{"FAKE_ACP_SCENARIO", "cancel"}],
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: false,
+          swarm_hooks: true,
+          swarm_hooks_module: EgressSpy
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+      assert {:ok, _result} = KiroSession.new_session(session, File.cwd!())
+
+      # Start a prompt to set turn_status to :running
+      task = Task.async(fn -> KiroSession.prompt(session, "long-running") end)
+
+      # Wait for the initial chunk so the agent is in its blocking read
+      assert_receive {:kiro_stream_event, ^session, _}, 2_000
+
+      # Cancel — routes through EgressSpy
+      :ok = KiroSession.cancel(session)
+
+      # Let the prompt complete
+      Task.await(task, 5_000)
+
+      calls = EgressSpy.get_calls()
+      egress_calls = Enum.filter(calls, &match?({:run_egress, _, _}, &1))
+      assert length(egress_calls) >= 1
+
+      {_, _action, opts} = List.last(egress_calls)
+
+      # Verify egress_boundary_opts includes payload and raw_payload with method
+      payload = Keyword.get(opts, :payload, %{})
+      raw_payload = Keyword.get(opts, :raw_payload, %{})
+
+      assert payload[:egress_type] == :acp_egress,
+             "expected payload.egress_type == :acp_egress, got: #{inspect(payload)}"
+
+      assert payload[:egress_method] == "session/cancel",
+             "expected payload.egress_method == 'session/cancel', got: #{inspect(payload)}"
+
+      assert raw_payload[:method] == "session/cancel",
+             "expected raw_payload.method == 'session/cancel', got: #{inspect(raw_payload)}"
+
+      KiroSession.stop(session)
+    end
+
+    test "exemption classification is correct for all egress actions" do
       assert ActionBoundary.egress_exempt?(:acp_egress_cancel)
       assert ActionBoundary.egress_exempt?(:acp_egress_respond)
       assert ActionBoundary.egress_exempt?(:acp_egress_respond_error)
