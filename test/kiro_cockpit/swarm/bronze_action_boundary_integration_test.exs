@@ -215,10 +215,14 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
       end)
     end
 
-    test "does not record action events when capture is disabled" do
-      session_id = "sess_disabled_#{System.unique_integer([:positive])}"
+    test "records action events even when capture flag is false (kiro-3nr mandatory)" do
+      # Per kiro-3nr, Bronze action capture is MANDATORY and non-disableable
+      # in the runtime path. The env flag :bronze_action_capture_enabled exists
+      # for test/reporting only and is NOT consulted by ActionBoundary.
+      session_id = "sess_mandatory_#{System.unique_integer([:positive])}"
 
       with_env(:bronze_action_capture_enabled, false, fn ->
+        # ActionBoundary MUST record even with the flag set to false
         result =
           ActionBoundary.run(
             :test_action,
@@ -234,9 +238,18 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
 
         assert {:ok, :ok} = result
 
-        # No action events should be recorded
+        # Action events MUST be recorded — Bronze capture is mandatory
         events = DataPipeline.list_action_events(session_id)
-        assert [] = events
+
+        assert [_ | _] = events,
+               "ActionBoundary must record Bronze events even when flag is false"
+
+        event_types = events |> Enum.map(& &1.event_type) |> Enum.sort()
+        assert ["action_after", "action_before"] = event_types
+
+        # Verify DataPipeline config function still reports the correct flag value
+        refute DataPipeline.action_capture_enabled?(),
+               "DataPipeline.action_capture_enabled?/0 must still respect config"
       end)
     end
 

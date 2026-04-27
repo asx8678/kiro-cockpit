@@ -1717,15 +1717,19 @@ defmodule KiroCockpit.KiroSession do
   defp persist_inbound_response(_state, _payload), do: :ok
 
   # -- Bronze ACP capture alongside raw EventStore persistence --------------
+  #
+  # Per kiro-3nr, Bronze ACP capture is MANDATORY when persist_messages is
+  # enabled (the default in production). The env flag :bronze_acp_capture_enabled
+  # exists for test/reporting only and is NOT consulted here. Persistence
+  # failures are rescued to :ok (never crash the session) and logged with
+  # full context for operational visibility.
 
   # Classify JSON-RPC payload shape and call the appropriate BronzeAcp
   # record function. Includes session_id, agent_id, and plan/task
   # correlation where available from KiroSession state.
   defp persist_bronze_acp(state, payload, direction) do
     unless state.persist_messages == false do
-      if DataPipeline.acp_capture_enabled?() do
-        do_persist_bronze_acp(state, payload, direction)
-      end
+      do_persist_bronze_acp(state, payload, direction)
     end
   end
 
@@ -1786,7 +1790,19 @@ defmodule KiroCockpit.KiroSession do
 
     :ok
   rescue
-    _ -> :ok
+    exception ->
+      # kiro-3nr: Persistence failures are rescued to :ok (never crash the
+      # session) but logged with full context for operational visibility.
+      # The BronzeAcp/BronzeAction modules also emit telemetry internally.
+      Logger.warning(fn ->
+        "KiroSession Bronze ACP persistence failed" <>
+          " (session_id=#{inspect(state.session_id)}" <>
+          ", agent_id=#{inspect(state.swarm_agent_id)}" <>
+          ", direction=#{inspect(direction)}" <>
+          "): #{Exception.message(exception)}"
+      end)
+
+      :ok
   end
 
   # -- Crash dump (§12.9) --------------------------------------------------
