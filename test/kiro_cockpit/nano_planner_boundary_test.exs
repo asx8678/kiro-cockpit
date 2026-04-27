@@ -116,7 +116,11 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
     [
       kiro_session_module: FakeKiroSession,
       project_dir: dir,
-      session_id: "boundary-test-session"
+      session_id: "boundary-test-session",
+      # kiro-egn: test_bypass allows direct execution in test env when
+      # boundary is disabled (default test config). Production paths never
+      # use this opt — it is silently ignored outside Mix.env() == :test.
+      test_bypass: true
     ]
   end
 
@@ -150,14 +154,32 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       assert trace.hook_results["action"] == "nano_plan_generate"
     end
 
-    test "boundary disabled (default test config) skips hooks and still works", %{
+    test "boundary disabled (default test config) fails closed for non-exempt action (kiro-egn)",
+         %{
+           project_dir: dir
+         } do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      # No swarm_hooks opt → defaults to Application env which is false in test
+      # kiro-egn: non-exempt actions now fail closed when boundary is disabled
+      # Remove test_bypass from default_plan_opts to test fail-closed behavior
+      opts = Keyword.delete(default_plan_opts(dir), :test_bypass)
+
+      assert {:error, {:swarm_boundary_disabled, :nano_plan_generate}} =
+               NanoPlanner.plan(:fake_session, "Build it", opts)
+    end
+
+    test "boundary disabled with test_bypass still works (kiro-egn)", %{
       project_dir: dir
     } do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
-      # No swarm_hooks opt → defaults to Application env which is false in test
+      # test_bypass allows direct execution in test environment only
 
       assert {:ok, plan} =
-               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+               NanoPlanner.plan(
+                 :fake_session,
+                 "Build it",
+                 Keyword.put(default_plan_opts(dir), :test_bypass, true)
+               )
 
       assert plan.session_id == "boundary-test-session"
       assert plan.status == "draft"
@@ -336,12 +358,37 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       assert trace.hook_results["outcome"] == "ok"
     end
 
-    test "approve with hooks disabled (default test config) still works", %{project_dir: dir} do
+    test "approve with hooks disabled fails closed for non-exempt action (kiro-egn)", %{
+      project_dir: dir
+    } do
+      Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # First generate with test_bypass so we can get a plan to approve
+      assert {:ok, plan} =
+               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+
+      Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
+      Process.put(:fake_kiro_prompt_calls, [])
+
+      # Approve without test_bypass should fail closed
+      assert {:error, {:swarm_boundary_disabled, :nano_plan_approve}} =
+               NanoPlanner.approve(:fake_session, plan.id,
+                 kiro_session_module: FakeKiroSession,
+                 project_dir: dir
+               )
+    end
+
+    test "approve with test_bypass still works (kiro-egn)", %{project_dir: dir} do
       Process.put(:fake_kiro_prompt_result, {:ok, valid_plan_map()})
       Process.put(:fake_kiro_prompt_calls, [])
 
       assert {:ok, plan} =
-               NanoPlanner.plan(:fake_session, "Build it", default_plan_opts(dir))
+               NanoPlanner.plan(
+                 :fake_session,
+                 "Build it",
+                 Keyword.put(default_plan_opts(dir), :test_bypass, true)
+               )
 
       Process.put(:fake_kiro_prompt_result, {:ok, %{"stopReason" => "end_turn"}})
       Process.put(:fake_kiro_prompt_calls, [])
@@ -349,7 +396,8 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       assert {:ok, %{plan: approved_plan}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 test_bypass: true
                )
 
       assert approved_plan.status == "approved"

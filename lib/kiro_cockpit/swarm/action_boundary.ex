@@ -24,6 +24,19 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   Enabled by default via `Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)`.
   Test config disables by default; explicit tests enable via opts.
 
+  ## Non-bypassable enforcement (kiro-egn)
+
+  The boundary is **non-bypassable** for non-exempt runtime actions. When
+  the boundary is disabled (via `:enabled` opt or app config), non-exempt
+  actions fail closed with `{:error, {:swarm_boundary_disabled, ...}}`.
+  Only exempt actions (lifecycle/internal) may execute directly when the
+  boundary is disabled.
+
+  A `:test_bypass` opt is provided for test isolation — it is only
+  effective when `Mix.env() == :test`. In production, `:test_bypass`
+  is silently ignored, ensuring production paths can never bypass
+  task/category/plan-mode/steering/Bronze capture hooks.
+
   ## Bronze capture
 
   HookManager persists hook_trace rows on every run (mandatory §27.11 inv. 7).
@@ -57,6 +70,20 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   ]
 
   @default_post_hooks [KiroCockpit.Swarm.Hooks.TaskGuidanceHook]
+
+  # Actions exempt from boundary enforcement (kiro-egn).
+  # These are internal/lifecycle actions that don't need pre-hook gating.
+  # All other runtime actions (prompt, callback, plan generate/approve/run)
+  # are non-exempt and MUST pass through hooks — disabling the boundary
+  # fails closed for them rather than allowing direct execution.
+  @exempt_actions [
+    :task_created,
+    :task_activated,
+    :task_completed,
+    :task_blocked,
+    :plan_approved_lifecycle,
+    :lifecycle_post_hook
+  ]
 
   @typedoc """
   Context map passed to arity-1 executor functions.
@@ -112,18 +139,28 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     * `:task_manager_module` — module for active task lookup (default: TaskManager)
     * `:staleness_module` — module for trusted_context (default: Staleness)
     * `:enabled` — explicitly enable/disable boundary (default: app config)
+    * `:test_bypass` — allow direct execution when boundary is disabled
+      (kiro-egn). **Only effective in `Mix.env() == :test`**; silently
+      ignored in production so non-exempt actions always fail closed.
 
   ## Returns
 
     * `{:ok, result}` — executor ran, result is the executor's return value
     * `{:error, {:swarm_blocked, reason, messages}}` — pre-hooks blocked execution
+    * `{:error, {:swarm_boundary_disabled, action}}` — boundary disabled for
+      a non-exempt action (kiro-egn fail-closed)
   """
-  @spec run(atom(), keyword(), (-> term()) | (executor_context() -> term())) :: boundary_result()
+  @type disabled_result ::
+          {:error, {:swarm_boundary_disabled, atom()}}
+          | boundary_result()
+
+  @spec run(atom(), keyword(), (-> term()) | (executor_context() -> term())) ::
+          boundary_result() | disabled_result()
   def run(action, opts, fun) when is_atom(action) and is_function(fun) do
     if boundary_enabled?(opts) do
       run_boundary(action, opts, fun)
     else
-      {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
+      handle_disabled_boundary(action, opts, fun)
     end
   end
 
@@ -135,6 +172,46 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       explicit -> explicit
     end
   end
+
+  # When boundary is disabled, enforce non-bypassability (kiro-egn):
+  #   - Exempt actions: execute directly (lifecycle/internal, no hook gating needed)
+  #   - Non-exempt actions: fail closed with {:error, {:swarm_boundary_disabled, action}}
+  #   - :test_bypass opt: only effective in Mix.env() == :test, allowing tests
+  #     to bypass the boundary for unit-style testing. In production, ignored.
+  defp handle_disabled_boundary(action, opts, fun) do
+    cond do
+      action in @exempt_actions ->
+        {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
+
+      test_bypass_allowed?(opts) ->
+        {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
+
+      true ->
+        {:error, {:swarm_boundary_disabled, action}}
+    end
+  end
+
+  # :test_bypass is only effective when Mix.env() == :test.
+  # In production (dev/staging/prod), this opt is silently ignored,
+  # ensuring non-exempt actions can NEVER bypass the boundary.
+  defp test_bypass_allowed?(opts) do
+    Keyword.get(opts, :test_bypass, false) and Mix.env() == :test
+  end
+
+  @doc """
+  Returns the list of actions exempt from boundary enforcement (kiro-egn).
+
+  Exempt actions are internal/lifecycle actions that don't require
+  pre-hook gating and may execute directly when the boundary is disabled.
+  """
+  @spec exempt_actions() :: [atom()]
+  def exempt_actions, do: @exempt_actions
+
+  @doc """
+  Check if an action is exempt from boundary enforcement (kiro-egn).
+  """
+  @spec exempt_action?(atom()) :: boolean()
+  def exempt_action?(action), do: action in @exempt_actions
 
   defp run_boundary(action, opts, fun) do
     hm = Keyword.get(opts, :hook_manager_module, HookManager)

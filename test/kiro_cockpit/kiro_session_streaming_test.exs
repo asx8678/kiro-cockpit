@@ -35,7 +35,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
       env: [{"FAKE_ACP_SCENARIO", scenario}],
       subscriber: self(),
       persist_messages: false,
-      auto_callbacks: false
+      auto_callbacks: false,
+      test_bypass: true
     ]
 
     {:ok, session} = KiroSession.start_link(Keyword.merge(base_opts, opts))
@@ -298,7 +299,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
                  stream_buffer_limit: 0,
                  subscriber: self(),
                  persist_messages: false,
-                 auto_callbacks: false
+                 auto_callbacks: false,
+                 test_bypass: true
                )
 
       assert {:error, {:invalid_option, {:stream_buffer_limit, :nope}}} =
@@ -307,7 +309,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
                  stream_buffer_limit: :nope,
                  subscriber: self(),
                  persist_messages: false,
-                 auto_callbacks: false
+                 auto_callbacks: false,
+                 test_bypass: true
                )
     end
 
@@ -490,7 +493,8 @@ defmodule KiroCockpit.KiroSessionStreamingTest do
           env: [{"FAKE_ACP_SCENARIO", "normal"}],
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)

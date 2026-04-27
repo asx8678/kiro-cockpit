@@ -196,6 +196,9 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
 
       # Configure a session resolver that provides the project dir
       Application.put_env(:kiro_cockpit, :kiro_session_resolver, fn _sid -> %{cwd: dir} end)
+      # kiro-egn: Enable hooks so run_plan goes through the boundary
+      # (otherwise fails closed for non-exempt action)
+      Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)
 
       try do
         {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
@@ -208,6 +211,7 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
         assert html =~ "Plan execution started"
         assert render(view) =~ "Running"
       after
+        Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, false)
         Application.delete_env(:kiro_cockpit, :kiro_session_resolver)
         File.rm_rf!(dir)
       end

@@ -42,7 +42,8 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
           args: args,
           subscriber: self(),
           persist_messages: true,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -149,7 +150,8 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
           env: [{"FAKE_ACP_SCENARIO", "cancel"}],
           subscriber: self(),
           persist_messages: true,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -227,7 +229,8 @@ defmodule KiroCockpit.KiroSessionPersistenceTest do
           args: args,
           subscriber: self(),
           persist_messages: true,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)

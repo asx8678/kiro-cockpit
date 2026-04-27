@@ -34,7 +34,9 @@ defmodule KiroCockpit.KiroSessionLongTurnTest do
       executable: elixir,
       args: args,
       subscriber: self(),
-      persist_messages: false
+      persist_messages: false,
+      # kiro-egn: test_bypass for non-bypassable action boundary in test env
+      test_bypass: true
     ]
 
     {:ok, session} = KiroSession.start_link(Keyword.merge(base_opts, opts))

@@ -439,15 +439,34 @@ defmodule KiroCockpit.Plans do
   end
 
   # Run plan transition through the action boundary if hooks are enabled;
-  # otherwise invoke the fun directly.
+  # otherwise fail closed for non-exempt actions (kiro-egn).
+  # When boundary is disabled, non-exempt actions return
+  # {:error, {:swarm_boundary_disabled, action}} instead of executing directly.
   defp run_plan_boundary_if_enabled(boundary_opts, enabled?, fun) do
     if enabled? do
       case ActionBoundary.run(:nano_plan_run, boundary_opts, fun) do
-        {:ok, result} -> result
-        {:error, {:swarm_blocked, reason, _messages}} -> {:error, {:swarm_blocked, reason}}
+        {:ok, result} ->
+          result
+
+        {:error, {:swarm_blocked, reason, _messages}} ->
+          {:error, {:swarm_blocked, reason}}
+
+        {:error, {:swarm_boundary_disabled, _action}} ->
+          {:error, {:swarm_boundary_disabled, :nano_plan_run}}
       end
     else
-      fun.()
+      # Boundary disabled — delegate to ActionBoundary for non-bypassable
+      # enforcement (kiro-egn). Exempt actions execute; non-exempt fail closed.
+      case ActionBoundary.run(:nano_plan_run, Keyword.put(boundary_opts, :enabled, false), fun) do
+        {:ok, result} ->
+          result
+
+        {:error, {:swarm_blocked, reason, _messages}} ->
+          {:error, {:swarm_blocked, reason}}
+
+        {:error, {:swarm_boundary_disabled, _action}} ->
+          {:error, {:swarm_boundary_disabled, :nano_plan_run}}
+      end
     end
   end
 
@@ -490,6 +509,7 @@ defmodule KiroCockpit.Plans do
     |> maybe_put_opt(opts, :post_hooks)
     |> maybe_put_opt(opts, :hook_manager_module)
     |> maybe_put_opt(opts, :task_manager_module)
+    |> maybe_put_opt(opts, :test_bypass)
   end
 
   defp maybe_put_opt(kw, opts, key) do

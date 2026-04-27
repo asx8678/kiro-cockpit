@@ -86,7 +86,10 @@ defmodule KiroCockpit.NanoPlannerTest do
     [
       kiro_session_module: FakeKiroSession,
       project_dir: dir,
-      session_id: "test-session"
+      session_id: "test-session",
+      # kiro-egn: test_bypass allows direct execution in test env when
+      # boundary is disabled (default test config). Production never uses this.
+      test_bypass: true
     ]
   end
 
@@ -569,7 +572,8 @@ defmodule KiroCockpit.NanoPlannerTest do
       assert {:ok, %{plan: approved_plan, prompt_result: result}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 test_bypass: true
                )
 
       assert approved_plan.status == "approved"
@@ -606,7 +610,8 @@ defmodule KiroCockpit.NanoPlannerTest do
       assert {:error, {:prompt_failed, failed_plan, :connection_lost}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 test_bypass: true
                )
 
       # The plan was still approved in the DB

@@ -518,7 +518,10 @@ defmodule KiroCockpit.PlansTest do
 
       {:ok, approved} = Plans.approve_plan(plan.id)
 
-      assert {:ok, running} = Plans.run_plan(approved.id, project_dir: dir)
+      # kiro-egn: test_bypass needed when hooks disabled (default test config)
+      assert {:ok, running} =
+               Plans.run_plan(approved.id, project_dir: dir, test_bypass: true)
+
       assert running.status == "running"
     end
 
@@ -561,7 +564,7 @@ defmodule KiroCockpit.PlansTest do
       assert trace.hook_results["action"] == "nano_plan_run"
     end
 
-    test "run_plan stale check skipped when hooks disabled (default test config)", %{
+    test "run_plan fails closed when hooks disabled for non-exempt action (kiro-egn)", %{
       project_dir: dir
     } do
       {:ok, plan} =
@@ -575,9 +578,37 @@ defmodule KiroCockpit.PlansTest do
 
       {:ok, approved} = Plans.approve_plan(plan.id)
 
-      # With hooks disabled (default test config), staleness check is skipped
-      # and the plan transitions to running directly
-      assert {:ok, running} = Plans.run_plan(approved.id, project_dir: dir)
+      # kiro-egn: With hooks disabled (default test config), non-exempt
+      # actions fail closed rather than bypassing the boundary
+      assert {:error, {:swarm_boundary_disabled, :nano_plan_run}} =
+               Plans.run_plan(approved.id, project_dir: dir)
+
+      # Plan must NOT transition to running
+      refreshed = Plans.get_plan(approved.id)
+      assert refreshed.status == "approved"
+    end
+
+    test "run_plan with test_bypass allows execution when hooks disabled (kiro-egn)", %{
+      project_dir: dir
+    } do
+      {:ok, plan} =
+        Plans.create_plan(
+          "sess_stale_bypass",
+          "req",
+          :nano,
+          [],
+          default_opts()
+        )
+
+      {:ok, approved} = Plans.approve_plan(plan.id)
+
+      # test_bypass allows direct execution in test env only (kiro-egn)
+      assert {:ok, running} =
+               Plans.run_plan(approved.id,
+                 project_dir: dir,
+                 test_bypass: true
+               )
+
       assert running.status == "running"
     end
 
