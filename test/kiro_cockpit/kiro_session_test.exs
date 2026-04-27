@@ -731,7 +731,7 @@ defmodule KiroCockpit.KiroSessionTest do
     end
   end
 
-  describe "kiro-egn: callback fails closed when hooks disabled" do
+  describe "kiro-egn: callback handles boundary-disabled tuple defensively" do
     setup %{elixir: elixir, args: args} do
       # Use a mock boundary that allows prompts but returns
       # {:error, {:swarm_boundary_disabled, action}} for callback actions.
@@ -756,6 +756,7 @@ defmodule KiroCockpit.KiroSessionTest do
 
       # Ensure the test file exists for the fake agent's read
       File.write!("/tmp/kiro-fake.txt", "callback boundary test content")
+
       on_exit(fn ->
         File.rm("/tmp/kiro-fake.txt")
         safe_stop(session)
@@ -764,7 +765,7 @@ defmodule KiroCockpit.KiroSessionTest do
       {:ok, %{session: session}}
     end
 
-    test "callback fails closed / no side effect when hooks disabled and no test_bypass", %{
+    test "callback sends respond_error on boundary-disabled tuple, no crash", %{
       session: session
     } do
       # The mock boundary allows the prompt but returns disabled for
@@ -828,9 +829,10 @@ defmodule KiroCockpit.KiroSessionTest do
       {:ok, %{session: session}}
     end
 
-    test "prompt routes through boundary / does not disabled-crash when swarm_hooks=true overrides app config", %{
-      session: session
-    } do
+    test "prompt routes through boundary / does not disabled-crash when swarm_hooks=true overrides app config",
+         %{
+           session: session
+         } do
       # With swarm_hooks: true and app config false, the boundary should
       # run (enabled: true in opts overrides app config). The boundary may
       # block the prompt (e.g. TaskEnforcementHook with no active task),
