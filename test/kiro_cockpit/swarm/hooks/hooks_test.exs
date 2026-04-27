@@ -713,41 +713,55 @@ defmodule KiroCockpit.Swarm.HooksTest do
       assert %HookResult{decision: :continue} = result
     end
 
-    test "tracks first_action_shown durably via process dictionary" do
-      session_id = "sess_durable_#{:erlang.unique_integer([:positive])}"
+    test "guidance is per-event: fires on every invocation while planning-locked (stateless)" do
+      session_id = "sess_stateless_#{:erlang.unique_integer([:positive])}"
       event = Event.new(:read, session_id: session_id, agent_id: "agent_1")
       {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
-      # No ctx first_action_shown — sentinel starts absent
+      # No ctx first_action_shown — hook is stateless, always injects when locked
       ctx = %{plan_mode: plan_mode}
 
-      # First invocation: should inject guidance
+      # Every invocation while planning-locked injects guidance (per-event, no sentinel)
       result1 = PlanModeFirstActionHook.on_event(event, ctx)
       assert %HookResult{decision: :modify} = result1
 
-      # Second invocation: sentinel persisted in process dict, should continue
-      result2 = PlanModeFirstActionHook.on_event(event, ctx)
-      assert %HookResult{decision: :continue} = result2
-    end
-
-    test "clear_sentinel/1 resets durable tracking so guidance re-fires" do
-      session_id = "sess_clear_#{:erlang.unique_integer([:positive])}"
-      event = Event.new(:read, session_id: session_id, agent_id: "agent_1")
-      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
-      ctx = %{plan_mode: plan_mode}
-
-      # First invocation fires guidance
-      result1 = PlanModeFirstActionHook.on_event(event, ctx)
-      assert %HookResult{decision: :modify} = result1
-
-      # Clear sentinel (e.g. plan approved/rejected → new planning cycle)
-      PlanModeFirstActionHook.clear_sentinel(session_id)
-
-      # Guidance fires again after clearing
       result2 = PlanModeFirstActionHook.on_event(event, ctx)
       assert %HookResult{decision: :modify} = result2
     end
 
-    test "sentinel is session-scoped: different sessions get independent tracking" do
+    test "guidance stops when plan mode transitions out of locked state (no sentinel reset needed)" do
+      session_id = "sess_transition_#{:erlang.unique_integer([:positive])}"
+      event = Event.new(:read, session_id: session_id, agent_id: "agent_1")
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+      ctx = %{plan_mode: plan_mode}
+
+      # While planning-locked, guidance fires
+      result1 = PlanModeFirstActionHook.on_event(event, ctx)
+      assert %HookResult{decision: :modify} = result1
+
+      # Plan approved → planning unlocked → no guidance
+      {:ok, approved_mode} = PlanMode.draft_generated(plan_mode)
+      {:ok, unlocked_mode} = PlanMode.approve(approved_mode)
+      ctx_unlocked = %{plan_mode: unlocked_mode}
+
+      result2 = PlanModeFirstActionHook.on_event(event, ctx_unlocked)
+      assert %HookResult{decision: :continue} = result2
+    end
+
+    test "guidance works with nil session_id (no shared process-dict key)" do
+      event = Event.new(:read, session_id: nil, agent_id: "agent_1")
+      {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
+      ctx = %{plan_mode: plan_mode}
+
+      # No crash from nil session_id — stateless design has no shared key
+      result1 = PlanModeFirstActionHook.on_event(event, ctx)
+      assert %HookResult{decision: :modify} = result1
+
+      # Second invocation also works (no corrupt sentinel)
+      result2 = PlanModeFirstActionHook.on_event(event, ctx)
+      assert %HookResult{decision: :modify} = result2
+    end
+
+    test "different sessions both get guidance independently (stateless, no cross-contamination)" do
       session_a = "sess_a_#{:erlang.unique_integer([:positive])}"
       session_b = "sess_b_#{:erlang.unique_integer([:positive])}"
       {:ok, plan_mode} = PlanMode.enter_plan_mode(PlanMode.new())
@@ -756,21 +770,16 @@ defmodule KiroCockpit.Swarm.HooksTest do
       event_a = Event.new(:read, session_id: session_a, agent_id: "agent_1")
       event_b = Event.new(:read, session_id: session_b, agent_id: "agent_1")
 
-      # First invocation for session A
+      # Both sessions get guidance independently
       result_a1 = PlanModeFirstActionHook.on_event(event_a, ctx)
       assert %HookResult{decision: :modify} = result_a1
 
-      # Session B is still fresh — should also inject guidance
       result_b1 = PlanModeFirstActionHook.on_event(event_b, ctx)
       assert %HookResult{decision: :modify} = result_b1
 
-      # Session A already shown — should continue
+      # Re-invocations still inject guidance (stateless per-event)
       result_a2 = PlanModeFirstActionHook.on_event(event_a, ctx)
-      assert %HookResult{decision: :continue} = result_a2
-
-      # Clean up
-      PlanModeFirstActionHook.clear_sentinel(session_a)
-      PlanModeFirstActionHook.clear_sentinel(session_b)
+      assert %HookResult{decision: :modify} = result_a2
     end
   end
 

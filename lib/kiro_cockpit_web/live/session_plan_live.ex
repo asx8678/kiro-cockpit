@@ -31,6 +31,10 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   @supported_modes ["nano", "nano_deep", "nano_fix"]
   @default_mode "nano"
 
+  # Max length for safe error messages — truncate to avoid leaking
+  # long strings that might contain tokens, paths, or PII (§22.6/§25.6).
+  @max_safe_error_length 200
+
   # ── Lifecycle ─────────────────────────────────────────────────────────
 
   @impl true
@@ -587,7 +591,11 @@ defmodule KiroCockpitWeb.SessionPlanLive do
       # exception structs into logs (may contain PII/secrets).
       require Logger
 
-      Logger.warning("NanoPlanner.plan failed: #{Exception.message(e)}")
+      # Truncate exception message per §22.6/§25.6 — raw messages
+      # may contain tokens, connection strings, or PII.
+      Logger.warning(
+        "NanoPlanner.plan failed: #{safe_truncate(Exception.message(e), @max_safe_error_length)}"
+      )
 
       {:error, :planner_unavailable}
   end
@@ -701,13 +709,27 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   end
 
   defp format_error(reason) when is_atom(reason), do: to_string(reason)
-  defp format_error(reason) when is_binary(reason), do: reason
-  defp format_error(%{__exception__: true} = reason), do: Exception.message(reason)
-  defp format_error(reason) when is_list(reason), do: format_error(inspect(reason))
+
+  defp format_error(reason) when is_binary(reason) do
+    safe_truncate(reason, @max_safe_error_length)
+  end
+
+  # Exception messages may contain connection strings, stack traces, or
+  # other PII. Truncate and never inspect the raw struct (§22.6/§25.6).
+  defp format_error(%{__exception__: true} = reason) do
+    safe_truncate(Exception.message(reason), @max_safe_error_length)
+  end
+
+  # Never inspect arbitrary lists — they may contain secrets, tokens, or
+  # large payloads. Summarize by count only (§22.6/§25.6).
+  defp format_error(reason) when is_list(reason) do
+    "list of #{length(reason)} item(s)"
+  end
+
   defp format_error(reason), do: "unexpected error: #{type_name(reason)}"
 
   # Returns a safe type name for an unknown value — never inspects
-  # the value body, only its type, to avoid leaking PII/secrets.
+  # the value body, only its type, to avoid leaking PII/secrets (§22.6/§25.6).
   @spec type_name(term()) :: String.t()
   defp type_name(value) when is_map(value), do: "map"
   defp type_name(value) when is_tuple(value), do: "tuple"
@@ -717,11 +739,23 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   defp type_name(value) when is_reference(value), do: "reference"
   defp type_name(value) when is_float(value), do: "float"
   defp type_name(value) when is_integer(value), do: "integer"
+  defp type_name(value) when is_bitstring(value), do: "bitstring"
   defp type_name(_value), do: "unknown"
+
+  # Truncates a string to max_length, appending "..." if truncated.
+  # Prevents long error messages from leaking secrets/PII (§22.6/§25.6).
+  @spec safe_truncate(String.t(), non_neg_integer()) :: String.t()
+  defp safe_truncate(text, max_length) when is_binary(text) do
+    if String.length(text) > max_length do
+      String.slice(text, 0, max_length) <> "..."
+    else
+      text
+    end
+  end
 
   defp format_exit(:normal), do: "normal exit"
   defp format_exit(:shutdown), do: "shutdown"
-  defp format_exit({:shutdown, reason}) when is_binary(reason), do: "shutdown: #{reason}"
+  # Never include raw shutdown reason text — it may contain PII/secrets (§22.6/§25.6).
   defp format_exit({:shutdown, _reason}), do: "shutdown"
   defp format_exit(reason) when is_atom(reason), do: to_string(reason)
   defp format_exit(_reason), do: "unexpected exit"

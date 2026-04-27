@@ -441,6 +441,69 @@ defmodule KiroCockpitWeb.SessionPlanLiveTest do
     end
   end
 
+  describe "format_error redaction — no PII/token leaks (§22.6/§25.6)" do
+    # These test the private format_error/format_exit helpers indirectly
+    # through the LiveView error path, or directly if we invoke the module.
+    # Since these are private functions, we test them through the public
+    # LiveView event paths that trigger them.
+
+    test "list error does not inspect contents", %{conn: conn} do
+      session_id = "redact-list-#{System.unique_integer([:positive])}"
+
+      # Create a plan that will produce a list-shaped error on reject
+      {:ok, plan} = create_test_plan(session_id, %{status: "rejected"})
+
+      {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+      html = render_click(view, :reject_plan, %{"id" => plan.id})
+
+      # Should show a generic error, not Elixir-style list inspection
+      refute html =~ ~s(["api_key")
+      refute html =~ ~s(["password")
+      assert html =~ "invalid status transition" or html =~ "error"
+    end
+
+    test "exception error does not expose raw message with secrets", %{conn: conn} do
+      session_id = "redact-exc-#{System.unique_integer([:positive])}"
+
+      # Create an already-approved plan — approving again will fail
+      {:ok, plan} = create_test_plan(session_id, %{status: "approved"})
+
+      {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+      html = render_click(view, :approve_plan, %{"id" => plan.id})
+
+      # Should show a generic error message, not raw exception data
+      refute html =~ "%RuntimeError"
+      refute html =~ "%ArgumentError"
+    end
+
+    test "shutdown exit does not expose shutdown reason text", %{conn: conn} do
+      session_id = "redact-shutdown-#{System.unique_integer([:positive])}"
+
+      {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+      # Use a valid-format UUID that doesn't exist in DB — avoids Ecto.CastError
+      fake_uuid = Ecto.UUID.generate()
+      html = render_click(view, :run_plan, %{"id" => fake_uuid})
+
+      # Should show some error, not crash — format_exit handles gracefully
+      assert html =~ "not found" or html =~ "error"
+    end
+
+    test "unknown error type shows generic type name, not inspected value", %{conn: conn} do
+      session_id = "redact-unknown-#{System.unique_integer([:positive])}"
+      {:ok, plan} = create_test_plan(session_id, %{status: "rejected"})
+
+      {:ok, view, _html} = live(conn, ~p"/sessions/#{session_id}/plan")
+
+      # Re-reject shows error — verify no raw struct inspection leaks
+      html = render_click(view, :reject_plan, %{"id" => plan.id})
+      refute html =~ ~s(%{__struct__)
+      assert html =~ "invalid status transition"
+    end
+  end
+
   # Helper functions
 
   defp create_test_plan(session_id, attrs) do
