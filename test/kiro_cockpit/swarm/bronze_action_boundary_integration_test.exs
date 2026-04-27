@@ -70,17 +70,21 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
     task
   end
 
-  # Exception-safe Application env mutation: always restores original value
-  # even if the test body raises. Module is async: false, so global env
-  # mutations are serialized, but we still restore to keep things clean.
+  # Exception-safe Application env mutation: uses fetch_env/delete_env to
+  # correctly restore keys that were previously unset, avoiding env leaks
+  # (e.g. :bronze_acp_capture_enabled=false persisting after the test).
+  # Module is async: false, so global env mutations are serialized.
   defp with_env(key, value, fun) do
-    original = Application.get_env(:kiro_cockpit, key, value)
+    original = Application.fetch_env(:kiro_cockpit, key)
     Application.put_env(:kiro_cockpit, key, value)
 
     try do
       fun.()
     after
-      Application.put_env(:kiro_cockpit, key, original)
+      case original do
+        {:ok, orig_value} -> Application.put_env(:kiro_cockpit, key, orig_value)
+        :error -> Application.delete_env(:kiro_cockpit, key)
+      end
     end
   end
 

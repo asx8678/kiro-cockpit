@@ -22,19 +22,18 @@ defmodule KiroCockpit.Swarm.DataPipeline do
 
   ## Configuration
 
-  These flags are **reporting/test-compatibility toggles**, NOT runtime kill
-  switches. `KiroSession.persist_bronze_acp/3` only checks `persist_messages`
-  and deliberately does NOT consult these flags — Bronze capture is mandatory
-  whenever `persist_messages` is enabled. The flags exist so that reporting
-  tools and test suites can opt out of downstream analysis without losing
-  raw event persistence.
-
     * `:bronze_full_payload_capture` — capture full payloads instead of summaries
       (default: false, enable only for debugging)
-    * `:bronze_action_capture_enabled` — reporting flag: when false, downstream
-      consumers should skip action_before/action_after analysis (default: true)
-    * `:bronze_acp_capture_enabled` — reporting flag: when false, downstream
-      consumers should skip ACP event analysis (default: true)
+    * `:bronze_action_capture_enabled` — gates `record_action_lifecycle/3`:
+      when false, the convenience wrapper skips before/after recording.
+      `ActionBoundary.run/3` records Bronze action events unconditionally
+      regardless of this flag. (default: true)
+    * `:bronze_acp_capture_enabled` — **reporting-only toggle**: when false,
+      downstream consumers should skip ACP event analysis. This is NOT a
+      runtime kill switch — `KiroSession.persist_bronze_acp/3` only checks
+      `persist_messages` and deliberately ignores this flag. Bronze ACP
+      capture is mandatory whenever `persist_messages` is enabled.
+      (default: true)
 
   **Important:** Setting `:bronze_acp_capture_enabled` to `false` does NOT
   prevent `KiroSession` from persisting Bronze ACP events. It only signals

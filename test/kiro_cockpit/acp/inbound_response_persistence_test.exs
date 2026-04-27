@@ -41,14 +41,20 @@ defmodule KiroCockpit.Acp.InboundResponsePersistenceTest do
     end
   end
 
+  # Exception-safe Application env mutation: uses fetch_env/delete_env to
+  # correctly restore keys that were previously unset, avoiding env leaks
+  # like :bronze_acp_capture_enabled=false persisting after the test.
   defp with_env(key, value, fun) do
-    original = Application.get_env(:kiro_cockpit, key, value)
+    original = Application.fetch_env(:kiro_cockpit, key)
     Application.put_env(:kiro_cockpit, key, value)
 
     try do
       fun.()
     after
-      Application.put_env(:kiro_cockpit, key, original)
+      case original do
+        {:ok, orig_value} -> Application.put_env(:kiro_cockpit, key, orig_value)
+        :error -> Application.delete_env(:kiro_cockpit, key)
+      end
     end
   end
 
@@ -187,7 +193,6 @@ defmodule KiroCockpit.Acp.InboundResponsePersistenceTest do
   # it deliberately does NOT consult DataPipeline.acp_capture_enabled?/0.
   # See KiroSession lines ~1721-1724 for the design rationale.
   describe "Bronze ACP persistence with flag disabled (kiro-3nr regression)" do
-
     setup %{elixir: elixir, args: args} do
       session_id = "sess_flag_disabled_#{System.unique_integer([:positive])}"
 
