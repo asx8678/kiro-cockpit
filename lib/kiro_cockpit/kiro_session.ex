@@ -1283,15 +1283,10 @@ defmodule KiroCockpit.KiroSession do
         # Plan referenced but not found — fail closed (kiro-6dw)
         PlanMode.locked(plan_id, :plan_not_found)
 
-      %{status: status} = plan when is_binary(status) ->
+      plan ->
+        # Delegate all status handling (including corrupt/non-binary)
+        # to PlanMode.from_plan/1 at the widened API boundary (kiro-6dw).
         PlanMode.from_plan(plan)
-
-      %{status: _non_binary_status} = plan ->
-        # Corrupt/non-binary plan status — fail closed as locked
-        # with unknown_plan_status (kiro-6dw). This catches cases
-        # where the DB row has a nil or atom status value instead
-        # of the expected string.
-        PlanMode.locked(plan_id || plan.id, :unknown_plan_status)
     end
   rescue
     # DB/plan lookup failure during plan-correlated execution — fail closed
