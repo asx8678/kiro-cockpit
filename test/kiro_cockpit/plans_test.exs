@@ -554,8 +554,9 @@ defmodule KiroCockpit.PlansTest do
       # Bronze trace should be persisted for the blocked attempt
       events = KiroCockpit.Swarm.Events.list_by_session("sess_stale_run", limit: 10)
       assert length(events) >= 1
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_blocked also present; find hook_trace specifically
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       assert trace.hook_results["outcome"] == "blocked"
       assert trace.hook_results["action"] == "nano_plan_run"
     end
@@ -674,8 +675,9 @@ defmodule KiroCockpit.PlansTest do
       # Verify Bronze trace has nano-planner as the top-level agent_id
       events = KiroCockpit.Swarm.Events.list_by_session("sess_default_agent", limit: 10)
       assert length(events) >= 1
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_after also present; find hook_trace specifically
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       assert trace.agent_id == "nano-planner"
     end
 
