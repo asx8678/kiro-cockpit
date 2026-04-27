@@ -19,7 +19,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     7. Run HookManager.run(event, post_hooks, ctx, :post) for Bronze post trace
     8. Return executor result (post block does not undo execution)
 
-  ## ACP Egress Flow (kiro-bih)
+  ## ACP Egress Flow (kiro-bih, kiro-fmn)
 
   ACP egress actions (cancel, respond, respond_error, notify) send data FROM
   the client TO the agent. They route through `run_egress/3` which provides
@@ -29,13 +29,21 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       but still emit Bronze action_before/action_after lifecycle records
       with full correlation. These are protocol-mandated completions or
       safety mechanisms that must never be blocked by task enforcement.
+      Bronze capture is mandatory (kiro-fmn) regardless of
+      `:bronze_action_capture_enabled` config flag.
 
     * **Non-exempt** (notify) — run through the full `run/3` pipeline
       where pre-hooks may block. Blocked attempts emit Bronze
       action_blocked records per §27.11 inv. 7.
 
+  When the boundary is disabled, kiro-fmn enforces non-bypassable semantics:
+
+    * **Exempt** — still executes with mandatory Bronze audit.
+    * **Non-exempt** — fails closed with `{:error, {:swarm_boundary_disabled, action}}`
+      and does NOT execute.
+
   This ensures every ACP egress is auditable (§35 Phase 3) regardless
-  of exemption status.
+  of exemption or enabled status.
 
   ## Configuration
 
@@ -226,11 +234,14 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
 
   ## Returns
 
-    * `{:ok, result}` — executor ran (exempt always reaches this)
+    * `{:ok, result}` — executor ran (exempt always reaches this, even when
+      boundary is disabled — with Bronze audit preserved)
     * `{:error, {:swarm_blocked, reason, messages}}` — non-exempt was blocked
+    * `{:error, {:swarm_boundary_disabled, action}}` — boundary disabled for
+      a non-exempt egress action (kiro-fmn fail-closed)
   """
   @spec run_egress(atom(), keyword(), (-> term()) | (executor_context() -> term())) ::
-          boundary_result()
+          boundary_result() | disabled_result()
   def run_egress(action, opts, fun) when is_atom(action) and is_function(fun) do
     if boundary_enabled?(opts) do
       if egress_exempt?(action) do
@@ -239,7 +250,16 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
         run(action, opts, fun)
       end
     else
-      {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
+      # kiro-fmn: boundary disabled — fail closed for non-exempt egress.
+      # Exempt egress still executes with Bronze audit (mandatory §27.11 inv. 7)
+      # using a lightweight path that doesn't require DB hydration.
+      # Non-exempt egress (e.g. :acp_egress_notify) returns
+      # {:error, {:swarm_boundary_disabled, action}} and does NOT execute.
+      if egress_exempt?(action) do
+        run_egress_audit_disabled(action, opts, fun)
+      else
+        {:error, {:swarm_boundary_disabled, action}}
+      end
     end
   end
 
@@ -909,10 +929,10 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     ctx = build_ctx(opts, event, staleness_mod, tm)
     egress_ctx = Map.put(ctx, :egress_exempt, true)
 
-    # Bronze: record action_before (§27.11 inv. 7 — every action audited)
-    if DataPipeline.action_capture_enabled?() do
-      DataPipeline.record_action_before(event, egress_ctx)
-    end
+    # kiro-fmn: Bronze action_before is MANDATORY for exempt egress (§27.11 inv. 7).
+    # Removed DataPipeline.action_capture_enabled?() gate — exempt egress Bronze
+    # capture is unconditional regardless of app config flags.
+    DataPipeline.record_action_before(event, egress_ctx)
 
     # Execute the egress action — exempt actions are NEVER blocked.
     # The executor fun sends the ACP message to the agent.
@@ -923,10 +943,45 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
     _ = hm.run(event, post_hooks, ctx, :post)
 
-    # Bronze: record action_after (§27.11 inv. 7 — every action audited)
-    if DataPipeline.action_capture_enabled?() do
-      DataPipeline.record_action_after(event, bronze_result(result), egress_ctx)
-    end
+    # kiro-fmn: Bronze action_after is MANDATORY for exempt egress (§27.11 inv. 7).
+    # Removed DataPipeline.action_capture_enabled?() gate — exempt egress Bronze
+    # capture is unconditional regardless of app config flags.
+    DataPipeline.record_action_after(event, bronze_result(result), egress_ctx)
+
+    {:ok, result}
+  end
+
+  # kiro-fmn: Lightweight egress audit for disabled boundary.
+  # When the boundary is disabled but the egress is exempt, we must still
+  # execute and persist Bronze audit (§27.11 inv. 7). Unlike run_egress_audit/3
+  # which builds full context with DB hydration (TaskManager, Staleness),
+  # this path builds a minimal event from opts alone — no DB lookups needed.
+  # This ensures exempt egress audit works even when the boundary is disabled
+  # and callers (e.g. KiroSession with swarm_hooks: false) don't have full
+  # boundary context set up.
+  defp run_egress_audit_disabled(action, opts, fun) do
+    event =
+      Event.new(action,
+        session_id: Keyword.get(opts, :session_id),
+        agent_id: Keyword.get(opts, :agent_id),
+        plan_id: Keyword.get(opts, :plan_id),
+        task_id: Keyword.get(opts, :task_id),
+        permission_level: Keyword.get(opts, :permission_level),
+        payload: Keyword.get(opts, :payload, %{}),
+        raw_payload: Keyword.get(opts, :raw_payload, %{}),
+        metadata: Keyword.get(opts, :metadata, %{})
+      )
+
+    egress_ctx = %{egress_exempt: true}
+
+    # Bronze: record action_before (§27.11 inv. 7 — mandatory, unconditional)
+    DataPipeline.record_action_before(event, egress_ctx)
+
+    # Execute the egress action — exempt actions are NEVER blocked.
+    result = call_executor(fun, %{event: event, messages: [], hook_messages: []})
+
+    # Bronze: record action_after (§27.11 inv. 7 — mandatory, unconditional)
+    DataPipeline.record_action_after(event, bronze_result(result), egress_ctx)
 
     {:ok, result}
   end

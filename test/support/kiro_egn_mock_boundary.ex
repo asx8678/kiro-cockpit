@@ -31,4 +31,23 @@ defmodule KiroCockpit.Test.KiroEgnMockBoundary do
   def run(action, _opts, _fun) do
     {:error, {:swarm_boundary_disabled, action}}
   end
+
+  @doc """
+  Mock `run_egress/3` that handles ACP egress routing (kiro-fmn).
+
+  - exempt egress (cancel, respond, respond_error) → executes the fun
+  - non-exempt egress (notify) → `{:error, {:swarm_boundary_disabled, action}}`
+  """
+  def run_egress(action, _opts, fun) do
+    if ActionBoundary.egress_exempt?(action) do
+      {:ok, fun.()}
+    else
+      {:error, {:swarm_boundary_disabled, action}}
+    end
+  end
+
+  @doc """
+  Mock `run_lifecycle_post_hooks/2` — no-op.
+  """
+  def run_lifecycle_post_hooks(_action, _opts), do: :ok
 end
