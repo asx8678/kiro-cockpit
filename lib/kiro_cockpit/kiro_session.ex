@@ -900,6 +900,16 @@ defmodule KiroCockpit.KiroSession do
     {:noreply, state}
   end
 
+  # Inbound JSON-RPC response/error forwarded by PortProcess after
+  # resolve_pending/3. These are responses to KiroSession-originated
+  # requests (e.g. session/prompt result). PortProcess already resolved
+  # the pending GenServer call; we persist the raw ACP and Bronze rows.
+  @impl GenServer
+  def handle_info({:acp_inbound_response, port_pid, payload}, %{port_process: port_pid} = state) do
+    persist_inbound_response(state, payload)
+    {:noreply, state}
+  end
+
   @impl GenServer
   def handle_info({:acp_notification, port_pid, msg}, %{port_process: port_pid} = state) do
     # 1. Forward raw notification to subscriber (back-compat).
@@ -987,6 +997,8 @@ defmodule KiroCockpit.KiroSession do
   # Ignore stale messages from unknown port pids
   @impl GenServer
   def handle_info({:acp_outbound, _port_pid, _payload}, state), do: {:noreply, state}
+
+  def handle_info({:acp_inbound_response, _port_pid, _payload}, state), do: {:noreply, state}
 
   def handle_info({:acp_notification, _port_pid, _msg}, state), do: {:noreply, state}
 
@@ -1659,6 +1671,33 @@ defmodule KiroCockpit.KiroSession do
 
   defp persist_inbound(_state, _msg), do: :ok
 
+  # Persist inbound JSON-RPC response/error from PortProcess.notify_inbound_response.
+  # These are responses to KiroSession-originated requests (e.g. session/prompt
+  # results). PortProcess has already resolved the pending caller via
+  # resolve_pending/3; this function records the raw ACP and Bronze rows.
+  @spec persist_inbound_response(t(), map()) :: :ok
+  defp persist_inbound_response(%{persist_messages: false}, _payload), do: :ok
+
+  defp persist_inbound_response(state, payload) when is_map(payload) do
+    # Raw ACP row (EventStore) — direction is agent_to_client for inbound responses
+    try do
+      EventStore.record_acp_message("agent_to_client", payload, session_id: state.session_id)
+    rescue
+      e ->
+        Logger.warning(fn ->
+          "KiroSession failed to persist inbound ACP response" <>
+            " (id=#{inspect(Map.get(payload, "id"))}): #{Exception.message(e)}"
+        end)
+    end
+
+    # Bronze ACP event with session/agent/plan correlation (§35 Phase 3)
+    persist_bronze_acp(state, payload, :agent_to_client)
+
+    :ok
+  end
+
+  defp persist_inbound_response(_state, _payload), do: :ok
+
   # -- Bronze ACP capture alongside raw EventStore persistence --------------
 
   # Classify JSON-RPC payload shape and call the appropriate BronzeAcp
@@ -1671,6 +1710,22 @@ defmodule KiroCockpit.KiroSession do
       end
     end
   end
+
+  # Classify direction + message_type into Bronze ACP event kind.
+  # Response and error message types both map to :response for Bronze capture.
+  @spec classify_bronze_acp_event(atom(), String.t()) ::
+          {:ok, :request | :response | :notification} | :unknown
+  defp classify_bronze_acp_event(dir, msg_type)
+       when dir in [:client_to_agent, :agent_to_client] do
+    case msg_type do
+      "request" -> {:ok, :request}
+      mt when mt in ["response", "error"] -> {:ok, :response}
+      "notification" -> {:ok, :notification}
+      _ -> :unknown
+    end
+  end
+
+  defp classify_bronze_acp_event(_dir, _msg_type), do: :unknown
 
   defp do_persist_bronze_acp(state, payload, direction) do
     session_id = state.session_id
@@ -1690,26 +1745,17 @@ defmodule KiroCockpit.KiroSession do
 
     opts = Keyword.merge(base_opts, method: method, rpc_id: rpc_id)
 
-    case {direction, message_type} do
-      {:client_to_agent, "request"} ->
+    case classify_bronze_acp_event(direction, message_type) do
+      {:ok, :request} ->
         DataPipeline.record_acp_request(session_id, agent_id, payload, opts)
 
-      {:client_to_agent, "notification"} ->
-        DataPipeline.record_acp_notification(session_id, agent_id, payload, opts)
-
-      {:agent_to_client, "request"} ->
-        DataPipeline.record_acp_request(session_id, agent_id, payload, opts)
-
-      {:agent_to_client, "response"} ->
+      {:ok, :response} ->
         DataPipeline.record_acp_response(session_id, agent_id, payload, opts)
 
-      {:agent_to_client, "error"} ->
-        DataPipeline.record_acp_response(session_id, agent_id, payload, opts)
-
-      {:agent_to_client, "notification"} ->
+      {:ok, :notification} ->
         DataPipeline.record_acp_notification(session_id, agent_id, payload, opts)
 
-      _direction_and_type ->
+      :unknown ->
         # "unknown" or unclassifiable — record as generic acp_update
         DataPipeline.record_acp_update(%{
           session_id: session_id,

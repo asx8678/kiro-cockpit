@@ -208,6 +208,11 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAction do
     {:blocked, "blocked: #{truncate_string(reason, 200)}"}
   end
 
+  # Lifecycle blocked result (e.g. from ActionBoundary.normalize_lifecycle_result/1)
+  defp extract_result_summary({:blocked, reason, _messages}) when is_binary(reason) do
+    {:blocked, "blocked: #{truncate_string(reason, 200)}"}
+  end
+
   defp extract_result_summary({:error, reason}) do
     {:error, format_error_summary(reason)}
   end

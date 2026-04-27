@@ -489,7 +489,9 @@ defmodule KiroCockpit.Acp.PortProcess do
         state
 
       {:response, id, outcome} ->
-        resolve_pending(id, outcome, state)
+        state = resolve_pending(id, outcome, state)
+        notify_inbound_response(state, msg)
+        state
 
       {:invalid, reason, raw} ->
         Logger.warning(fn ->
@@ -570,6 +572,16 @@ defmodule KiroCockpit.Acp.PortProcess do
   @spec notify_outbound(state(), map()) :: :ok
   defp notify_outbound(%{owner: owner}, msg) when is_pid(owner) do
     send(owner, {:acp_outbound, self(), msg})
+    :ok
+  end
+
+  # Send the raw inbound JSON-RPC response/error map to the owner so it can
+  # persist it via EventStore and Bronze. This is distinct from the request
+  # resolution flow (resolve_pending/3 replies to the caller); the owner
+  # needs the raw payload for observability and Bronze capture.
+  @spec notify_inbound_response(state(), map()) :: :ok
+  defp notify_inbound_response(%{owner: owner}, msg) when is_pid(owner) do
+    send(owner, {:acp_inbound_response, self(), msg})
     :ok
   end
 
