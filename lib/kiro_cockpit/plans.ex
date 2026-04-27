@@ -166,7 +166,7 @@ defmodule KiroCockpit.Plans do
           | {:error, term()}
   def approve_plan_with_tasks(plan_id, agent_id, _task_manager_mod, opts \\ []) do
     # Fetch plan with preloaded steps (required for task derivation)
-    with plan when not is_nil(plan) <- Repo.get(Plan, plan_id),
+    with {:ok, plan} <- fetch_plan(plan_id),
          plan = Repo.preload(plan, :plan_steps),
          :ok <- require_status(plan, "draft") do
       do_approve_plan_with_tasks(plan, agent_id, opts)

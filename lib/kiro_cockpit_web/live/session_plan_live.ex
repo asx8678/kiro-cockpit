@@ -27,6 +27,7 @@ defmodule KiroCockpitWeb.SessionPlanLive do
 
   alias KiroCockpit.NanoPlanner
   alias KiroCockpit.Plans
+  alias KiroCockpitWeb.SafeErrorFormatter
 
   @supported_modes ["nano", "nano_deep", "nano_fix"]
   @default_mode "nano"
@@ -165,7 +166,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, socket}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Failed to approve plan: #{format_error(reason)}")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Failed to approve plan: #{SafeErrorFormatter.format_error(reason)}"
+         )}
     end
   end
 
@@ -183,7 +189,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, put_flash(socket, :error, "Cannot reject plan: invalid status transition")}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Failed to reject plan: #{format_error(reason)}")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Failed to reject plan: #{SafeErrorFormatter.format_error(reason)}"
+         )}
     end
   end
 
@@ -250,7 +261,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, put_flash(socket, :error, "Plan not found")}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Failed to run plan: #{format_error(reason)}")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Failed to run plan: #{SafeErrorFormatter.format_error(reason)}"
+         )}
     end
   end
 
@@ -326,7 +342,7 @@ defmodule KiroCockpitWeb.SessionPlanLive do
     socket =
       socket
       |> assign(:generating, false)
-      |> put_flash(:error, "Failed to generate plan: #{format_error(reason)}")
+      |> put_flash(:error, "Failed to generate plan: #{SafeErrorFormatter.format_error(reason)}")
 
     {:noreply, socket}
   end
@@ -336,7 +352,7 @@ defmodule KiroCockpitWeb.SessionPlanLive do
     socket =
       socket
       |> assign(:generating, false)
-      |> put_flash(:error, "Plan generation crashed: #{format_exit(reason)}")
+      |> put_flash(:error, "Plan generation crashed: #{SafeErrorFormatter.format_exit(reason)}")
 
     {:noreply, socket}
   end
@@ -583,8 +599,16 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   rescue
     e ->
       # Handle cases where NanoPlanner might not be available
+      # Use Exception.message/1 per §22.6/§25.6 — never inspect raw
+      # exception structs into logs (may contain PII/secrets).
       require Logger
-      Logger.warning("NanoPlanner.plan failed: #{inspect(e)}")
+
+      # Truncate exception message per §22.6/§25.6 — raw messages
+      # may contain tokens, connection strings, or PII.
+      Logger.warning(
+        "NanoPlanner.plan failed: #{SafeErrorFormatter.safe_truncate(Exception.message(e), 200)}"
+      )
+
       {:error, :planner_unavailable}
   end
 
@@ -690,20 +714,6 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   # {:ok, %{plan: plan}} (plan+tasks result) or {:ok, plan} (plan-only).
   defp unwrap_approve_result(%{plan: plan}), do: plan
   defp unwrap_approve_result(plan), do: plan
-
-  defp format_error(%Ecto.Changeset{} = changeset) do
-    changeset.errors
-    |> Enum.map_join(", ", fn {field, {msg, _}} -> "#{field}: #{msg}" end)
-  end
-
-  defp format_error(reason) when is_atom(reason), do: to_string(reason)
-  defp format_error(reason) when is_binary(reason), do: reason
-  defp format_error(reason), do: inspect(reason)
-
-  defp format_exit(:normal), do: "normal exit"
-  defp format_exit(:shutdown), do: "shutdown"
-  defp format_exit({:shutdown, reason}), do: "shutdown: #{inspect(reason)}"
-  defp format_exit(reason), do: inspect(reason)
 
   defp truncate(text, max_length) do
     if String.length(text) > max_length do

@@ -1,11 +1,30 @@
 defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
   @moduledoc """
-  Injects decomposition/read-only guidance on the first action in plan mode.
+  Injects decomposition/read-only guidance on actions in plan mode.
 
-  Per §27.6/§36.2, when in planning or waiting_for_approval state and this is
-  the first action/tool, inject guidance to help the operator understand that
-  direct reads are allowed for discovery while shell/command/mutating tools are
-  blocked until approval.
+  Per §27.6/§36.2, when in planning or waiting_for_approval state, inject
+  guidance to help the operator understand that direct reads are allowed for
+  discovery while shell/command/mutating tools are blocked until approval.
+
+  ## Design (kiro-2tt reviewer fix)
+
+  Guidance is **per-event and stateless**: every action that fires while
+  `PlanMode.planning_locked?/1` is true receives guidance. No process-dictionary
+  sentinel, no accumulated state, no lifecycle reset needed.
+
+  Rationale (§4.1): process-dictionary sentinels are not durable — they
+  evaporate on process crash/migration, cannot cross process boundaries (hooks
+  may run in different processes across ActionBoundary calls), and a nil
+  `session_id` produces a shared key that corrupts tracking across sessions.
+
+  The guidance is informational (non-blocking), so re-injecting it on each
+  action while planning-locked is harmless and arguably more helpful: an
+  operator who joins mid-session still sees the context. When the plan
+  transitions out of planning/waiting_for_approval, guidance stops naturally
+  because `planning_locked?/1` returns false.
+
+  The `ctx` key `:first_action_shown` is retained for backward compatibility
+  with tests that explicitly suppress guidance by setting it to `true`.
 
   Priority: 96 (pre-action, non-blocking)
   """
@@ -33,12 +52,15 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
   @impl true
   def on_event(event, ctx) do
     plan_mode = Map.get(ctx, :plan_mode) || PlanMode.new()
-    first_action_shown = Map.get(ctx, :first_action_shown, false)
 
-    if PlanMode.planning_locked?(plan_mode) and not first_action_shown do
+    # Per-event, stateless: inject guidance whenever planning is locked AND
+    # the caller hasn't explicitly suppressed it via ctx (:first_action_shown
+    # is retained for backward compatibility with unit tests only).
+    # No process-dictionary sentinel — see moduledoc.
+    suppressed? = Map.get(ctx, :first_action_shown, false)
+
+    if PlanMode.planning_locked?(plan_mode) and not suppressed? do
       guidance = build_guidance(event, plan_mode)
-      # Mark that we've shown the first action guidance
-      _updated_ctx = Map.put(ctx, :first_action_shown, true)
       HookResult.modify(event, [guidance], hook_metadata: %{first_action_shown: true})
     else
       HookResult.continue(event)
