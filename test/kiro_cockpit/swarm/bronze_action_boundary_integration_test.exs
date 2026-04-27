@@ -70,17 +70,21 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
     task
   end
 
-  # Exception-safe Application env mutation: always restores original value
-  # even if the test body raises. Module is async: false, so global env
-  # mutations are serialized, but we still restore to keep things clean.
+  # Exception-safe Application env mutation: uses fetch_env/delete_env to
+  # correctly restore keys that were previously unset, avoiding env leaks
+  # (e.g. :bronze_acp_capture_enabled=false persisting after the test).
+  # Module is async: false, so global env mutations are serialized.
   defp with_env(key, value, fun) do
-    original = Application.get_env(:kiro_cockpit, key, value)
+    original = Application.fetch_env(:kiro_cockpit, key)
     Application.put_env(:kiro_cockpit, key, value)
 
     try do
       fun.()
     after
-      Application.put_env(:kiro_cockpit, key, original)
+      case original do
+        {:ok, orig_value} -> Application.put_env(:kiro_cockpit, key, orig_value)
+        :error -> Application.delete_env(:kiro_cockpit, key)
+      end
     end
   end
 
@@ -215,10 +219,14 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
       end)
     end
 
-    test "does not record action events when capture is disabled" do
-      session_id = "sess_disabled_#{System.unique_integer([:positive])}"
+    test "records action events even when capture flag is false (kiro-3nr mandatory)" do
+      # Per kiro-3nr, Bronze action capture is MANDATORY and non-disableable
+      # in the runtime path. The env flag :bronze_action_capture_enabled exists
+      # for test/reporting only and is NOT consulted by ActionBoundary.
+      session_id = "sess_mandatory_#{System.unique_integer([:positive])}"
 
       with_env(:bronze_action_capture_enabled, false, fn ->
+        # ActionBoundary MUST record even with the flag set to false
         result =
           ActionBoundary.run(
             :test_action,
@@ -234,9 +242,18 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
 
         assert {:ok, :ok} = result
 
-        # No action events should be recorded
+        # Action events MUST be recorded — Bronze capture is mandatory
         events = DataPipeline.list_action_events(session_id)
-        assert [] = events
+
+        assert [_ | _] = events,
+               "ActionBoundary must record Bronze events even when flag is false"
+
+        event_types = events |> Enum.map(& &1.event_type) |> Enum.sort()
+        assert ["action_after", "action_before"] = event_types
+
+        # Verify DataPipeline config function still reports the correct flag value
+        refute DataPipeline.action_capture_enabled?(),
+               "DataPipeline.action_capture_enabled?/0 must still respect config"
       end)
     end
 

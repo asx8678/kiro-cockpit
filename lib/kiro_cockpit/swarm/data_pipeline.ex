@@ -24,10 +24,21 @@ defmodule KiroCockpit.Swarm.DataPipeline do
 
     * `:bronze_full_payload_capture` — capture full payloads instead of summaries
       (default: false, enable only for debugging)
-    * `:bronze_action_capture_enabled` — enable action_before/action_after recording
+    * `:bronze_action_capture_enabled` — gates `record_action_lifecycle/3`:
+      when false, the convenience wrapper skips before/after recording.
+      `ActionBoundary.run/3` records Bronze action events unconditionally
+      regardless of this flag. (default: true)
+    * `:bronze_acp_capture_enabled` — **reporting-only toggle**: when false,
+      downstream consumers should skip ACP event analysis. This is NOT a
+      runtime kill switch — `KiroSession.persist_bronze_acp/3` only checks
+      `persist_messages` and deliberately ignores this flag. Bronze ACP
+      capture is mandatory whenever `persist_messages` is enabled.
       (default: true)
-    * `:bronze_acp_capture_enabled` — enable ACP event recording
-      (default: true)
+
+  **Important:** Setting `:bronze_acp_capture_enabled` to `false` does NOT
+  prevent `KiroSession` from persisting Bronze ACP events. It only signals
+  to reporting/analytics code that ACP capture should be treated as
+  disabled for display purposes.
 
   ## Privacy
 
@@ -145,7 +156,11 @@ defmodule KiroCockpit.Swarm.DataPipeline do
   # Feature flags ------------------------------------------------------------
 
   @doc """
-  Returns true if action_before/action_after capture is enabled.
+  Returns true if action_before/action_after capture reporting is enabled.
+
+  This is a reporting/test-compatibility flag, NOT a runtime kill switch.
+  KiroSession persists Bronze action events whenever `persist_messages`
+  is true regardless of this flag's value.
   """
   @spec action_capture_enabled?() :: boolean()
   def action_capture_enabled? do
@@ -153,7 +168,13 @@ defmodule KiroCockpit.Swarm.DataPipeline do
   end
 
   @doc """
-  Returns true if ACP event capture is enabled.
+  Returns true if ACP event capture reporting is enabled.
+
+  This is a reporting/test-compatibility flag, NOT a runtime kill switch.
+  KiroSession persists Bronze ACP events whenever `persist_messages`
+  is true regardless of this flag's value. Setting this to false only
+  signals downstream consumers (analytics, dashboards) to skip ACP
+  analysis — it does NOT prevent persistence.
   """
   @spec acp_capture_enabled?() :: boolean()
   def acp_capture_enabled? do

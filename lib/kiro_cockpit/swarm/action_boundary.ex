@@ -230,11 +230,12 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     pre_hooks = Keyword.get(opts, :pre_hooks, @default_pre_hooks)
     post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
 
-    # Bronze Phase 3: Record action_before for audit trail (§35)
-    # This captures the action entering the boundary before pre-hooks run
-    if DataPipeline.action_capture_enabled?() do
-      DataPipeline.record_action_before(event, ctx)
-    end
+    # Bronze Phase 3: Record action_before for audit trail (§35) — MANDATORY
+    # Per kiro-3nr, Bronze capture is non-disableable in the runtime path.
+    # The env flag :bronze_action_capture_enabled exists for test/reporting
+    # only and is NOT consulted here. Persistence failures are caught and
+    # emitted as telemetry inside BronzeAction — they never crash the boundary.
+    DataPipeline.record_action_before(event, ctx)
 
     case hm.run(event, pre_hooks, ctx, :pre) do
       {:ok, modified_event, messages} ->
@@ -250,24 +251,22 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
         # kiro-4dk: Pass the modified event (not original) so post-hooks see pre-hook changes
         _ = hm.run(event_for_executor, post_hooks, ctx, :post)
 
-        # Bronze Phase 3: Record action_after with result (§35)
-        # Pass actual executor result shape so Bronze captures error status correctly.
-        if DataPipeline.action_capture_enabled?() do
-          DataPipeline.record_action_after(event_for_executor, bronze_result(result), ctx)
-        end
+        # Bronze Phase 3: Record action_after with result (§35) — MANDATORY
+        # Per kiro-3nr, Bronze capture is non-disableable. Pass actual executor
+        # result shape so Bronze captures error status correctly.
+        DataPipeline.record_action_after(event_for_executor, bronze_result(result), ctx)
 
         {:ok, result}
 
       {:blocked, blocked_event, reason, messages} ->
-        # Bronze Phase 3: Record action_blocked for fail-closed audit (§35)
+        # Bronze Phase 3: Record action_blocked for fail-closed audit (§35) — MANDATORY
         # Blocked actions always persist a Bronze record per §27.11 inv. 7
-        if DataPipeline.action_capture_enabled?() do
-          blocking_hook = extract_blocking_hook(messages)
+        # Per kiro-3nr, Bronze capture is non-disableable in the runtime path.
+        blocking_hook = extract_blocking_hook(messages)
 
-          DataPipeline.record_action_blocked(blocked_event, reason, messages, ctx,
-            blocking_hook: blocking_hook
-          )
-        end
+        DataPipeline.record_action_blocked(blocked_event, reason, messages, ctx,
+          blocking_hook: blocking_hook
+        )
 
         {:error, {:swarm_blocked, reason, messages}}
     end
@@ -644,16 +643,14 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   end
 
   defp record_lifecycle_before(event, ctx) do
-    if DataPipeline.action_capture_enabled?() do
-      DataPipeline.record_action_before(event, Map.put(ctx, :lifecycle, true))
-    end
+    # Bronze capture is MANDATORY per kiro-3nr — no env flag gating.
+    DataPipeline.record_action_before(event, Map.put(ctx, :lifecycle, true))
   end
 
   defp record_lifecycle_after(event, result, ctx) do
-    if DataPipeline.action_capture_enabled?() do
-      normalized_result = normalize_lifecycle_result(result)
-      DataPipeline.record_action_after(event, normalized_result, Map.put(ctx, :lifecycle, true))
-    end
+    # Bronze capture is MANDATORY per kiro-3nr — no env flag gating.
+    normalized_result = normalize_lifecycle_result(result)
+    DataPipeline.record_action_after(event, normalized_result, Map.put(ctx, :lifecycle, true))
   end
 
   defp normalize_lifecycle_result({:ok, _evt, _msgs}), do: {:ok, :lifecycle_completed}
