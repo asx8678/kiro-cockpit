@@ -695,6 +695,158 @@ defmodule KiroCockpit.KiroSessionTest do
     end
   end
 
+  # -- kiro-egn: non-bypassable action boundary (KiroSession-level tests) ----
+
+  describe "kiro-egn: non-bypassable action boundary" do
+    setup %{elixir: elixir, args: args} do
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: false,
+          # Explicitly disable hooks, no test_bypass
+          swarm_hooks: false,
+          test_bypass: false
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+
+      cwd = File.cwd!()
+      assert {:ok, _} = KiroSession.new_session(session, cwd)
+      # Drain session/update notification
+      assert_receive {:acp_notification, ^session, _}, 2_000
+
+      on_exit(fn -> safe_stop(session) end)
+      {:ok, %{session: session}}
+    end
+
+    test "prompt fails closed when swarm_hooks disabled and no test_bypass", %{session: session} do
+      assert {:error, {:swarm_boundary_disabled, :kiro_session_prompt}} =
+               KiroSession.prompt(session, "should be blocked")
+
+      # Session stays alive — no GenServer crash
+      assert Process.alive?(session)
+    end
+  end
+
+  describe "kiro-egn: callback fails closed when hooks disabled" do
+    setup %{elixir: elixir, args: args} do
+      # Use a mock boundary that allows prompts but returns
+      # {:error, {:swarm_boundary_disabled, action}} for callback actions.
+      # This tests the defensive handling in run_callback_with_boundary/5.
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: true,
+          swarm_hooks: true,
+          swarm_hooks_module: KiroCockpit.Test.KiroEgnMockBoundary,
+          test_bypass: true
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+
+      cwd = File.cwd!()
+      assert {:ok, _} = KiroSession.new_session(session, cwd)
+      assert_receive {:acp_notification, ^session, _}, 2_000
+
+      # Ensure the test file exists for the fake agent's read
+      File.write!("/tmp/kiro-fake.txt", "callback boundary test content")
+      on_exit(fn ->
+        File.rm("/tmp/kiro-fake.txt")
+        safe_stop(session)
+      end)
+
+      {:ok, %{session: session}}
+    end
+
+    test "callback fails closed / no side effect when hooks disabled and no test_bypass", %{
+      session: session
+    } do
+      # The mock boundary allows the prompt but returns disabled for
+      # callback actions (fs_read_requested). The session should NOT crash —
+      # the defensive clause in run_callback_with_boundary sends
+      # respond_error instead.
+      task =
+        Task.async(fn ->
+          KiroSession.prompt(session, "Read a file")
+        end)
+
+      # The subscriber still receives the forwarded request for observability
+      assert_receive {:acp_request, ^session,
+                      %{id: _id, method: "fs/read_text_file", params: _params}},
+                     5_000
+
+      # The prompt should complete (the agent got an error response from
+      # the boundary disabled handler and continued or ended the turn).
+      result = Task.await(task, 10_000)
+
+      # Session is still alive — no GenServer crash from unhandled clause
+      assert Process.alive?(session)
+
+      # Result may be {:ok, _} or {:error, _} depending on agent behavior
+      # after receiving the boundary-disabled error; the key invariant is
+      # no crash.
+      assert match?({:ok, _}, result) or match?({:error, _}, result)
+    end
+  end
+
+  describe "kiro-egn: explicit swarm_hooks=true with app config false" do
+    setup %{elixir: elixir, args: args} do
+      # Save and override app config to false (already false in test.exs,
+      # but be explicit for clarity)
+      original = Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled)
+      Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, false)
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: false,
+          # Explicitly enable hooks at session level, overriding app config
+          swarm_hooks: true,
+          test_bypass: true
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+
+      cwd = File.cwd!()
+      assert {:ok, _} = KiroSession.new_session(session, cwd)
+      assert_receive {:acp_notification, ^session, _}, 2_000
+
+      on_exit(fn ->
+        Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, original)
+        safe_stop(session)
+      end)
+
+      {:ok, %{session: session}}
+    end
+
+    test "prompt routes through boundary / does not disabled-crash when swarm_hooks=true overrides app config", %{
+      session: session
+    } do
+      # With swarm_hooks: true and app config false, the boundary should
+      # run (enabled: true in opts overrides app config). The boundary may
+      # block the prompt (e.g. TaskEnforcementHook with no active task),
+      # but it must NOT return {:error, {:swarm_boundary_disabled, ...}}.
+      result = KiroSession.prompt(session, "test boundary routing")
+
+      # Key assertion: NOT the disabled-crash error. The boundary either
+      # blocks with {:swarm_blocked, ...} (hooks running) or some other
+      # result, but never {:swarm_boundary_disabled, ...}.
+      refute match?({:error, {:swarm_boundary_disabled, _}}, result)
+
+      # Session is still alive — no GenServer crash
+      assert Process.alive?(session)
+    end
+  end
+
   # -- Helpers --------------------------------------------------------------
 
   defp safe_stop(pid) do

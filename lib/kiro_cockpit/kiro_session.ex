@@ -1130,7 +1130,13 @@ defmodule KiroCockpit.KiroSession do
         project_dir: state.cwd,
         plan_mode: plan_mode,
         swarm_ctx: state.swarm_ctx,
-        approved: truthy_lookup(state.swarm_ctx, :approved)
+        approved: truthy_lookup(state.swarm_ctx, :approved),
+        # kiro-egn: per-session swarm_hooks=true overrides app config disabled.
+        # Without this, ActionBoundary.boundary_enabled?/1 falls back to
+        # Application env (:swarm_action_hooks_enabled, false in test),
+        # which would disable the boundary even when the session explicitly
+        # enables hooks.
+        enabled: state.swarm_hooks
       ],
       opts
     )
@@ -1146,6 +1152,12 @@ defmodule KiroCockpit.KiroSession do
 
       {:error, {:swarm_blocked, reason, messages}} ->
         {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
+
+      # kiro-egn: defensive handling — boundary returned disabled for
+      # a non-exempt action. Return stable error instead of GenServer
+      # crash from unhandled clause.
+      {:error, {:swarm_boundary_disabled, action}} ->
+        {:reply, {:error, {:swarm_boundary_disabled, action}}, state}
     end
   end
 
@@ -1251,6 +1263,18 @@ defmodule KiroCockpit.KiroSession do
           "Action blocked by swarm boundary: #{reason}",
           nil
         )
+
+      # kiro-egn: defensive handling — boundary returned disabled for
+      # a non-exempt callback action. Respond with error instead of
+      # GenServer crash from unhandled clause. No side effect dispatched.
+      {:error, {:swarm_boundary_disabled, ^action}} ->
+        PortProcess.respond_error(
+          port_pid,
+          id,
+          -32_000,
+          "Action blocked: swarm boundary disabled for non-exempt action",
+          nil
+        )
     end
   end
 
@@ -1301,7 +1325,10 @@ defmodule KiroCockpit.KiroSession do
         permission_level: permission,
         project_dir: state.cwd,
         plan_mode: plan_mode,
-        swarm_ctx: state.swarm_ctx
+        swarm_ctx: state.swarm_ctx,
+        # kiro-egn: per-session swarm_hooks=true overrides app config disabled.
+        # See prompt_boundary_opts/2 for rationale.
+        enabled: state.swarm_hooks
       ]
 
     meta = %{callback_method: method}
