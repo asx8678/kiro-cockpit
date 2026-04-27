@@ -1874,10 +1874,17 @@ defmodule KiroCockpit.KiroSession do
   # payloads with a fake `"id" => 0` because PortProcess owned request ids.
   #
   # When `persist_messages: false` (test/runtime option; production default is
-  # `true`), persistence is skipped. Failures are logged but never crash the
-  # session.
+  # `true`), raw EventStore persistence is skipped for testing/performance.
+  # Bronze ACP capture is MANDATORY and persists regardless — it is NOT gated
+  # on `persist_messages`. Failures are logged but never crash the session.
+  #
+  # See also: `persist_bronze_acp/3` which runs unconditionally.
+  #
+  # §kiro-buk: Bronze ACP capture is independent of persist_messages.
   @spec persist_raw_outbound(t(), map()) :: :ok
-  defp persist_raw_outbound(%{persist_messages: false}, _payload), do: :ok
+  defp persist_raw_outbound(%{persist_messages: false} = state, payload) do
+    persist_bronze_acp(state, payload, :client_to_agent)
+  end
 
   defp persist_raw_outbound(state, payload) when is_map(payload) do
     method = Map.get(payload, "method")
@@ -1901,8 +1908,11 @@ defmodule KiroCockpit.KiroSession do
 
   # Inbound request: reconstruct a JSON-RPC request envelope (with id)
   # so EventStore classifies it as "request" and preserves rpc_id.
+  # §kiro-buk: Bronze ACP capture is independent of persist_messages.
   @spec persist_inbound(t(), map()) :: :ok
-  defp persist_inbound(%{persist_messages: false}, _msg), do: :ok
+  defp persist_inbound(%{persist_messages: false} = state, msg) do
+    persist_bronze_acp(state, msg, :agent_to_client)
+  end
 
   defp persist_inbound(state, %{id: id, method: method, params: params})
        when not is_nil(id) do
@@ -1952,8 +1962,11 @@ defmodule KiroCockpit.KiroSession do
   # These are responses to KiroSession-originated requests (e.g. session/prompt
   # results). PortProcess has already resolved the pending caller via
   # resolve_pending/3; this function records the raw ACP and Bronze rows.
+  # §kiro-buk: Bronze ACP capture is independent of persist_messages.
   @spec persist_inbound_response(t(), map()) :: :ok
-  defp persist_inbound_response(%{persist_messages: false}, _payload), do: :ok
+  defp persist_inbound_response(%{persist_messages: false} = state, payload) do
+    persist_bronze_acp(state, payload, :agent_to_client)
+  end
 
   defp persist_inbound_response(state, payload) when is_map(payload) do
     # Raw ACP row (EventStore) — direction is agent_to_client for inbound responses
@@ -1975,21 +1988,23 @@ defmodule KiroCockpit.KiroSession do
 
   defp persist_inbound_response(_state, _payload), do: :ok
 
-  # -- Bronze ACP capture alongside raw EventStore persistence --------------
+  # -- Bronze ACP capture — MANDATORY, independent of persist_messages ------
   #
-  # Per kiro-3nr, Bronze ACP capture is MANDATORY when persist_messages is
-  # enabled (the default in production). The env flag :bronze_acp_capture_enabled
-  # exists for test/reporting only and is NOT consulted here. Persistence
-  # failures are rescued to :ok (never crash the session) and logged with
-  # full context for operational visibility.
+  # Per kiro-3nr / §kiro-buk, Bronze ACP capture is MANDATORY and runs
+  # UNCONDITIONALLY regardless of `persist_messages`. The env flag
+  # `:bronze_acp_capture_enabled` exists for test/reporting only and is
+  # NOT consulted here. Raw EventStore persistence is gated by
+  # `persist_messages` (see `persist_raw_outbound/2`, `persist_inbound/2`,
+  # `persist_inbound_response/2`), but Bronze ACP always persists.
+  #
+  # Persistence failures are rescued to :ok (never crash the session) and
+  # logged with full context for operational visibility.
 
   # Classify JSON-RPC payload shape and call the appropriate BronzeAcp
   # record function. Includes session_id, agent_id, and plan/task
   # correlation where available from KiroSession state.
   defp persist_bronze_acp(state, payload, direction) do
-    unless state.persist_messages == false do
-      do_persist_bronze_acp(state, payload, direction)
-    end
+    do_persist_bronze_acp(state, payload, direction)
   end
 
   # Classify direction + message_type into Bronze ACP event kind.
