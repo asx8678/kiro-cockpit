@@ -19,6 +19,24 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     7. Run HookManager.run(event, post_hooks, ctx, :post) for Bronze post trace
     8. Return executor result (post block does not undo execution)
 
+  ## ACP Egress Flow (kiro-bih)
+
+  ACP egress actions (cancel, respond, respond_error, notify) send data FROM
+  the client TO the agent. They route through `run_egress/3` which provides
+  two paths:
+
+    * **Exempt** (cancel, respond, respond_error) — skip pre-hook gating
+      but still emit Bronze action_before/action_after lifecycle records
+      with full correlation. These are protocol-mandated completions or
+      safety mechanisms that must never be blocked by task enforcement.
+
+    * **Non-exempt** (notify) — run through the full `run/3` pipeline
+      where pre-hooks may block. Blocked attempts emit Bronze
+      action_blocked records per §27.11 inv. 7.
+
+  This ensures every ACP egress is auditable (§35 Phase 3) regardless
+  of exemption status.
+
   ## Configuration
 
   Enabled by default via `Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled, true)`.
@@ -84,6 +102,23 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     :plan_approved_lifecycle,
     :lifecycle_post_hook
   ]
+
+  # -- ACP egress exemptions (kiro-bih) ------------------------------------
+  #
+  # ACP egress actions send data FROM the client TO the agent. Some are
+  # protocol-mandated completions (respond, respond_error) or safety
+  # mechanisms (cancel) that must never be blocked by task/category
+  # enforcement. Others (notify) are general-purpose and SHOULD go
+  # through the full boundary.
+  #
+  # Exempt actions skip pre-hook gating but still emit Bronze action
+  # lifecycle records (action_before / action_after) with correlation
+  # so every egress is auditable (§27.11 inv. 7, §35 Phase 3).
+  #
+  # Non-exempt egress actions run through the full boundary pipeline
+  # (pre-hooks can block, Bronze records action_blocked on block).
+
+  @egress_exempt_actions [:acp_egress_cancel, :acp_egress_respond, :acp_egress_respond_error]
 
   @typedoc """
   Context map passed to arity-1 executor functions.
@@ -163,6 +198,68 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       handle_disabled_boundary(action, opts, fun)
     end
   end
+
+  @doc """
+  Run an ACP egress action through the boundary with audit capture.
+
+  ACP egress actions (cancel, respond, respond_error, notify) send data
+  FROM the client TO the agent. This function routes them appropriately:
+
+    * **Exempt actions** (cancel, respond, respond_error) — skip pre-hook
+      gating but still emit Bronze action_before/action_after lifecycle
+      records with full session/plan/task/agent correlation. Post-hooks
+      fire for guidance and trace capture.
+
+    * **Non-exempt actions** (notify) — run through the full boundary
+      pipeline via `run/3`. Pre-hooks can block; blocked attempts emit
+      Bronze action_blocked records per §27.11 inv. 7.
+
+  This ensures every ACP egress is auditable (§35 Phase 3) regardless
+  of exemption status. Exemptions are codified in `@egress_exempt_actions`
+  and checked via `egress_exempt?/1`.
+
+  ## Parameters
+
+    * `action` — atom action name (e.g. `:acp_egress_cancel`)
+    * `opts` — keyword list with event/boundary options (same as `run/3`)
+    * `fun` — zero-arity or arity-1 executor function (same as `run/3`)
+
+  ## Returns
+
+    * `{:ok, result}` — executor ran (exempt always reaches this)
+    * `{:error, {:swarm_blocked, reason, messages}}` — non-exempt was blocked
+  """
+  @spec run_egress(atom(), keyword(), (-> term()) | (executor_context() -> term())) ::
+          boundary_result()
+  def run_egress(action, opts, fun) when is_atom(action) and is_function(fun) do
+    if boundary_enabled?(opts) do
+      if egress_exempt?(action) do
+        run_egress_audit(action, opts, fun)
+      else
+        run(action, opts, fun)
+      end
+    else
+      {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
+    end
+  end
+
+  @doc """
+  Returns whether an ACP egress action is exempt from pre-hook blocking.
+
+  Exempt actions always execute but still emit Bronze audit records.
+  Non-exempt actions run through the full boundary pipeline where
+  pre-hooks may block them.
+  """
+  @spec egress_exempt?(atom()) :: boolean()
+  def egress_exempt?(action) when is_atom(action) do
+    action in @egress_exempt_actions
+  end
+
+  @doc """
+  Returns the list of ACP egress actions exempt from pre-hook blocking.
+  """
+  @spec egress_exempt_actions() :: [atom()]
+  def egress_exempt_actions, do: @egress_exempt_actions
 
   # -- Private implementation ------------------------------------------------
 
@@ -659,4 +756,46 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     do: {:blocked, "post-hook blocked", []}
 
   defp normalize_lifecycle_result(_), do: {:ok, :lifecycle_completed}
+
+  # -- ACP egress audit (kiro-bih) -------------------------------------------
+  #
+  # Exempt ACP egress actions (cancel, respond, respond_error) bypass
+  # pre-hook gating but still emit Bronze action lifecycle records
+  # with full session/plan/task/agent correlation. Post-hooks fire for
+  # guidance injection and trace capture, but their block decisions are
+  # ignored (the action has already executed by the time post-hooks run).
+  #
+  # This ensures §27.11 invariant 7 compliance: every action, including
+  # exempt ones, leaves a Bronze audit trail.
+
+  defp run_egress_audit(action, opts, fun) do
+    hm = Keyword.get(opts, :hook_manager_module, HookManager)
+    tm = Keyword.get(opts, :task_manager_module, TaskManager)
+    staleness_mod = Keyword.get(opts, :staleness_module, Staleness)
+
+    event = build_event(action, opts, tm)
+    ctx = build_ctx(opts, event, staleness_mod, tm)
+    egress_ctx = Map.put(ctx, :egress_exempt, true)
+
+    # Bronze: record action_before (§27.11 inv. 7 — every action audited)
+    if DataPipeline.action_capture_enabled?() do
+      DataPipeline.record_action_before(event, egress_ctx)
+    end
+
+    # Execute the egress action — exempt actions are NEVER blocked.
+    # The executor fun sends the ACP message to the agent.
+    result = call_executor(fun, %{event: event, messages: [], hook_messages: []})
+
+    # Post-hooks fire for Bronze trace and guidance, but their block
+    # decisions are ignored (the egress has already executed).
+    post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
+    _ = hm.run(event, post_hooks, ctx, :post)
+
+    # Bronze: record action_after (§27.11 inv. 7 — every action audited)
+    if DataPipeline.action_capture_enabled?() do
+      DataPipeline.record_action_after(event, bronze_result(result), egress_ctx)
+    end
+
+    {:ok, result}
+  end
 end
