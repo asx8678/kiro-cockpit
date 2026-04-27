@@ -82,6 +82,20 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       pm = PlanMode.from_plan(%{status: nil})
       assert pm.state == :idle
     end
+
+    test "derives locked from non-binary corrupt status with plan_id (kiro-6dw)" do
+      pm = PlanMode.from_plan(%{status: :corrupt_atom, id: "plan-999"})
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+      assert pm.plan_id == "plan-999"
+    end
+
+    test "derives locked from nil status with plan_id (kiro-6dw)" do
+      pm = PlanMode.from_plan(%{status: nil, id: "plan-nil-status"})
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+      assert pm.plan_id == "plan-nil-status"
+    end
   end
 
   describe "from_plan_status/1" do
@@ -103,6 +117,18 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
 
     test "derives locked from unknown string status (kiro-6dw fail-closed)" do
       pm = PlanMode.from_plan_status("garbage_status")
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+    end
+
+    test "derives locked from non-binary corrupt status (kiro-6dw)" do
+      pm = PlanMode.from_plan_status(:corrupt_atom)
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+    end
+
+    test "derives locked from numeric status (kiro-6dw)" do
+      pm = PlanMode.from_plan_status(42)
       assert pm.state == :locked
       assert pm.locked_reason == :unknown_plan_status
     end

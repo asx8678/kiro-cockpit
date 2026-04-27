@@ -296,26 +296,48 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   Maps plan statuses to runtime PlanMode states:
 
-    | Plan status     | PlanMode state        |
-    |-----------------|-----------------------|
-    | `draft`         | `:waiting_for_approval` |
-    | `approved`      | `:approved`           |
-    | `running`       | `:executing`          |
-    | `completed`     | `:completed`          |
-    | `rejected`      | `:rejected`           |
-    | `failed`        | `:failed`             |
-    | `superseded`    | `:rejected` (terminal) |
-    | nil/unknown     | `:idle` (fail-safe)   |
+    | Plan status / condition        | PlanMode state                    |
+    |--------------------------------|-----------------------------------|
+    | `draft`                        | `:waiting_for_approval`           |
+    | `approved`                     | `:approved`                       |
+    | `running`                      | `:executing`                      |
+    | `completed`                    | `:completed`                      |
+    | `rejected`                     | `:rejected`                       |
+    | `failed`                       | `:failed`                         |
+    | `superseded`                   | `:rejected` (terminal)            |
+    | nil / no plan                  | `:idle` (no plan → no restriction) |
+    | unknown string status          | `:locked` (:unknown_plan_status) |
+    | plan_id missing from DB        | `:locked` (:plan_not_found)       |
+    | plan_id lookup failure         | `:locked` (:plan_lookup_failed)   |
+    | corrupt/non-binary status      | `:locked` (:unknown_plan_status)  |
 
   The plan_id is preserved from the plan struct for trace correlation.
   """
   @spec from_plan(map()) :: t()
-  def from_plan(%{status: status, id: plan_id}) do
+  def from_plan(%{status: status, id: plan_id}) when is_binary(status) do
     %{from_plan_status(status) | plan_id: plan_id}
   end
 
-  def from_plan(%{status: status}) do
+  def from_plan(%{status: _status, id: plan_id}) do
+    # Non-binary or nil status with a plan_id — plan exists but its
+    # status is corrupt/unknown. Fail closed as locked (kiro-6dw).
+    locked(plan_id, :unknown_plan_status)
+  end
+
+  def from_plan(%{status: status}) when is_binary(status) do
     from_plan_status(status)
+  end
+
+  # nil status without an id — no plan exists, so no restriction.
+  # This is the "no plan at all" case; :idle is correct (kiro-6dw).
+  def from_plan(%{status: nil}) do
+    %__MODULE__{state: :idle}
+  end
+
+  # Non-nil, non-binary status without an id — corrupt but untraceable.
+  # Fail closed as locked (kiro-6dw).
+  def from_plan(%{}) do
+    locked(nil, :unknown_plan_status)
   end
 
   @status_to_state %{
@@ -343,12 +365,24 @@ defmodule KiroCockpit.Swarm.PlanMode do
     end
   end
 
-  # No plan_id / no status at all — genuinely no plan exists.
+  # No status at all — genuinely no plan exists.
   # :idle is correct: there is no plan-mode restriction when there
   # is no plan. Callers with a plan_id that failed to load should
   # use PlanMode.locked/2 instead (kiro-6dw).
-  def from_plan_status(_nil_or_unknown) do
+  #
+  # Note: for a plan with a non-binary/corrupt status, callers
+  # should use from_plan/1 or locked/2 which carry the plan_id
+  # and return :locked with :unknown_plan_status. from_plan_status/1
+  # without a plan_id has no way to know whether a plan exists,
+  # so nil → :idle is the correct default (kiro-6dw).
+  def from_plan_status(nil) do
     %__MODULE__{state: :idle}
+  end
+
+  # Non-binary, non-nil status — this shouldn't happen in normal flows
+  # since DB statuses are strings. Fail closed as locked (kiro-6dw).
+  def from_plan_status(_corrupt) do
+    %__MODULE__{state: :locked, locked_reason: :unknown_plan_status}
   end
 
   @doc """
