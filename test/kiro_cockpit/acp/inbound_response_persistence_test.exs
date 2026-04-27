@@ -178,4 +178,97 @@ defmodule KiroCockpit.Acp.InboundResponsePersistenceTest do
       end)
     end
   end
+
+  # Regression test proving KiroSession persists Bronze ACP events even when
+  # :bronze_acp_capture_enabled is false, as long as persist_messages is true.
+  #
+  # The flag is a reporting/test-compatibility toggle, NOT a runtime kill
+  # switch. KiroSession.persist_bronze_acp/3 only checks persist_messages;
+  # it deliberately does NOT consult DataPipeline.acp_capture_enabled?/0.
+  # See KiroSession lines ~1721-1724 for the design rationale.
+  describe "Bronze ACP persistence with flag disabled (kiro-3nr regression)" do
+
+    setup %{elixir: elixir, args: args} do
+      session_id = "sess_flag_disabled_#{System.unique_integer([:positive])}"
+
+      {:ok, session_pid} =
+        KiroCockpit.KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          subscriber: self(),
+          persist_messages: true
+        )
+
+      on_exit(fn ->
+        if Process.alive?(session_pid) do
+          try do
+            KiroCockpit.KiroSession.stop(session_pid)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+      end)
+
+      {:ok, %{session_pid: session_pid, session_id: session_id}}
+    end
+
+    test "Bronze ACP events are persisted even when :bronze_acp_capture_enabled is false",
+         %{session_pid: session_pid} do
+      with_env(:bronze_acp_capture_enabled, false, fn ->
+        # The reporting flag must read as false
+        refute KiroCockpit.Swarm.DataPipeline.acp_capture_enabled?()
+
+        # Full session lifecycle
+        assert {:ok, _} = KiroCockpit.KiroSession.initialize(session_pid, timeout: 10_000)
+
+        tmp_dir = System.tmp_dir!()
+
+        assert {:ok, _} =
+                 KiroCockpit.KiroSession.new_session(session_pid, tmp_dir, timeout: 10_000)
+
+        state = KiroCockpit.KiroSession.state(session_pid)
+        sid = state.session_id
+        assert sid != nil
+
+        # Wait briefly for async persistence to complete
+        Process.sleep(150)
+
+        # Flag must still read false after session activity
+        refute KiroCockpit.Swarm.DataPipeline.acp_capture_enabled?()
+
+        # Raw ACP messages MUST still be persisted (persist_messages: true)
+        raw_msgs = EventStore.list_acp_messages(sid)
+        assert [_ | _] = raw_msgs
+
+        # Inbound responses must exist despite flag being false
+        responses =
+          Enum.filter(raw_msgs, fn m ->
+            m.direction == "agent_to_client" and m.message_type in ["response", "error"]
+          end)
+
+        assert [_ | _] = responses
+
+        # Bronze ACP events MUST also be persisted — the flag is NOT a kill switch
+        acp_events = BronzeAcp.list_acp_events(sid)
+        assert [_ | _] = acp_events
+
+        # Request events with correct direction
+        request_events = Enum.filter(acp_events, &(&1.event_type == "acp_request"))
+
+        assert Enum.any?(request_events, fn event ->
+                 event.hook_results["direction"] == "client_to_agent"
+               end)
+
+        # Response events with correct direction
+        response_events = Enum.filter(acp_events, &(&1.event_type == "acp_response"))
+
+        assert Enum.any?(response_events, fn event ->
+                 event.hook_results["direction"] == "agent_to_client"
+               end)
+
+        # Triple-check: flag never flipped during the test
+        refute KiroCockpit.Swarm.DataPipeline.acp_capture_enabled?()
+      end)
+    end
+  end
 end
