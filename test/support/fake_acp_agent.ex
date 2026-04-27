@@ -656,6 +656,13 @@ defmodule KiroCockpit.Test.Acp.FakeAgent do
              "method" => "session/cancel",
              "params" => %{"sessionId" => ^expected_session_id}
            }} ->
+            # Give the client a deterministic window to observe its local
+            # :cancel_requested state and issue an idempotent second cancel
+            # before this fake agent emits turn_end and completes the turn.
+            # Without this tiny test-harness pause, the OS pipe + scheduler can
+            # round-trip so quickly in the full suite that assertions meant to
+            # target the in-flight cancellation state race against completion.
+            Process.sleep(25)
             :ok
 
           _other ->
