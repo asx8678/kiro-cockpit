@@ -54,15 +54,18 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   @type action_result :: :ok | {:blocked, String.t(), String.t()}
 
+  @type locked_reason :: :plan_not_found | :plan_lookup_failed | :unknown_plan_status | nil
+
   @type t :: %__MODULE__{
           state: state(),
           plan_id: String.t() | nil,
-          rejected_count: non_neg_integer()
+          rejected_count: non_neg_integer(),
+          locked_reason: locked_reason()
         }
 
-  defstruct state: :idle, plan_id: nil, rejected_count: 0
+  defstruct state: :idle, plan_id: nil, rejected_count: 0, locked_reason: nil
 
-  @states ~w(idle planning waiting_for_approval approved executing verifying completed rejected failed)a
+  @states ~w(idle planning waiting_for_approval approved executing verifying completed rejected failed locked)a
 
   @read_only_permissions [:read]
 
@@ -92,7 +95,8 @@ defmodule KiroCockpit.Swarm.PlanMode do
     {:executing, :start_verification} => :verifying,
     {:executing, :fail} => :failed,
     {:verifying, :complete} => :completed,
-    {:verifying, :fail} => :failed
+    {:verifying, :fail} => :failed,
+    {:locked, :reset} => :idle
   }
 
   # ── Constructor ────────────────────────────────────────────────────────
@@ -104,6 +108,41 @@ defmodule KiroCockpit.Swarm.PlanMode do
   def new(plan_id \\ nil) do
     %__MODULE__{state: :idle, plan_id: plan_id, rejected_count: 0}
   end
+
+  @doc """
+  Creates a PlanMode in the `:locked` state — the fail-closed state for
+  unknown or missing durable plan state (kiro-6dw).
+
+  When a plan_id exists but the plan cannot be loaded from the durable
+  store, or the plan has an unrecognized status, the boundary must fail
+  closed rather than falling back to permissive `:idle`. The `:locked`
+  state blocks all non-read actions with actionable guidance explaining
+  the root cause.
+
+  ## `:locked` vs `:idle`
+
+    * `:idle` — no plan exists; plan-mode restrictions don't apply.
+    * `:locked` — a plan *should* exist but its state is unknown; all
+      mutating actions are blocked until the durable state is resolved.
+
+  ## Parameters
+
+    * `plan_id` — the plan correlation ID that failed to resolve.
+    * `reason` — atom explaining why the plan state is unknown
+      (`:plan_not_found`, `:plan_lookup_failed`, `:unknown_plan_status`).
+  """
+  # credo:disable-for-next-line Credo.Check.Warning.SpecWithStruct
+  def locked(plan_id, reason)
+      when (is_binary(plan_id) or is_nil(plan_id)) and
+             reason in [:plan_not_found, :plan_lookup_failed, :unknown_plan_status] do
+    %__MODULE__{state: :locked, plan_id: plan_id, rejected_count: 0, locked_reason: reason}
+  end
+
+  def locked(plan_id) when is_binary(plan_id) or is_nil(plan_id) do
+    locked(plan_id, :plan_not_found)
+  end
+
+  def locked, do: locked(nil, :plan_not_found)
 
   # ── Introspection ──────────────────────────────────────────────────────
 
@@ -130,6 +169,17 @@ defmodule KiroCockpit.Swarm.PlanMode do
   @doc "Returns true when the state machine is in a terminal state."
   @spec terminal?(t()) :: boolean()
   def terminal?(%__MODULE__{state: s}), do: s in [:completed, :rejected, :failed]
+
+  @doc """
+  Returns true when the state machine is in the fail-closed `:locked` state.
+
+  The `:locked` state means a plan_id is correlated but the durable plan
+  state is unknown or missing. All non-read actions are blocked until
+  the plan state is resolved (kiro-6dw).
+  """
+  @spec locked?(t()) :: boolean()
+  def locked?(%__MODULE__{state: :locked}), do: true
+  def locked?(%__MODULE__{}), do: false
 
   @doc "Returns true when mutations are unlocked (after approval, during execution/verification)."
   @spec execution_unlocked?(t()) :: boolean()
@@ -246,50 +296,93 @@ defmodule KiroCockpit.Swarm.PlanMode do
 
   Maps plan statuses to runtime PlanMode states:
 
-    | Plan status     | PlanMode state        |
-    |-----------------|-----------------------|
-    | `draft`         | `:waiting_for_approval` |
-    | `approved`      | `:approved`           |
-    | `running`       | `:executing`          |
-    | `completed`     | `:completed`          |
-    | `rejected`      | `:rejected`           |
-    | `failed`        | `:failed`             |
-    | `superseded`    | `:rejected` (terminal) |
-    | nil/unknown     | `:idle` (fail-safe)   |
+    | Plan status / condition        | PlanMode state                    |
+    |--------------------------------|-----------------------------------|
+    | `draft`                        | `:waiting_for_approval`           |
+    | `approved`                     | `:approved`                       |
+    | `running`                      | `:executing`                      |
+    | `completed`                    | `:completed`                      |
+    | `rejected`                     | `:rejected`                       |
+    | `failed`                       | `:failed`                         |
+    | `superseded`                   | `:rejected` (terminal)            |
+    | nil / no plan                  | `:idle` (no plan → no restriction) |
+    | unknown string status          | `:locked` (:unknown_plan_status) |
+    | plan_id missing from DB        | `:locked` (:plan_not_found)       |
+    | plan_id lookup failure         | `:locked` (:plan_lookup_failed)   |
+    | corrupt/non-binary status      | `:locked` (:unknown_plan_status)  |
 
   The plan_id is preserved from the plan struct for trace correlation.
   """
   @spec from_plan(map()) :: t()
-  def from_plan(%{status: status, id: plan_id}) do
+  def from_plan(%{status: status, id: plan_id}) when is_binary(status) do
     %{from_plan_status(status) | plan_id: plan_id}
   end
 
-  def from_plan(%{status: status}) do
+  def from_plan(%{status: _status, id: plan_id}) do
+    # Non-binary or nil status with a plan_id — plan exists but its
+    # status is corrupt/unknown. Fail closed as locked (kiro-6dw).
+    locked(plan_id, :unknown_plan_status)
+  end
+
+  def from_plan(%{status: status}) when is_binary(status) do
     from_plan_status(status)
   end
+
+  # nil status without an id — no plan exists, so no restriction.
+  # This is the "no plan at all" case; :idle is correct (kiro-6dw).
+  def from_plan(%{status: nil}) do
+    %__MODULE__{state: :idle}
+  end
+
+  # Non-nil, non-binary status without an id — corrupt but untraceable.
+  # Fail closed as locked (kiro-6dw).
+  def from_plan(%{}) do
+    locked(nil, :unknown_plan_status)
+  end
+
+  @status_to_state %{
+    "draft" => :waiting_for_approval,
+    "approved" => :approved,
+    "running" => :executing,
+    "completed" => :completed,
+    "rejected" => :rejected,
+    "failed" => :failed,
+    "superseded" => :rejected
+  }
 
   @doc """
   Derives a PlanMode from a plan status string, without a plan_id.
   """
   @spec from_plan_status(String.t() | nil) :: t()
   def from_plan_status(status) when is_binary(status) do
-    state =
-      case status do
-        "draft" -> :waiting_for_approval
-        "approved" -> :approved
-        "running" -> :executing
-        "completed" -> :completed
-        "rejected" -> :rejected
-        "failed" -> :failed
-        "superseded" -> :rejected
-        _ -> :idle
-      end
+    case Map.fetch(@status_to_state, status) do
+      {:ok, state} ->
+        %__MODULE__{state: state}
 
-    %__MODULE__{state: state}
+      :error ->
+        # Unknown status — fail closed (kiro-6dw)
+        %__MODULE__{state: :locked, locked_reason: :unknown_plan_status}
+    end
   end
 
-  def from_plan_status(_nil_or_unknown) do
+  # No status at all — genuinely no plan exists.
+  # :idle is correct: there is no plan-mode restriction when there
+  # is no plan. Callers with a plan_id that failed to load should
+  # use PlanMode.locked/2 instead (kiro-6dw).
+  #
+  # Note: for a plan with a non-binary/corrupt status, callers
+  # should use from_plan/1 or locked/2 which carry the plan_id
+  # and return :locked with :unknown_plan_status. from_plan_status/1
+  # without a plan_id has no way to know whether a plan exists,
+  # so nil → :idle is the correct default (kiro-6dw).
+  def from_plan_status(nil) do
     %__MODULE__{state: :idle}
+  end
+
+  # Non-binary, non-nil status — this shouldn't happen in normal flows
+  # since DB statuses are strings. Fail closed as locked (kiro-6dw).
+  def from_plan_status(_corrupt) do
+    %__MODULE__{state: :locked, locked_reason: :unknown_plan_status}
   end
 
   @doc """
@@ -330,10 +423,20 @@ defmodule KiroCockpit.Swarm.PlanMode do
       :ok
   """
   @spec check_action(t(), permission()) :: action_result()
-  def check_action(%__MODULE__{state: state}, permission) do
+  def check_action(%__MODULE__{state: state} = plan_mode, permission) do
     cond do
       state in [:idle, :completed, :rejected, :failed] ->
         :ok
+
+      state == :locked ->
+        # kiro-6dw: locked state blocks all non-read actions — fail-closed
+        # for unknown/missing durable plan state.
+        if permission in @read_only_permissions do
+          :ok
+        else
+          {:blocked, "Action blocked: plan state is locked (unknown)",
+           guidance_for_locked_permission(permission, plan_mode)}
+        end
 
       state in [:planning, :waiting_for_approval] ->
         if permission in @read_only_permissions do
@@ -376,7 +479,8 @@ defmodule KiroCockpit.Swarm.PlanMode do
       :approved,
       :executing,
       :verifying,
-      :completed
+      :completed,
+      :locked
     ]
   end
 
@@ -387,7 +491,9 @@ defmodule KiroCockpit.Swarm.PlanMode do
   (§27.11 Invariant 2).
   """
   @spec mutations_blocked?(t()) :: boolean()
-  def mutations_blocked?(%__MODULE__{} = plan_mode), do: planning_locked?(plan_mode)
+  def mutations_blocked?(%__MODULE__{} = plan_mode) do
+    planning_locked?(plan_mode) or locked?(plan_mode)
+  end
 
   # ── Private ────────────────────────────────────────────────────────────
 
@@ -482,4 +588,33 @@ defmodule KiroCockpit.Swarm.PlanMode do
     "This action is blocked during #{state}. " <>
       "Wait for plan approval before making changes."
   end
+
+  # kiro-6dw: Guidance for actions blocked in the fail-closed :locked state.
+  # The locked state means a plan_id is correlated but durable plan state
+  # is unknown or missing. Guidance is actionable — tells the operator what
+  # to investigate and how to recover.
+  defp guidance_for_locked_permission(permission, plan_mode) do
+    reason_text =
+      case plan_mode.locked_reason do
+        :plan_not_found -> "Plan not found in the database (it may have been deleted)."
+        :plan_lookup_failed -> "Plan lookup failed (database may be unavailable)."
+        :unknown_plan_status -> "Plan has an unrecognized status."
+        nil -> "Plan state is unknown."
+      end
+
+    "#{permission_label(permission)} are blocked because the plan state " <>
+      "is locked (unknown). #{reason_text} " <>
+      "Verify the plan exists and has a valid status, or reset plan mode to idle."
+  end
+
+  defp permission_label(:read), do: "Reads"
+  defp permission_label(:write), do: "Writes"
+  defp permission_label(:shell_read), do: "Shell diagnostics"
+  defp permission_label(:shell_write), do: "Shell commands"
+  defp permission_label(:terminal), do: "Terminal sessions"
+  defp permission_label(:external), do: "External access"
+  defp permission_label(:destructive), do: "Destructive actions"
+  defp permission_label(:subagent), do: "Subagent invocations"
+  defp permission_label(:memory_write), do: "Memory writes"
+  defp permission_label(other), do: "#{other} actions"
 end

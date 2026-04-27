@@ -1298,7 +1298,6 @@ defmodule KiroCockpit.KiroSession do
   end
 
   defp truthy_lookup(_nil_or_not_map, _key), do: false
-
   # -- Auto callback handling (kiro-4ff) ------------------------------------
 
   # When auto_callbacks is enabled and the inbound request method is known,
@@ -1467,22 +1466,36 @@ defmodule KiroCockpit.KiroSession do
   end
 
   # Derive plan_mode from durable plan status when a plan_id is available.
-  # Checks opts first, then state.swarm_plan_id. Returns nil if no plan_id
-  # is found or the plan cannot be loaded (fail-safe to nil so callers fall
-  # back to PlanMode.new() / idle behavior).
+  # Checks opts first, then state.swarm_plan_id.
+  #
+  # kiro-6dw: Fail-closed — when a plan_id exists but the plan cannot
+  # be loaded from the durable store, return a locked PlanMode instead
+  # of nil/idle. Unknown/missing durable plan state for plan-correlated
+  # execution must fail closed. Only when no plan_id exists at all does
+  # the function return nil (no plan → no plan-mode restriction).
   defp derive_plan_mode(opts, state) do
     plan_id =
       Keyword.get(opts, :plan_id) || Keyword.get(opts, :swarm_plan_id) || state.swarm_plan_id
 
-    if plan_id do
-      case Plans.get_plan(plan_id) do
-        nil -> nil
-        plan -> PlanMode.from_plan(plan)
-      end
+    do_derive_plan_mode(plan_id)
+  end
+
+  defp do_derive_plan_mode(nil), do: nil
+
+  defp do_derive_plan_mode(plan_id) do
+    case Plans.get_plan(plan_id) do
+      nil ->
+        # Plan referenced but not found — fail closed (kiro-6dw)
+        PlanMode.locked(plan_id, :plan_not_found)
+
+      plan ->
+        # Delegate all status handling (including corrupt/non-binary)
+        # to PlanMode.from_plan/1 at the widened API boundary (kiro-6dw).
+        PlanMode.from_plan(plan)
     end
   rescue
-    # DB or plan lookup failures should not crash the session
-    _ -> nil
+    # DB/plan lookup failure during plan-correlated execution — fail closed
+    _ -> PlanMode.locked(plan_id, :plan_lookup_failed)
   end
 
   # fs/* methods are fast file operations — handle synchronously.

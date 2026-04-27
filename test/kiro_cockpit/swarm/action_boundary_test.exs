@@ -38,6 +38,24 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
     end
   end
 
+  # Captures the boundary context into the process dictionary for assertions.
+  # Shared across multiple describe blocks (kiro-6dw).
+  defmodule ProvenanceCtxHook do
+    @behaviour Hook
+
+    @impl true
+    def name, do: :provenance_ctx
+    @impl true
+    def priority, do: 95
+    @impl true
+    def filter(_event), do: true
+    @impl true
+    def on_event(event, ctx) do
+      Process.put(:provenance_ctx, ctx)
+      HookResult.continue(event, ["provenance ctx"])
+    end
+  end
+
   # -- Exception-safe Application env mutation for test isolation ---------------
   # Concurrent tests (bronze_section35_regression_test, bronze_action_boundary_integration_test)
   # temporarily set :bronze_action_capture_enabled to false via Application.put_env.
@@ -236,7 +254,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
               agent_id: agent_id,
               permission_level: :subagent,
               plan_mode: plan_mode,
-              approved: true,
+              swarm_ctx: %{approved: true},
               pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
               post_hooks: []
             ],
@@ -279,8 +297,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :write,
             plan_mode: plan_mode,
-            approved: true,
-            policy_allows_write: true,
+            swarm_ctx: %{approved: true, policy_allows_write: true},
             payload: %{target_path: "/etc/passwd"},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
@@ -319,7 +336,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :executor_dispatch,
             plan_mode: plan_mode,
-            approved: true,
+            swarm_ctx: %{approved: true},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
           ],
@@ -356,7 +373,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :write,
             plan_mode: plan_mode,
-            approved: true,
+            swarm_ctx: %{approved: true},
             payload: %{target_path: "lib/test.ex"},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
@@ -436,7 +453,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
+            swarm_ctx: %{approved: true},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
           ],
@@ -499,8 +516,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{stale_plan?: true, stale_plan_override?: true},
+            swarm_ctx: %{approved: true, stale_plan?: true, stale_plan_override?: true},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
           ],
@@ -534,7 +550,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             plan_id: "some-plan-id",
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
+            swarm_ctx: %{approved: true},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
           ],
@@ -570,7 +586,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             task_id: "some-task-id",
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
+            swarm_ctx: %{approved: true},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
           ],
@@ -650,7 +666,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             permission_level: :subagent,
             plan_mode: plan_mode,
             project_dir: "/tmp/test-project",
-            approved: true,
+            swarm_ctx: %{approved: true},
             pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
             post_hooks: []
           ],
@@ -1291,9 +1307,8 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            # Empty swarm_ctx — should be hydrated
-            swarm_ctx: %{},
+            # swarm_ctx with approved — should be hydrated
+            swarm_ctx: %{approved: true},
             pre_hooks: [CtxCapturingHook],
             post_hooks: []
           ],
@@ -1359,9 +1374,8 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             plan_id: plan.id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            # Empty swarm_ctx — should be hydrated with plan
-            swarm_ctx: %{},
+            # swarm_ctx with approved — should be hydrated with plan
+            swarm_ctx: %{approved: true},
             pre_hooks: [CtxCapturingHook],
             post_hooks: []
           ],
@@ -1425,8 +1439,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{},
+            swarm_ctx: %{approved: true},
             pre_hooks: [CtxCapturingHook],
             post_hooks: []
           ],
@@ -1504,8 +1517,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{},
+            swarm_ctx: %{approved: true},
             pre_hooks: [CtxCapturingHook],
             post_hooks: []
           ],
@@ -1553,8 +1565,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :write,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{},
+            swarm_ctx: %{approved: true},
             pre_hooks: [CtxCapturingHook],
             post_hooks: []
           ],
@@ -1621,8 +1632,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{active_task: existing_task},
+            swarm_ctx: %{approved: true, active_task: existing_task},
             pre_hooks: [CtxPreservingHook],
             post_hooks: []
           ],
@@ -1689,8 +1699,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             plan_id: db_plan.id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{plan: existing_plan},
+            swarm_ctx: %{approved: true, plan: existing_plan},
             pre_hooks: [CtxPreservingHook],
             post_hooks: []
           ],
@@ -1732,8 +1741,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :write,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{permission_policy: existing_policy},
+            swarm_ctx: %{approved: true, permission_policy: existing_policy},
             pre_hooks: [CtxPreservingHook],
             post_hooks: []
           ],
@@ -1794,8 +1802,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{},
+            swarm_ctx: %{approved: true},
             # Inject raising task manager
             task_manager_module: RaisingTaskManager,
             pre_hooks: [CtxDefensiveHook],
@@ -1837,8 +1844,7 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
             agent_id: agent_id,
             permission_level: :subagent,
             plan_mode: plan_mode,
-            approved: true,
-            swarm_ctx: %{},
+            swarm_ctx: %{approved: true},
             # Use real TaskManager (default)
             pre_hooks: [CtxDefensiveHook],
             post_hooks: []
@@ -1852,6 +1858,634 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
       assert ctx.active_task.id == task.id
       # permission_policy should be built from the hydrated task
       assert ctx.permission_policy != nil
+    end
+  end
+
+  # ── kiro-6dw: Trusted signal provenance hardening ───────────────────
+
+  describe "run/3 — trusted provenance flags (kiro-6dw)" do
+    # Tests that the boundary derives approved/policy_allows_write from
+    # durable state rather than blindly copying from caller opts.
+
+    defmodule ProvenanceHook do
+      @behaviour KiroCockpit.Swarm.Hook
+
+      @impl true
+      def name, do: :provenance_ctx
+      @impl true
+      def priority, do: 95
+      @impl true
+      def filter(_event), do: true
+      @impl true
+      def on_event(event, ctx) do
+        Process.put(:provenance_ctx, ctx)
+        KiroCockpit.Swarm.HookResult.continue(event, ["provenance ctx"])
+      end
+    end
+
+    setup do
+      Process.delete(:provenance_ctx)
+      :ok
+    end
+
+    test "does not trust approved flag from arbitrary caller opts" do
+      session_id = "sess_provenance_#{System.unique_integer([:positive])}"
+      agent_id = "agent_provenance"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            approved: false,
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+      # approved should be false from durable derivation (no plan_id → not approved),
+      # NOT from the caller opt approved: false
+      assert Map.get(ctx, :approved) == false
+    end
+
+    test "preserves approved flag from trusted swarm_ctx" do
+      session_id = "sess_trusted_ctx_#{System.unique_integer([:positive])}"
+      agent_id = "agent_trusted_ctx"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      plan_mode = KiroCockpit.Swarm.PlanMode.new()
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.enter_plan_mode(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.draft_generated(plan_mode)
+      {:ok, plan_mode} = KiroCockpit.Swarm.PlanMode.approve(plan_mode)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: plan_mode,
+            swarm_ctx: %{approved: true},
+            pre_hooks: [ProvenanceHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+      assert Map.get(ctx, :approved) == true
+    end
+
+    test "does not lift root_cause_stated from caller opts into ctx" do
+      session_id = "sess_no_root_cause_#{System.unique_integer([:positive])}"
+      agent_id = "agent_no_root_cause"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.new(),
+            root_cause_stated: true,
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+      refute Map.has_key?(ctx, :root_cause_stated)
+    end
+
+    test "preserves root_cause_stated from trusted swarm_ctx" do
+      session_id = "sess_swarm_root_cause_#{System.unique_integer([:positive])}"
+      agent_id = "agent_swarm_root_cause"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.new(),
+            swarm_ctx: %{root_cause_stated: true},
+            pre_hooks: [ProvenanceHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+      assert Map.get(ctx, :root_cause_stated) == true
+    end
+
+    test "does not lift fixing_test_fixture from caller opts into ctx" do
+      session_id = "sess_no_fixture_#{System.unique_integer([:positive])}"
+      agent_id = "agent_no_fixture"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.new(),
+            fixing_test_fixture: true,
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+      refute Map.has_key?(ctx, :fixing_test_fixture)
+    end
+
+    test "does not lift docs_scoped from caller opts into ctx" do
+      session_id = "sess_no_docs_#{System.unique_integer([:positive])}"
+      agent_id = "agent_no_docs"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.new(),
+            docs_scoped: true,
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+      refute Map.has_key?(ctx, :docs_scoped)
+    end
+  end
+
+  # ── kiro-6dw: Locked plan mode in action boundary ──────────────────
+
+  describe "run/3 — locked plan mode blocks mutation (kiro-6dw)" do
+    test "locked plan mode blocks write permission" do
+      session_id = "sess_locked_#{System.unique_integer([:positive])}"
+      agent_id = "agent_locked"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      locked_pm = KiroCockpit.Swarm.PlanMode.locked("plan-missing", :plan_not_found)
+
+      result =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :write,
+            plan_mode: locked_pm,
+            swarm_ctx: %{},
+            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+            post_hooks: []
+          ],
+          fn -> :should_not_run end
+        )
+
+      assert {:error, {:swarm_blocked, reason, _messages}} = result
+      assert reason =~ "locked"
+    end
+
+    test "locked plan mode allows read permission" do
+      session_id = "sess_locked_read_#{System.unique_integer([:positive])}"
+      agent_id = "agent_locked_read"
+
+      _task = create_active_task!(session_id, agent_id)
+
+      locked_pm = KiroCockpit.Swarm.PlanMode.locked("plan-missing", :plan_not_found)
+
+      result =
+        ActionBoundary.run(
+          :file_read_requested,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            permission_level: :read,
+            plan_mode: locked_pm,
+            swarm_ctx: %{},
+            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+            post_hooks: []
+          ],
+          fn -> :read_ok end
+        )
+
+      assert {:ok, :read_ok} = result
+    end
+  end
+
+  # ── kiro-6dw: Durable policy_allows_write derivation regression ─────
+
+  describe "run/3 — durable policy_allows_write derivation (kiro-6dw regression)" do
+    setup do
+      Process.delete(:provenance_ctx)
+      :ok
+    end
+
+    test "approved plan + acting write-scoped task derives policy_allows_write: true" do
+      session_id = "sess_paw_#{System.unique_integer([:positive])}"
+      agent_id = "agent_paw"
+
+      # Create an approved plan in the DB
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "Test approved plan",
+          "nano",
+          [],
+          plan_markdown: "# Plan",
+          execution_prompt: "Execute",
+          project_snapshot_hash: "abc"
+        )
+
+      {:ok, plan} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      # Create an acting task with write permission scope
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Implement feature",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          permission_scope: ["write", "read"],
+          files_scope: [],
+          plan_id: plan.id
+        })
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            task_id: task.id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.from_plan(plan),
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceCtxHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+
+      # The durable derivation must produce both flags as true
+      assert Map.get(ctx, :approved) == true,
+             "expected approved: true for approved plan, got: #{inspect(Map.get(ctx, :approved))}"
+
+      assert Map.get(ctx, :policy_allows_write) == true,
+             "expected policy_allows_write: true for approved plan + acting write-scoped task, got: #{inspect(Map.get(ctx, :policy_allows_write))}"
+    end
+
+    test "running plan + acting write-scoped task derives policy_allows_write: true" do
+      session_id = "sess_paw_run_#{System.unique_integer([:positive])}"
+      agent_id = "agent_paw_run"
+
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "Test running plan",
+          "nano",
+          [],
+          plan_markdown: "# Plan",
+          execution_prompt: "Execute",
+          project_snapshot_hash: "abc"
+        )
+
+      {:ok, plan} = KiroCockpit.Plans.approve_plan(plan.id)
+      {:ok, plan} = KiroCockpit.Plans.update_status(plan.id, "running")
+
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Implement feature",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          permission_scope: ["write"],
+          files_scope: [],
+          plan_id: plan.id
+        })
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            task_id: task.id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.from_plan(plan),
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceCtxHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+
+      assert Map.get(ctx, :approved) == true
+      assert Map.get(ctx, :policy_allows_write) == true
+    end
+
+    test "draft plan + acting write-scoped task derives policy_allows_write: false" do
+      session_id = "sess_paw_draft_#{System.unique_integer([:positive])}"
+      agent_id = "agent_paw_draft"
+
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "Test draft plan",
+          "nano",
+          [],
+          plan_markdown: "# Plan",
+          execution_prompt: "Execute",
+          project_snapshot_hash: "abc"
+        )
+
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Implement feature",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          permission_scope: ["write"],
+          files_scope: [],
+          plan_id: plan.id
+        })
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            task_id: task.id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.from_plan(plan),
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceCtxHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+
+      # Draft plan is NOT approved, so both should be false
+      assert Map.get(ctx, :approved) == false
+      assert Map.get(ctx, :policy_allows_write) == false
+    end
+
+    test "approved plan + researching task (no write scope) derives policy_allows_write: false" do
+      session_id = "sess_paw_research_#{System.unique_integer([:positive])}"
+      agent_id = "agent_paw_research"
+
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "Test approved plan researching",
+          "nano",
+          [],
+          plan_markdown: "# Plan",
+          execution_prompt: "Execute",
+          project_snapshot_hash: "abc"
+        )
+
+      {:ok, plan} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Research task",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "researching",
+          permission_scope: ["read"],
+          files_scope: [],
+          plan_id: plan.id
+        })
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            task_id: task.id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.from_plan(plan),
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceCtxHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+
+      assert Map.get(ctx, :approved) == true
+      # Researching category hard-blocks write
+      assert Map.get(ctx, :policy_allows_write) == false
+    end
+
+    test "malicious top-level opts policy_allows_write is ignored" do
+      session_id = "sess_paw_mal_#{System.unique_integer([:positive])}"
+      agent_id = "agent_paw_mal"
+
+      # Draft plan — not approved
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "Unapproved plan",
+          "nano",
+          [],
+          plan_markdown: "# Plan",
+          execution_prompt: "Execute",
+          project_snapshot_hash: "abc"
+        )
+
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Acting task",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          permission_scope: ["write"],
+          files_scope: [],
+          plan_id: plan.id
+        })
+
+      {:ok, _} =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            task_id: task.id,
+            permission_level: :subagent,
+            plan_mode: KiroCockpit.Swarm.PlanMode.from_plan(plan),
+            # Malicious: try to override via top-level opts
+            policy_allows_write: true,
+            approved: true,
+            swarm_ctx: %{},
+            pre_hooks: [ProvenanceCtxHook],
+            post_hooks: []
+          ],
+          fn -> :ok end
+        )
+
+      ctx = Process.get(:provenance_ctx)
+
+      # Durable derivation must override malicious opts
+      assert Map.get(ctx, :approved) == false
+      assert Map.get(ctx, :policy_allows_write) == false
+    end
+
+    test "end-to-end write action allowed with approved plan + acting write-scoped task" do
+      session_id = "sess_e2e_#{System.unique_integer([:positive])}"
+      agent_id = "agent_e2e"
+
+      {:ok, plan} =
+        KiroCockpit.Plans.create_plan(
+          session_id,
+          "E2E approved plan",
+          "nano",
+          [],
+          plan_markdown: "# Plan",
+          execution_prompt: "Execute",
+          project_snapshot_hash: "abc"
+        )
+
+      {:ok, plan} = KiroCockpit.Plans.approve_plan(plan.id)
+
+      {:ok, task} =
+        TaskManager.create(%{
+          session_id: session_id,
+          content: "Implement feature",
+          owner_id: agent_id,
+          status: "in_progress",
+          category: "acting",
+          permission_scope: ["write", "read"],
+          files_scope: [],
+          plan_id: plan.id
+        })
+
+      # Run a write action through the full boundary with standard hooks
+      result =
+        ActionBoundary.run(
+          :file_write_requested,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: agent_id,
+            plan_id: plan.id,
+            task_id: task.id,
+            permission_level: :write,
+            plan_mode: KiroCockpit.Swarm.PlanMode.from_plan(plan),
+            swarm_ctx: %{},
+            pre_hooks: [KiroCockpit.Swarm.Hooks.TaskEnforcementHook],
+            post_hooks: []
+          ],
+          fn -> :write_ok end
+        )
+
+      # Write action should be allowed: approved plan + acting write-scoped task
+      assert {:ok, :write_ok} = result,
+             "expected write action to be allowed with approved plan + acting write-scoped task"
+    end
+  end
+
+  # ── kiro-6dw: Corrupt/non-binary plan status handling ──────────────────
+
+  describe "run/3 — corrupt plan status derives locked (kiro-6dw)" do
+    setup do
+      Process.delete(:provenance_ctx)
+      :ok
+    end
+
+    test "plan with nil status derives locked with unknown_plan_status (kiro-6dw)" do
+      # We can't set status to NULL in the DB (NOT NULL constraint), but
+      # PlanMode.from_plan/1 must handle a plan map with nil status correctly.
+      # This simulates what do_derive_plan_mode would see if a plan row
+      # somehow had a corrupt/non-binary status.
+      corrupted_plan = %{status: nil, id: "plan-corrupt-nil"}
+
+      pm = KiroCockpit.Swarm.PlanMode.from_plan(corrupted_plan)
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+      assert pm.plan_id == "plan-corrupt-nil"
+    end
+
+    test "plan with atom status derives locked with unknown_plan_status (kiro-6dw)" do
+      # Atom status is non-binary and should be treated as corrupt
+      corrupted_plan = %{status: :approved, id: "plan-corrupt-atom"}
+
+      pm = KiroCockpit.Swarm.PlanMode.from_plan(corrupted_plan)
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+      assert pm.plan_id == "plan-corrupt-atom"
     end
   end
 end

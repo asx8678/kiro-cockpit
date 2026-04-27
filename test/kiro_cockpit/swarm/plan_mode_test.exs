@@ -23,11 +23,11 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
   # ── Introspection ─────────────────────────────────────────────────────
 
   describe "states/0" do
-    test "returns all 9 states including rejected and failed" do
+    test "returns all 10 states including rejected, failed, and locked" do
       states = PlanMode.states()
 
       expected =
-        ~w(idle planning waiting_for_approval approved executing verifying completed rejected failed)a
+        ~w(idle planning waiting_for_approval approved executing verifying completed rejected failed locked)a
 
       assert states == expected
     end
@@ -72,14 +72,29 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       assert pm.state == :rejected
     end
 
-    test "derives idle from unknown status" do
+    test "derives locked from unknown status (kiro-6dw fail-closed)" do
       pm = PlanMode.from_plan(%{status: "unknown_status"})
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+    end
+
+    test "derives idle from nil status (no plan at all)" do
+      pm = PlanMode.from_plan(%{status: nil})
       assert pm.state == :idle
     end
 
-    test "derives idle from nil plan_id" do
-      pm = PlanMode.from_plan(%{status: nil})
-      assert pm.state == :idle
+    test "derives locked from non-binary corrupt status with plan_id (kiro-6dw)" do
+      pm = PlanMode.from_plan(%{status: :corrupt_atom, id: "plan-999"})
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+      assert pm.plan_id == "plan-999"
+    end
+
+    test "derives locked from nil status with plan_id (kiro-6dw)" do
+      pm = PlanMode.from_plan(%{status: nil, id: "plan-nil-status"})
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+      assert pm.plan_id == "plan-nil-status"
     end
   end
 
@@ -96,8 +111,26 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       assert PlanMode.from_plan_status("running").state == :executing
     end
 
-    test "derives idle from nil" do
+    test "derives idle from nil (no plan)" do
       assert PlanMode.from_plan_status(nil).state == :idle
+    end
+
+    test "derives locked from unknown string status (kiro-6dw fail-closed)" do
+      pm = PlanMode.from_plan_status("garbage_status")
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+    end
+
+    test "derives locked from non-binary corrupt status (kiro-6dw)" do
+      pm = PlanMode.from_plan_status(:corrupt_atom)
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+    end
+
+    test "derives locked from numeric status (kiro-6dw)" do
+      pm = PlanMode.from_plan_status(42)
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
     end
   end
 
@@ -106,6 +139,125 @@ defmodule KiroCockpit.Swarm.PlanModeTest do
       pm = PlanMode.for_planning()
       assert pm.state == :planning
       assert pm.plan_id == nil
+    end
+  end
+
+  # ── kiro-6dw: locked state (fail-closed for unknown plan state) ────
+
+  describe "locked/2" do
+    test "creates a locked PlanMode with plan_not_found reason" do
+      pm = PlanMode.locked("plan-404", :plan_not_found)
+      assert pm.state == :locked
+      assert pm.plan_id == "plan-404"
+      assert pm.locked_reason == :plan_not_found
+    end
+
+    test "creates a locked PlanMode with plan_lookup_failed reason" do
+      pm = PlanMode.locked("plan-500", :plan_lookup_failed)
+      assert pm.state == :locked
+      assert pm.locked_reason == :plan_lookup_failed
+    end
+
+    test "creates a locked PlanMode with unknown_plan_status reason" do
+      pm = PlanMode.locked("plan-xxx", :unknown_plan_status)
+      assert pm.state == :locked
+      assert pm.locked_reason == :unknown_plan_status
+    end
+
+    test "defaults plan_id to nil and reason to plan_not_found" do
+      pm = PlanMode.locked()
+      assert pm.state == :locked
+      assert pm.plan_id == nil
+      assert pm.locked_reason == :plan_not_found
+    end
+  end
+
+  describe "locked?/1" do
+    test "returns true for locked state" do
+      assert PlanMode.locked?(PlanMode.locked("plan-1"))
+    end
+
+    test "returns false for idle" do
+      refute PlanMode.locked?(PlanMode.new())
+    end
+
+    test "returns false for approved" do
+      {:ok, pm} = full_approve()
+      refute PlanMode.locked?(pm)
+    end
+
+    test "returns false for planning" do
+      {:ok, pm} = PlanMode.enter_plan_mode(PlanMode.new())
+      refute PlanMode.locked?(pm)
+    end
+  end
+
+  describe "check_action/2 with locked state (kiro-6dw)" do
+    setup do
+      %{pm: PlanMode.locked("plan-locked", :plan_not_found)}
+    end
+
+    test "allows read in locked state", %{pm: pm} do
+      assert :ok = PlanMode.check_action(pm, :read)
+    end
+
+    test "blocks write in locked state", %{pm: pm} do
+      assert {:blocked, reason, guidance} = PlanMode.check_action(pm, :write)
+      assert reason =~ "locked"
+      assert guidance =~ "not found"
+    end
+
+    test "blocks shell_read in locked state", %{pm: pm} do
+      assert {:blocked, _reason, guidance} = PlanMode.check_action(pm, :shell_read)
+      assert guidance =~ "locked"
+    end
+
+    test "blocks subagent in locked state", %{pm: pm} do
+      assert {:blocked, _reason, guidance} = PlanMode.check_action(pm, :subagent)
+      assert guidance =~ "locked"
+    end
+
+    test "blocks destructive in locked state", %{pm: pm} do
+      assert {:blocked, _reason, guidance} = PlanMode.check_action(pm, :destructive)
+      assert guidance =~ "locked"
+    end
+
+    test "locked guidance includes reason for plan_not_found" do
+      pm = PlanMode.locked("plan-x", :plan_not_found)
+      {:blocked, _reason, guidance} = PlanMode.check_action(pm, :write)
+      assert guidance =~ "not found"
+    end
+
+    test "locked guidance includes reason for plan_lookup_failed" do
+      pm = PlanMode.locked("plan-x", :plan_lookup_failed)
+      {:blocked, _reason, guidance} = PlanMode.check_action(pm, :write)
+      assert guidance =~ "lookup failed"
+    end
+
+    test "locked guidance includes reason for unknown_plan_status" do
+      pm = PlanMode.locked("plan-x", :unknown_plan_status)
+      {:blocked, _reason, guidance} = PlanMode.check_action(pm, :write)
+      assert guidance =~ "unrecognized"
+    end
+  end
+
+  describe "mutations_blocked?/1 with locked state" do
+    test "returns true for locked state" do
+      assert PlanMode.mutations_blocked?(PlanMode.locked("plan-1"))
+    end
+  end
+
+  describe "reset from locked state (kiro-6dw)" do
+    test "locked → reset → idle" do
+      pm = PlanMode.locked("plan-locked")
+      {:ok, pm_idle} = PlanMode.reset(pm)
+      assert pm_idle.state == :idle
+    end
+  end
+
+  describe "read_only_discovery_allowed?/1 with locked state" do
+    test "returns true for locked state (reads are allowed for diagnostics)" do
+      assert PlanMode.read_only_discovery_allowed?(PlanMode.locked("plan-1"))
     end
   end
 
