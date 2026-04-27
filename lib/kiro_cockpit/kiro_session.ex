@@ -1256,7 +1256,11 @@ defmodule KiroCockpit.KiroSession do
         # kiro-fmn: pass session's swarm_hooks as enabled so the boundary
         # enforces fail-closed for non-exempt egress even when app config
         # has :swarm_action_hooks_enabled = false.
-        enabled: state.swarm_hooks
+        enabled: state.swarm_hooks,
+        # kiro-fmn: pass test_bypass so ActionBoundary.run_egress/3 can
+        # allow non-exempt egress in test env when boundary is disabled
+        # (mirrors the test_bypass_allowed? check in handle_disabled_boundary/3).
+        test_bypass: state.swarm_test_bypass
       ]
 
     extra_map = Enum.into(extra, %{})

@@ -254,11 +254,18 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       # Exempt egress still executes with Bronze audit (mandatory §27.11 inv. 7)
       # using a lightweight path that doesn't require DB hydration.
       # Non-exempt egress (e.g. :acp_egress_notify) returns
-      # {:error, {:swarm_boundary_disabled, action}} and does NOT execute.
-      if egress_exempt?(action) do
-        run_egress_audit_disabled(action, opts, fun)
-      else
-        {:error, {:swarm_boundary_disabled, action}}
+      # {:error, {:swarm_boundary_disabled, action}} and does NOT execute
+      # unless test_bypass is allowed (mirrors handle_disabled_boundary/3
+      # for run/3 — allows unit-style testing without boundary enforcement).
+      cond do
+        egress_exempt?(action) ->
+          run_egress_audit_disabled(action, opts, fun)
+
+        test_bypass_allowed?(opts) ->
+          {:ok, call_executor(fun, %{event: nil, messages: [], hook_messages: []})}
+
+        true ->
+          {:error, {:swarm_boundary_disabled, action}}
       end
     end
   end
