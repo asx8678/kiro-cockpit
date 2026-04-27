@@ -27,13 +27,10 @@ defmodule KiroCockpitWeb.SessionPlanLive do
 
   alias KiroCockpit.NanoPlanner
   alias KiroCockpit.Plans
+  alias KiroCockpitWeb.SafeErrorFormatter
 
   @supported_modes ["nano", "nano_deep", "nano_fix"]
   @default_mode "nano"
-
-  # Max length for safe error messages — truncate to avoid leaking
-  # long strings that might contain tokens, paths, or PII (§22.6/§25.6).
-  @max_safe_error_length 200
 
   # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -169,7 +166,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, socket}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Failed to approve plan: #{format_error(reason)}")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Failed to approve plan: #{SafeErrorFormatter.format_error(reason)}"
+         )}
     end
   end
 
@@ -187,7 +189,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, put_flash(socket, :error, "Cannot reject plan: invalid status transition")}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Failed to reject plan: #{format_error(reason)}")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Failed to reject plan: #{SafeErrorFormatter.format_error(reason)}"
+         )}
     end
   end
 
@@ -254,7 +261,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, put_flash(socket, :error, "Plan not found")}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Failed to run plan: #{format_error(reason)}")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Failed to run plan: #{SafeErrorFormatter.format_error(reason)}"
+         )}
     end
   end
 
@@ -330,7 +342,7 @@ defmodule KiroCockpitWeb.SessionPlanLive do
     socket =
       socket
       |> assign(:generating, false)
-      |> put_flash(:error, "Failed to generate plan: #{format_error(reason)}")
+      |> put_flash(:error, "Failed to generate plan: #{SafeErrorFormatter.format_error(reason)}")
 
     {:noreply, socket}
   end
@@ -340,7 +352,7 @@ defmodule KiroCockpitWeb.SessionPlanLive do
     socket =
       socket
       |> assign(:generating, false)
-      |> put_flash(:error, "Plan generation crashed: #{format_exit(reason)}")
+      |> put_flash(:error, "Plan generation crashed: #{SafeErrorFormatter.format_exit(reason)}")
 
     {:noreply, socket}
   end
@@ -594,7 +606,7 @@ defmodule KiroCockpitWeb.SessionPlanLive do
       # Truncate exception message per §22.6/§25.6 — raw messages
       # may contain tokens, connection strings, or PII.
       Logger.warning(
-        "NanoPlanner.plan failed: #{safe_truncate(Exception.message(e), @max_safe_error_length)}"
+        "NanoPlanner.plan failed: #{SafeErrorFormatter.safe_truncate(Exception.message(e), 200)}"
       )
 
       {:error, :planner_unavailable}
@@ -702,63 +714,6 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   # {:ok, %{plan: plan}} (plan+tasks result) or {:ok, plan} (plan-only).
   defp unwrap_approve_result(%{plan: plan}), do: plan
   defp unwrap_approve_result(plan), do: plan
-
-  defp format_error(%Ecto.Changeset{} = changeset) do
-    changeset.errors
-    |> Enum.map_join(", ", fn {field, {msg, _}} -> "#{field}: #{msg}" end)
-  end
-
-  defp format_error(reason) when is_atom(reason), do: to_string(reason)
-
-  defp format_error(reason) when is_binary(reason) do
-    safe_truncate(reason, @max_safe_error_length)
-  end
-
-  # Exception messages may contain connection strings, stack traces, or
-  # other PII. Truncate and never inspect the raw struct (§22.6/§25.6).
-  defp format_error(%{__exception__: true} = reason) do
-    safe_truncate(Exception.message(reason), @max_safe_error_length)
-  end
-
-  # Never inspect arbitrary lists — they may contain secrets, tokens, or
-  # large payloads. Summarize by count only (§22.6/§25.6).
-  defp format_error(reason) when is_list(reason) do
-    "list of #{length(reason)} item(s)"
-  end
-
-  defp format_error(reason), do: "unexpected error: #{type_name(reason)}"
-
-  # Returns a safe type name for an unknown value — never inspects
-  # the value body, only its type, to avoid leaking PII/secrets (§22.6/§25.6).
-  @spec type_name(term()) :: String.t()
-  defp type_name(value) when is_map(value), do: "map"
-  defp type_name(value) when is_tuple(value), do: "tuple"
-  defp type_name(value) when is_pid(value), do: "pid"
-  defp type_name(value) when is_function(value), do: "function"
-  defp type_name(value) when is_port(value), do: "port"
-  defp type_name(value) when is_reference(value), do: "reference"
-  defp type_name(value) when is_float(value), do: "float"
-  defp type_name(value) when is_integer(value), do: "integer"
-  defp type_name(value) when is_bitstring(value), do: "bitstring"
-  defp type_name(_value), do: "unknown"
-
-  # Truncates a string to max_length, appending "..." if truncated.
-  # Prevents long error messages from leaking secrets/PII (§22.6/§25.6).
-  @spec safe_truncate(String.t(), non_neg_integer()) :: String.t()
-  defp safe_truncate(text, max_length) when is_binary(text) do
-    if String.length(text) > max_length do
-      String.slice(text, 0, max_length) <> "..."
-    else
-      text
-    end
-  end
-
-  defp format_exit(:normal), do: "normal exit"
-  defp format_exit(:shutdown), do: "shutdown"
-  # Never include raw shutdown reason text — it may contain PII/secrets (§22.6/§25.6).
-  defp format_exit({:shutdown, _reason}), do: "shutdown"
-  defp format_exit(reason) when is_atom(reason), do: to_string(reason)
-  defp format_exit(_reason), do: "unexpected exit"
 
   defp truncate(text, max_length) do
     if String.length(text) > max_length do
