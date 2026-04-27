@@ -50,7 +50,7 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
 
   # -- Helpers --------------------------------------------------------------
 
-  defp create_active_task!(session_id, agent_id, opts \\ []) do
+  defp create_active_task!(session_id, agent_id, opts) do
     attrs = %{
       session_id: session_id,
       content: Keyword.get(opts, :content, "integration test task"),
@@ -343,6 +343,274 @@ defmodule KiroCockpit.Swarm.BronzeActionBoundaryIntegrationTest do
       hook_traces = Enum.filter(all_events, &(&1.event_type == "hook_trace"))
       # Pre-hook trace
       assert length(hook_traces) >= 1
+    end
+
+    test "action_after records error status when executor returns {:error, reason}" do
+      session_id = "sess_exec_error_#{System.unique_integer([:positive])}"
+
+      # Enable action capture
+      original = Application.get_env(:kiro_cockpit, :bronze_action_capture_enabled, true)
+      Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, true)
+
+      result =
+        ActionBoundary.run(
+          :failing_action,
+          [
+            enabled: true,
+            session_id: session_id,
+            agent_id: "error-agent",
+            pre_hooks: [ContinueHook],
+            post_hooks: []
+          ],
+          fn -> {:error, :executor_failed} end
+        )
+
+      # Restore config
+      Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, original)
+
+      # Boundary returns {:ok, {:error, ...}} because it didn't block
+      assert {:ok, {:error, :executor_failed}} = result
+
+      # action_before and action_after should be recorded
+      events = DataPipeline.list_action_events(session_id)
+      assert length(events) == 2
+
+      after_event = Enum.find(events, &(&1.event_type == "action_after"))
+      assert after_event != nil
+
+      # Bronze result_status must be "error", not "ok"
+      assert after_event.hook_results["result_status"] == "error"
+    end
+  end
+
+  describe "BronzeAcp missing mandatory IDs" do
+    test "record_acp_update rejects nil session_id without inventing unknown" do
+      attrs = %{
+        # session_id intentionally nil
+        agent_id: "test-agent",
+        payload: %{"method" => "test"},
+        event_type: "acp_update"
+      }
+
+      :ok = KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_update(attrs)
+
+      # No acp_* events should be persisted with fake IDs
+      events = KiroCockpit.Swarm.Events.list_by_session("unknown")
+
+      acp_events =
+        Enum.filter(
+          events,
+          &(&1.event_type in ["acp_update", "acp_request", "acp_response", "acp_notification"])
+        )
+
+      assert Enum.all?(acp_events, &(&1.session_id != "unknown"))
+    end
+
+    test "record_acp_update rejects nil agent_id without inventing unknown" do
+      session_id = "sess_no_agent_#{System.unique_integer([:positive])}"
+
+      attrs = %{
+        session_id: session_id,
+        # agent_id intentionally nil
+        payload: %{"method" => "test"},
+        event_type: "acp_update"
+      }
+
+      :ok = KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_update(attrs)
+
+      # No events should be recorded for this session
+      events = KiroCockpit.Swarm.DataPipeline.BronzeAcp.list_acp_events(session_id)
+      assert length(events) == 0
+    end
+
+    test "record_acp_update rejects empty string session_id" do
+      attrs = %{
+        session_id: "",
+        agent_id: "test-agent",
+        payload: %{"method" => "test"},
+        event_type: "acp_update"
+      }
+
+      :ok = KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_update(attrs)
+
+      # No events with empty session_id
+      events = KiroCockpit.Swarm.Events.list_by_session("")
+
+      acp_events =
+        Enum.filter(
+          events,
+          &(&1.event_type in ["acp_update", "acp_request", "acp_response", "acp_notification"])
+        )
+
+      assert length(acp_events) == 0
+    end
+
+    test "record_acp_request with valid IDs persists correctly" do
+      session_id = "sess_valid_#{System.unique_integer([:positive])}"
+
+      payload = %{"jsonrpc" => "2.0", "method" => "tools/call", "id" => 1}
+
+      :ok =
+        KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_request(
+          session_id,
+          "test-agent",
+          payload,
+          method: "tools/call"
+        )
+
+      events = KiroCockpit.Swarm.DataPipeline.BronzeAcp.list_acp_events(session_id)
+      assert length(events) == 1
+      assert hd(events).event_type == "acp_request"
+      assert hd(events).session_id == session_id
+      assert hd(events).agent_id == "test-agent"
+    end
+  end
+
+  describe "ACP Bronze persistence path via EventStore" do
+    test "outbound ACP request creates both raw_acp_message and swarm_event acp rows" do
+      session_id = "sess_bronze_out_#{System.unique_integer([:positive])}"
+
+      payload = %{
+        "jsonrpc" => "2.0",
+        "id" => 42,
+        "method" => "tools/call",
+        "params" => %{"name" => "fs/read"}
+      }
+
+      # Enable ACP capture
+      original = Application.get_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+
+      # Record via EventStore (raw row)
+      {:ok, _msg} =
+        KiroCockpit.EventStore.record_acp_message(
+          "client_to_agent",
+          payload,
+          session_id: session_id
+        )
+
+      # Record via BronzeAcp (correlation row)
+      :ok =
+        KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_request(
+          session_id,
+          "integration-agent",
+          payload,
+          method: "tools/call",
+          rpc_id: "42"
+        )
+
+      # Restore config
+      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, original)
+
+      # Verify raw_acp_message row exists
+      raw_msgs = KiroCockpit.EventStore.list_acp_messages(session_id)
+      assert length(raw_msgs) >= 1
+      first_raw = hd(raw_msgs)
+      assert first_raw.direction == "client_to_agent"
+      assert first_raw.message_type == "request"
+
+      # Verify swarm_event acp_* row exists
+      acp_events = KiroCockpit.Swarm.DataPipeline.BronzeAcp.list_acp_events(session_id)
+      assert length(acp_events) >= 1
+      first_acp = hd(acp_events)
+      assert first_acp.event_type == "acp_request"
+      assert first_acp.session_id == session_id
+      assert first_acp.agent_id == "integration-agent"
+    end
+
+    test "inbound ACP response creates both raw_acp_message and swarm_event acp rows" do
+      session_id = "sess_bronze_in_#{System.unique_integer([:positive])}"
+
+      payload = %{
+        "jsonrpc" => "2.0",
+        "id" => 42,
+        "result" => %{"content" => "file data"}
+      }
+
+      # Enable ACP capture
+      original = Application.get_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+
+      # Record via EventStore (raw row)
+      {:ok, _msg} =
+        KiroCockpit.EventStore.record_acp_message(
+          "agent_to_client",
+          payload,
+          session_id: session_id
+        )
+
+      # Record via BronzeAcp (correlation row)
+      :ok =
+        KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_response(
+          session_id,
+          "integration-agent",
+          payload,
+          rpc_id: "42"
+        )
+
+      # Restore config
+      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, original)
+
+      # Verify raw_acp_message row exists
+      raw_msgs = KiroCockpit.EventStore.list_acp_messages(session_id)
+      assert length(raw_msgs) >= 1
+      first_raw = hd(raw_msgs)
+      assert first_raw.direction == "agent_to_client"
+      assert first_raw.message_type == "response"
+
+      # Verify swarm_event acp_* row exists
+      acp_events = KiroCockpit.Swarm.DataPipeline.BronzeAcp.list_acp_events(session_id)
+      assert length(acp_events) >= 1
+      first_acp = hd(acp_events)
+      assert first_acp.event_type == "acp_response"
+    end
+
+    test "inbound ACP notification creates both raw_acp_message and swarm_event acp rows" do
+      session_id = "sess_bronze_notif_#{System.unique_integer([:positive])}"
+
+      payload = %{
+        "jsonrpc" => "2.0",
+        "method" => "session/update",
+        "params" => %{"delta" => "text"}
+      }
+
+      # Enable ACP capture
+      original = Application.get_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, true)
+
+      # Record via EventStore (raw row)
+      {:ok, _msg} =
+        KiroCockpit.EventStore.record_acp_message(
+          "agent_to_client",
+          payload,
+          session_id: session_id
+        )
+
+      # Record via BronzeAcp (correlation row)
+      :ok =
+        KiroCockpit.Swarm.DataPipeline.BronzeAcp.record_acp_notification(
+          session_id,
+          "integration-agent",
+          payload,
+          method: "session/update",
+          direction: :agent_to_client
+        )
+
+      # Restore config
+      Application.put_env(:kiro_cockpit, :bronze_acp_capture_enabled, original)
+
+      # Verify raw_acp_message row exists
+      raw_msgs = KiroCockpit.EventStore.list_acp_messages(session_id)
+      assert length(raw_msgs) >= 1
+      first_raw = hd(raw_msgs)
+      assert first_raw.direction == "agent_to_client"
+      assert first_raw.message_type == "notification"
+
+      # Verify swarm_event acp_* row exists
+      acp_events = KiroCockpit.Swarm.DataPipeline.BronzeAcp.list_acp_events(session_id)
+      assert length(acp_events) >= 1
+      first_acp = hd(acp_events)
+      assert first_acp.event_type == "acp_notification"
     end
   end
 end

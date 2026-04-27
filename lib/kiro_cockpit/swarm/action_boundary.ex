@@ -174,9 +174,9 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
         _ = hm.run(event_for_executor, post_hooks, ctx, :post)
 
         # Bronze Phase 3: Record action_after with result (§35)
-        # This captures successful action completion with result status
+        # Pass actual executor result shape so Bronze captures error status correctly.
         if DataPipeline.action_capture_enabled?() do
-          DataPipeline.record_action_after(event_for_executor, {:ok, result}, ctx)
+          DataPipeline.record_action_after(event_for_executor, bronze_result(result), ctx)
         end
 
         {:ok, result}
@@ -210,6 +210,14 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       end
     end)
   end
+
+  # Normalize executor result for Bronze capture.
+  # If the executor returned {:error, _}, Bronze result_status must be
+  # :error, not :ok. The boundary itself still returns {:ok, result}
+  # because it didn't block — but Bronze records the executor truth.
+  defp bronze_result({:ok, _} = result), do: result
+  defp bronze_result({:error, _} = result), do: result
+  defp bronze_result(other), do: {:ok, other}
 
   # Prepare context for executor based on function arity.
   # For arity-0: merge hook messages into event metadata so they persist in traces.
@@ -534,37 +542,47 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   @spec run_lifecycle_post_hooks(atom(), keyword()) :: :ok
   def run_lifecycle_post_hooks(action, opts) when is_atom(action) do
     if boundary_enabled?(opts) do
-      hm = Keyword.get(opts, :hook_manager_module, HookManager)
-      tm = Keyword.get(opts, :task_manager_module, TaskManager)
-      staleness_mod = Keyword.get(opts, :staleness_module, Staleness)
-
-      event = build_event(action, opts, tm)
-      ctx = build_ctx(opts, event, staleness_mod, tm)
-      post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
-
-      # Bronze Phase 3: Record lifecycle action_before for completeness (§35)
-      if DataPipeline.action_capture_enabled?() do
-        DataPipeline.record_action_before(event, Map.put(ctx, :lifecycle, true))
-      end
-
-      result = hm.run(event, post_hooks, ctx, :post)
-
-      # Bronze Phase 3: Record lifecycle action_after for completeness (§35)
-      # Lifecycle actions always succeed (they've already happened)
-      if DataPipeline.action_capture_enabled?() do
-        normalized_result =
-          case result do
-            {:ok, _evt, _msgs} -> {:ok, :lifecycle_completed}
-            {:blocked, _evt, _reason, _msgs} -> {:blocked, "post-hook blocked", []}
-            _ -> {:ok, :lifecycle_completed}
-          end
-
-        DataPipeline.record_action_after(event, normalized_result, Map.put(ctx, :lifecycle, true))
-      end
+      do_run_lifecycle_post_hooks(action, opts)
     end
 
     :ok
   rescue
     _ -> :ok
   end
+
+  defp do_run_lifecycle_post_hooks(action, opts) do
+    hm = Keyword.get(opts, :hook_manager_module, HookManager)
+    tm = Keyword.get(opts, :task_manager_module, TaskManager)
+    staleness_mod = Keyword.get(opts, :staleness_module, Staleness)
+
+    event = build_event(action, opts, tm)
+    ctx = build_ctx(opts, event, staleness_mod, tm)
+    post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
+
+    record_lifecycle_before(event, ctx)
+
+    result = hm.run(event, post_hooks, ctx, :post)
+
+    record_lifecycle_after(event, result, ctx)
+  end
+
+  defp record_lifecycle_before(event, ctx) do
+    if DataPipeline.action_capture_enabled?() do
+      DataPipeline.record_action_before(event, Map.put(ctx, :lifecycle, true))
+    end
+  end
+
+  defp record_lifecycle_after(event, result, ctx) do
+    if DataPipeline.action_capture_enabled?() do
+      normalized_result = normalize_lifecycle_result(result)
+      DataPipeline.record_action_after(event, normalized_result, Map.put(ctx, :lifecycle, true))
+    end
+  end
+
+  defp normalize_lifecycle_result({:ok, _evt, _msgs}), do: {:ok, :lifecycle_completed}
+
+  defp normalize_lifecycle_result({:blocked, _evt, _reason, _msgs}),
+    do: {:blocked, "post-hook blocked", []}
+
+  defp normalize_lifecycle_result(_), do: {:ok, :lifecycle_completed}
 end

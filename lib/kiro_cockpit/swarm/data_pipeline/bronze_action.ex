@@ -323,22 +323,20 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAction do
     end
   end
 
-  # Safely persist with error handling (fail-closed)
+  # Safely persist with error handling (implicit try per Credo).
   defp persist_safely(attrs, event, event_type) do
-    try do
-      case Events.create_event(attrs) do
-        {:ok, _} ->
-          :ok
+    case Events.create_event(attrs) do
+      {:ok, _} ->
+        :ok
 
-        {:error, changeset} ->
-          emit_persistence_error(event_type, event, changeset)
-          :ok
-      end
-    rescue
-      exception ->
-        emit_persistence_error(event_type, event, exception)
+      {:error, changeset} ->
+        emit_persistence_error(event_type, event, changeset)
         :ok
     end
+  rescue
+    exception ->
+      emit_persistence_error(event_type, event, exception)
+      :ok
   end
 
   # Emit telemetry for persistence errors.

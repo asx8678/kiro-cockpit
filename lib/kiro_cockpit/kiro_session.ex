@@ -94,6 +94,7 @@ defmodule KiroCockpit.KiroSession do
   alias KiroCockpit.KiroSession.StreamEvent
   alias KiroCockpit.KiroSession.TerminalManager
   alias KiroCockpit.Swarm.ActionBoundary
+  alias KiroCockpit.Swarm.DataPipeline
   alias KiroCockpit.Telemetry
 
   # ACP protocol defaults per kiro-acp-instructions.md
@@ -1592,6 +1593,7 @@ defmodule KiroCockpit.KiroSession do
   defp persist_raw_outbound(state, payload) when is_map(payload) do
     method = Map.get(payload, "method")
 
+    # Raw ACP row (EventStore)
     try do
       EventStore.record_acp_message("client_to_agent", payload, session_id: state.session_id)
     rescue
@@ -1601,6 +1603,9 @@ defmodule KiroCockpit.KiroSession do
             " (#{method}): #{Exception.message(e)}"
         end)
     end
+
+    # Bronze ACP event with session/agent/plan correlation (§35 Phase 3)
+    persist_bronze_acp(state, payload, :client_to_agent)
 
     :ok
   end
@@ -1614,6 +1619,7 @@ defmodule KiroCockpit.KiroSession do
        when not is_nil(id) do
     payload = %{"jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params}
 
+    # Raw ACP row (EventStore)
     try do
       EventStore.record_acp_message("agent_to_client", payload, session_id: state.session_id)
     rescue
@@ -1624,6 +1630,9 @@ defmodule KiroCockpit.KiroSession do
         end)
     end
 
+    # Bronze ACP event with session/agent/plan correlation (§35 Phase 3)
+    persist_bronze_acp(state, payload, :agent_to_client)
+
     :ok
   end
 
@@ -1631,6 +1640,7 @@ defmodule KiroCockpit.KiroSession do
   defp persist_inbound(state, %{method: method, params: params}) do
     payload = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
 
+    # Raw ACP row (EventStore)
     try do
       EventStore.record_acp_message("agent_to_client", payload, session_id: state.session_id)
     rescue
@@ -1641,10 +1651,79 @@ defmodule KiroCockpit.KiroSession do
         end)
     end
 
+    # Bronze ACP event with session/agent/plan correlation (§35 Phase 3)
+    persist_bronze_acp(state, payload, :agent_to_client)
+
     :ok
   end
 
   defp persist_inbound(_state, _msg), do: :ok
+
+  # -- Bronze ACP capture alongside raw EventStore persistence --------------
+
+  # Classify JSON-RPC payload shape and call the appropriate BronzeAcp
+  # record function. Includes session_id, agent_id, and plan/task
+  # correlation where available from KiroSession state.
+  defp persist_bronze_acp(state, payload, direction) do
+    unless state.persist_messages == false do
+      if DataPipeline.acp_capture_enabled?() do
+        do_persist_bronze_acp(state, payload, direction)
+      end
+    end
+  end
+
+  defp do_persist_bronze_acp(state, payload, direction) do
+    session_id = state.session_id
+    agent_id = state.swarm_agent_id
+    plan_id = state.swarm_plan_id
+
+    base_opts =
+      [
+        plan_id: plan_id,
+        direction: direction
+      ]
+      |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+
+    message_type = EventStore.classify_message_type(payload)
+    method = EventStore.extract_method(payload)
+    rpc_id = EventStore.normalize_rpc_id(payload)
+
+    opts = Keyword.merge(base_opts, method: method, rpc_id: rpc_id)
+
+    case {direction, message_type} do
+      {:client_to_agent, "request"} ->
+        DataPipeline.record_acp_request(session_id, agent_id, payload, opts)
+
+      {:client_to_agent, "notification"} ->
+        DataPipeline.record_acp_notification(session_id, agent_id, payload, opts)
+
+      {:agent_to_client, "request"} ->
+        DataPipeline.record_acp_request(session_id, agent_id, payload, opts)
+
+      {:agent_to_client, "response"} ->
+        DataPipeline.record_acp_response(session_id, agent_id, payload, opts)
+
+      {:agent_to_client, "error"} ->
+        DataPipeline.record_acp_response(session_id, agent_id, payload, opts)
+
+      {:agent_to_client, "notification"} ->
+        DataPipeline.record_acp_notification(session_id, agent_id, payload, opts)
+
+      _direction_and_type ->
+        # "unknown" or unclassifiable — record as generic acp_update
+        DataPipeline.record_acp_update(%{
+          session_id: session_id,
+          agent_id: agent_id,
+          payload: payload,
+          event_type: "acp_update",
+          direction: direction
+        })
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
 
   # -- Crash dump (§12.9) --------------------------------------------------
 

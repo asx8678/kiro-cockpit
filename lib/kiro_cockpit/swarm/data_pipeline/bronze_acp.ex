@@ -70,8 +70,16 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
   """
   @spec record_acp_update(map()) :: :ok
   def record_acp_update(attrs) when is_map(attrs) do
-    attrs = normalize_attrs(attrs)
+    case normalize_attrs(attrs) do
+      nil ->
+        :ok
 
+      attrs ->
+        do_record_acp_update(attrs)
+    end
+  end
+
+  defp do_record_acp_update(attrs) do
     event_type = Map.get(attrs, :event_type, "acp_update")
     payload = build_payload_summary(attrs)
     raw_payload = build_raw_payload_summary(attrs)
@@ -236,30 +244,50 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
 
   # -- Internal helpers ------------------------------------------------------
 
-  # Normalize input attributes
+  # Normalize input attributes; returns nil when mandatory IDs are missing.
   defp normalize_attrs(attrs) do
-    attrs
-    |> ensure_string_session_id()
-    |> ensure_string_agent_id()
-    |> extract_method_from_payload()
-    |> extract_rpc_id_from_payload()
+    case ensure_string_session_id(attrs) do
+      nil ->
+        nil
+
+      attrs ->
+        case ensure_string_agent_id(attrs) do
+          nil ->
+            nil
+
+          attrs ->
+            attrs
+            |> extract_method_from_payload()
+            |> extract_rpc_id_from_payload()
+        end
+    end
   end
 
-  # Ensure session_id is present
-  defp ensure_string_session_id(%{session_id: sid} = attrs) when is_binary(sid), do: attrs
+  # Ensure session_id is present — reject persistence for missing/empty
+  # values rather than inventing "unknown" (§35 critic fix #2).
+  defp ensure_string_session_id(%{session_id: sid} = attrs) when is_binary(sid) and sid != "",
+    do: attrs
 
-  defp ensure_string_session_id(%{session_id: sid} = attrs) when is_atom(sid),
+  defp ensure_string_session_id(%{session_id: sid} = attrs) when is_atom(sid) and not is_nil(sid),
     do: %{attrs | session_id: to_string(sid)}
 
-  defp ensure_string_session_id(attrs), do: Map.put(attrs, :session_id, "unknown")
+  defp ensure_string_session_id(attrs) do
+    emit_mandatory_id_error("session_id", attrs)
+    nil
+  end
 
-  # Ensure agent_id is present
-  defp ensure_string_agent_id(%{agent_id: aid} = attrs) when is_binary(aid), do: attrs
+  # Ensure agent_id is present — reject persistence for missing/empty
+  # values rather than inventing "unknown" (§35 critic fix #2).
+  defp ensure_string_agent_id(%{agent_id: aid} = attrs) when is_binary(aid) and aid != "",
+    do: attrs
 
-  defp ensure_string_agent_id(%{agent_id: aid} = attrs) when is_atom(aid),
+  defp ensure_string_agent_id(%{agent_id: aid} = attrs) when is_atom(aid) and not is_nil(aid),
     do: %{attrs | agent_id: to_string(aid)}
 
-  defp ensure_string_agent_id(attrs), do: Map.put(attrs, :agent_id, "unknown")
+  defp ensure_string_agent_id(attrs) do
+    emit_mandatory_id_error("agent_id", attrs)
+    nil
+  end
 
   # Extract method from payload if not explicitly provided
   defp extract_method_from_payload(%{method: method} = attrs) when is_binary(method), do: attrs
@@ -417,22 +445,20 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
     end
   end
 
-  # Safely persist with error handling
+  # Safely persist with error handling (implicit try per Credo).
   defp persist_safely(attrs, original_attrs, event_type) do
-    try do
-      case Events.create_event(attrs) do
-        {:ok, _} ->
-          :ok
+    case Events.create_event(attrs) do
+      {:ok, _} ->
+        :ok
 
-        {:error, changeset} ->
-          emit_persistence_error(event_type, original_attrs, changeset)
-          :ok
-      end
-    rescue
-      exception ->
-        emit_persistence_error(event_type, original_attrs, exception)
+      {:error, changeset} ->
+        emit_persistence_error(event_type, original_attrs, changeset)
         :ok
     end
+  rescue
+    exception ->
+      emit_persistence_error(event_type, original_attrs, exception)
+      :ok
   end
 
   # Emit telemetry for persistence errors.
@@ -456,5 +482,22 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcp do
   # Check if full payload capture is enabled globally
   defp full_payload_capture_enabled? do
     Application.get_env(:kiro_cockpit, :bronze_full_payload_capture, false)
+  end
+
+  # Emit telemetry for missing mandatory correlation IDs.
+  # Records the diagnostic without fake IDs; preserves fail-safe :ok return.
+  defp emit_mandatory_id_error(field, attrs) do
+    telemetry_event = KiroCockpit.Telemetry.event(:bronze, :acp, :exception)
+
+    metadata = %{
+      event_type: Map.get(attrs, :event_type, "acp_update"),
+      missing_field: field,
+      session_id: Map.get(attrs, :session_id),
+      agent_id: Map.get(attrs, :agent_id),
+      error: "mandatory #{field} is missing or empty",
+      persistence_error: true
+    }
+
+    KiroCockpit.Telemetry.execute(telemetry_event, %{count: 1}, metadata)
   end
 end
