@@ -819,11 +819,22 @@ defmodule KiroCockpit.KiroSession do
   end
 
   def handle_call({:cancel, _opts}, _from, %{turn_status: :running} = state) do
-    # Send the ACP cancel notification — fire-and-forget per spec.
-    # Local state flips immediately so callers see :cancel_requested.
+    # Route egress through ActionBoundary.run_egress/3 (kiro-bih).
+    # cancel is EXEMPT from pre-hook blocking (safety mechanism), but
+    # Bronze action_before/action_after records are still emitted with
+    # full session/plan/task/agent correlation per §27.11 inv. 7.
     params = %{"sessionId" => state.session_id}
-    :ok = PortProcess.notify(state.port_process, "session/cancel", params)
 
+    egress_result =
+      run_egress_if_hooks(state, :acp_egress_cancel, [method: "session/cancel"], fn ->
+        PortProcess.notify(state.port_process, "session/cancel", params)
+      end)
+
+    # cancel is exempt — egress_result is always {:ok, _} when hooks enabled.
+    # When hooks disabled, the notification is still sent.
+    _ = egress_result
+
+    # Local state flips immediately so callers see :cancel_requested.
     {:reply, :ok, %{state | turn_status: :cancel_requested}}
   end
 
@@ -858,7 +869,17 @@ defmodule KiroCockpit.KiroSession do
   @impl GenServer
   def handle_call({:respond, request_id, result}, _from, %{port_process: port_pid} = state)
       when is_pid(port_pid) do
-    :ok = PortProcess.respond(port_pid, request_id, result)
+    # Route egress through ActionBoundary.run_egress/3 (kiro-bih).
+    # respond is EXEMPT from pre-hook blocking (protocol completion —
+    # the agent is waiting for a response), but Bronze action lifecycle
+    # records are still emitted with correlation per §27.11 inv. 7.
+    egress_result =
+      run_egress_if_hooks(state, :acp_egress_respond, [method: "callback_response"], fn ->
+        PortProcess.respond(port_pid, request_id, result)
+      end)
+
+    # respond is exempt — always {:ok, _} when hooks enabled.
+    _ = egress_result
     {:reply, :ok, state}
   end
 
@@ -873,7 +894,20 @@ defmodule KiroCockpit.KiroSession do
         %{port_process: port_pid} = state
       )
       when is_pid(port_pid) do
-    :ok = PortProcess.respond_error(port_pid, request_id, code, message, data)
+    # Route egress through ActionBoundary.run_egress/3 (kiro-bih).
+    # respond_error is EXEMPT from pre-hook blocking (protocol completion —
+    # the agent is waiting for a response), but Bronze action lifecycle
+    # records are still emitted with correlation per §27.11 inv. 7.
+    egress_result =
+      run_egress_if_hooks(
+        state,
+        :acp_egress_respond_error,
+        [method: "callback_response_error"],
+        fn -> PortProcess.respond_error(port_pid, request_id, code, message, data) end
+      )
+
+    # respond_error is exempt — always {:ok, _} when hooks enabled.
+    _ = egress_result
     {:reply, :ok, state}
   end
 
@@ -884,7 +918,18 @@ defmodule KiroCockpit.KiroSession do
   @impl GenServer
   def handle_cast({:notify, method, params}, %{port_process: port_pid} = state)
       when is_pid(port_pid) do
-    :ok = PortProcess.notify(port_pid, method, params)
+    # Route egress through ActionBoundary.run_egress/3 (kiro-bih).
+    # notify is NON-EXEMPT — pre-hooks may block it. When blocked, the
+    # notification is dropped (fire-and-forget cast semantics), but the
+    # blocked attempt is recorded in Bronze per §27.11 inv. 7.
+    case run_egress_if_hooks(state, :acp_egress_notify, [method: method], fn ->
+           PortProcess.notify(port_pid, method, params)
+         end) do
+      {:ok, _} -> :ok
+      # dropped, Bronze records it
+      {:error, {:swarm_blocked, _reason, _messages}} -> :ok
+    end
+
     {:noreply, state}
   end
 
@@ -1124,6 +1169,56 @@ defmodule KiroCockpit.KiroSession do
       {:error, {:swarm_blocked, reason, messages}} ->
         {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
     end
+  end
+
+  # -- ACP egress boundary routing (kiro-bih) --------------------------------
+  #
+  # Routes ACP egress actions (cancel, respond, respond_error, notify)
+  # through ActionBoundary.run_egress/3 when swarm_hooks is enabled.
+  # When disabled, the egress executes directly (backward compatible).
+  #
+  # Exempt actions (cancel, respond, respond_error) skip pre-hook gating
+  # but still emit Bronze audit records. Non-exempt actions (notify) run
+  # through the full boundary where pre-hooks can block.
+
+  defp run_egress_if_hooks(state, action, extra, fun)
+       when is_list(extra) and is_function(fun, 0) do
+    if state.swarm_hooks do
+      boundary_opts = egress_boundary_opts(state, extra)
+      state.swarm_hooks_module.run_egress(action, boundary_opts, fun)
+    else
+      # Hooks disabled — execute directly, skip boundary entirely.
+      {:ok, fun.()}
+    end
+  end
+
+  # Build boundary options for ACP egress actions.
+  # Egress actions are client→agent messages; permission_level is :read
+  # because they don't directly modify the environment (the agent decides
+  # how to act on them). Includes the ACP method in metadata for audit.
+  defp egress_boundary_opts(state, extra) do
+    plan_mode = state.plan_mode || derive_plan_mode([], state)
+
+    base =
+      [
+        session_id: state.session_id,
+        agent_id: state.swarm_agent_id,
+        plan_id: state.swarm_plan_id,
+        permission_level: :read,
+        project_dir: state.cwd,
+        plan_mode: plan_mode,
+        swarm_ctx: state.swarm_ctx
+      ]
+
+    # Merge extra keyword pairs (e.g. method: "session/cancel")
+    # into metadata so they appear in Bronze records.
+    metadata =
+      extra
+      |> Enum.into(%{})
+      |> Map.put(:egress_type, :acp_egress)
+
+    base
+    |> Keyword.put(:metadata, metadata)
   end
 
   defp truthy_lookup(map, key) when is_map(map) do
