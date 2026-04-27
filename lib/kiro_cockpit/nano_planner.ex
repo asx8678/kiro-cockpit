@@ -137,8 +137,11 @@ defmodule KiroCockpit.NanoPlanner do
   defp run_boundary_if_enabled(action, boundary_opts, enabled?, fun) do
     if enabled? do
       case ActionBoundary.run(action, boundary_opts, fun) do
-        {:ok, result} -> result
-        {:error, {:swarm_blocked, reason, messages}} -> {:error, {:swarm_blocked, reason, messages}}
+        {:ok, result} ->
+          result
+
+        {:error, {:swarm_blocked, reason, messages}} ->
+          {:error, {:swarm_blocked, reason, messages}}
       end
     else
       fun.()

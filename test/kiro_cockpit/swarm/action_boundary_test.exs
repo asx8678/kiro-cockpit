@@ -1,5 +1,7 @@
 defmodule KiroCockpit.Swarm.ActionBoundaryTest do
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:bronze_action_capture_enabled)
+  # which would race with concurrent async tests that also toggle that flag.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.Swarm.{ActionBoundary, Hook, HookResult}
   alias KiroCockpit.Swarm.Tasks.TaskManager
@@ -36,13 +38,12 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
     end
   end
 
-  # -- Exception-safe Application env mutation for async test isolation ------
+  # -- Exception-safe Application env mutation for test isolation ---------------
   # Concurrent tests (bronze_section35_regression_test, bronze_action_boundary_integration_test)
   # temporarily set :bronze_action_capture_enabled to false via Application.put_env.
-  # Since this module is async: true, those global env mutations can race with
-  # our ActionBoundary.run calls, causing action_capture_enabled?() to return false
-  # and silently skipping action_before/action_blocked/event persistence.
-  # This wrapper forces the flag to true for tests that assert Bronze events.
+  # Now that this module is async: false, global env mutations are serialized,
+  # but we still use this wrapper to guarantee the flag is true for tests that
+  # assert Bronze events (defence-in-depth against future regressions).
   defp with_bronze_capture(fun) do
     key = :bronze_action_capture_enabled
     original = Application.get_env(:kiro_cockpit, key, true)

@@ -17,7 +17,9 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeSection35RegressionTest do
     * Persistence errors never crash the caller.
   """
 
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:bronze_action_capture_enabled,
+  # :bronze_acp_capture_enabled) which would race with concurrent async tests.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.Swarm.{DataPipeline, DataPipeline.BronzeAction, DataPipeline.BronzeAcp, Event}
 

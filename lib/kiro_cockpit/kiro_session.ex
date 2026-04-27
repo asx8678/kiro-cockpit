@@ -1118,7 +1118,9 @@ defmodule KiroCockpit.KiroSession do
   # prompt and callback boundary entry points.
   defp run_hooks_if_enabled(hooks_module, action, boundary_opts, fun, state) do
     case hooks_module.run(action, boundary_opts, fun) do
-      {:ok, {:noreply, new_state}} -> {:noreply, new_state}
+      {:ok, {:noreply, new_state}} ->
+        {:noreply, new_state}
+
       {:error, {:swarm_blocked, reason, messages}} ->
         {:reply, {:error, {:swarm_blocked, reason, messages}}, state}
     end

@@ -11,7 +11,9 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeActionTest do
     * Fail-closed persistence (errors don't crash)
   """
 
-  use KiroCockpit.DataCase, async: true
+  # async: false — tests mutate global Application env (:bronze_full_payload_capture)
+  # which would race with concurrent async tests.
+  use KiroCockpit.DataCase, async: false
 
   alias KiroCockpit.Swarm.{DataPipeline.BronzeAction, Event, Events}
 
