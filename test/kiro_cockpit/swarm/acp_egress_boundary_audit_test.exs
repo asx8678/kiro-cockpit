@@ -1,6 +1,6 @@
 defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
   @moduledoc """
-  Tests for ACP egress boundary audit (kiro-bih).
+  Tests for ACP egress boundary audit (kiro-bih, kiro-fmn).
 
   Verifies that ActionBoundary.run_egress/3:
 
@@ -16,7 +16,10 @@ defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
     * Codifies exemptions in @egress_exempt_actions and exposes them via
       egress_exempt?/1 and egress_exempt_actions/0.
 
-    * When boundary is disabled, egress executes directly without audit.
+    * kiro-fmn: When boundary is disabled, non-exempt egress fails closed
+      with {:error, {:swarm_boundary_disabled, action}} and does NOT execute.
+      Exempt egress still executes with mandatory Bronze audit regardless
+      of :bronze_action_capture_enabled flag.
   """
 
   # async: false — tests toggle global Application env (:bronze_action_capture_enabled)
@@ -428,31 +431,64 @@ defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
 
   # -- Boundary disabled ----------------------------------------------------
 
-  describe "run_egress/3 — boundary disabled" do
-    test "executes fun directly when boundary disabled via opts" do
-      ref = make_ref()
+  describe "run_egress/3 — boundary disabled (kiro-fmn)" do
+    test "non-exempt egress fails closed when boundary disabled via opts" do
+      {:ok, exec_tracker} = Agent.start_link(fn -> false end)
 
       result =
         ActionBoundary.run_egress(
           :acp_egress_notify,
           [enabled: false],
-          fn -> {:direct, ref} end
+          fn ->
+            Agent.update(exec_tracker, fn _ -> true end)
+            :should_not_run
+          end
         )
 
-      assert {:ok, {:direct, ^ref}} = result
+      # kiro-fmn: non-exempt egress must fail closed when boundary disabled
+      assert {:error, {:swarm_boundary_disabled, :acp_egress_notify}} = result
+
+      # The executor fun must NOT have been called
+      refute Agent.get(exec_tracker, & &1),
+             "executor should not have run for disabled non-exempt egress"
+
+      Agent.stop(exec_tracker)
     end
 
-    test "exempt egress executes directly when boundary disabled" do
-      ref = make_ref()
+    test "exempt egress executes with Bronze audit when boundary disabled (kiro-fmn)" do
+      with_bronze_capture(fn ->
+        session_id = "egress-disabled-exempt-#{System.unique_integer([:positive])}"
+        agent_id = "egress-test-agent"
+        ref = make_ref()
 
-      result =
-        ActionBoundary.run_egress(
-          :acp_egress_cancel,
-          [enabled: false],
-          fn -> {:direct, ref} end
-        )
+        result =
+          ActionBoundary.run_egress(
+            :acp_egress_cancel,
+            [
+              enabled: false,
+              session_id: session_id,
+              agent_id: agent_id,
+              pre_hooks: [],
+              post_hooks: []
+            ],
+            fn -> {:direct, ref} end
+          )
 
-      assert {:ok, {:direct, ^ref}} = result
+        # kiro-fmn: exempt egress still executes when boundary disabled
+        assert {:ok, {:direct, ^ref}} = result
+
+        # kiro-fmn: Bronze action_before/action_after are mandatory regardless
+        # of :bronze_action_capture_enabled flag
+        actions = BronzeAction.list_actions(session_id)
+        before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+        after_events = Enum.filter(actions, &(&1.event_type == "action_after"))
+
+        assert length(before_events) >= 1,
+               "expected action_before for exempt egress when boundary disabled"
+
+        assert length(after_events) >= 1,
+               "expected action_after for exempt egress when boundary disabled"
+      end)
     end
   end
 
@@ -732,6 +768,123 @@ defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
     end
   end
 
+  # -- kiro-fmn: Egress non-bypassable enforcement ---------------------------
+  #
+  # Proves that:
+  #   1. Real ActionBoundary with app config disabled but session hooks true
+  #      still persists egress Bronze.
+  #   2. Direct run_egress disabled non-exempt returns
+  #      {:error, {:swarm_boundary_disabled, :acp_egress_notify}} and does not execute.
+  #   3. Exempt egress persists Bronze when :bronze_action_capture_enabled=false.
+
+  describe "kiro-fmn: non-bypassable egress enforcement" do
+    test "session hooks true persists egress Bronze even when app config disabled" do
+      # Simulate: app config has :swarm_action_hooks_enabled = false (test default),
+      # but session passes enabled: true (state.swarm_hooks = true).
+      # Real ActionBoundary should honor the explicit enabled: true opt.
+      with_bronze_capture(fn ->
+        session_id = "fmn-hooks-true-#{System.unique_integer([:positive])}"
+        agent_id = "fmn-test-agent"
+
+        # App config is false (test default), but session passes enabled: true
+        original = Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled, false)
+        Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, false)
+
+        try do
+          result =
+            ActionBoundary.run_egress(
+              :acp_egress_cancel,
+              [
+                enabled: true,
+                session_id: session_id,
+                agent_id: agent_id,
+                pre_hooks: [],
+                post_hooks: []
+              ],
+              fn -> :ok end
+            )
+
+          assert {:ok, :ok} = result
+
+          # Bronze must be persisted — enabled: true means boundary is active
+          actions = BronzeAction.list_actions(session_id)
+          before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+          after_events = Enum.filter(actions, &(&1.event_type == "action_after"))
+
+          assert length(before_events) >= 1, "expected action_before when session hooks true"
+          assert length(after_events) >= 1, "expected action_after when session hooks true"
+        after
+          Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, original)
+        end
+      end)
+    end
+
+    test "disabled non-exempt egress returns swarm_boundary_disabled and does not execute" do
+      # Direct run_egress with enabled: false for non-exempt action.
+      # Must fail closed — return error and never call the executor.
+      {:ok, exec_counter} = Agent.start_link(fn -> 0 end)
+
+      result =
+        ActionBoundary.run_egress(
+          :acp_egress_notify,
+          [enabled: false],
+          fn ->
+            Agent.update(exec_counter, &(&1 + 1))
+            :should_not_run
+          end
+        )
+
+      assert {:error, {:swarm_boundary_disabled, :acp_egress_notify}} = result
+
+      assert Agent.get(exec_counter, & &1) == 0,
+             "executor must not have run for disabled non-exempt egress"
+
+      Agent.stop(exec_counter)
+    end
+
+    test "exempt egress persists Bronze when bronze_action_capture_enabled=false" do
+      # kiro-fmn: Removed DataPipeline.action_capture_enabled? gates from
+      # run_egress_audit/3, so exempt action_before/action_after Bronze capture
+      # is mandatory regardless of the flag.
+      session_id = "fmn-exempt-bronze-#{System.unique_integer([:positive])}"
+      agent_id = "fmn-test-agent"
+
+      # Explicitly disable the action capture flag
+      original = Application.get_env(:kiro_cockpit, :bronze_action_capture_enabled, true)
+      Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, false)
+
+      try do
+        result =
+          ActionBoundary.run_egress(
+            :acp_egress_cancel,
+            [
+              enabled: true,
+              session_id: session_id,
+              agent_id: agent_id,
+              pre_hooks: [],
+              post_hooks: []
+            ],
+            fn -> :ok end
+          )
+
+        assert {:ok, :ok} = result
+
+        # Bronze must be persisted even though :bronze_action_capture_enabled = false
+        actions = BronzeAction.list_actions(session_id)
+        before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+        after_events = Enum.filter(actions, &(&1.event_type == "action_after"))
+
+        assert length(before_events) >= 1,
+               "expected action_before for exempt egress even with bronze_action_capture_enabled=false"
+
+        assert length(after_events) >= 1,
+               "expected action_after for exempt egress even with bronze_action_capture_enabled=false"
+      after
+        Application.put_env(:kiro_cockpit, :bronze_action_capture_enabled, original)
+      end
+    end
+  end
+
   # -- KiroSession integration (kiro-bih) --------------------------------------
   #
   # Proves that KiroSession routes egress actions through
@@ -892,6 +1045,188 @@ defmodule KiroCockpit.Swarm.AcpEgressBoundaryAuditTest do
       assert ActionBoundary.egress_exempt?(:acp_egress_respond)
       assert ActionBoundary.egress_exempt?(:acp_egress_respond_error)
       refute ActionBoundary.egress_exempt?(:acp_egress_notify)
+    end
+
+    test "KiroSession egress opts include enabled: true when swarm_hooks is true" do
+      # Regression guard: proves egress_boundary_opts propagates
+      # enabled: state.swarm_hooks correctly (kiro-fmn).
+      EgressSpy.start_link()
+      EgressSpy.reset()
+
+      elixir = System.find_executable("elixir") || flunk("elixir not on PATH")
+
+      ebin_dirs =
+        Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
+
+      fake_agent_entry = ~s|KiroCockpit.Test.Acp.FakeAgent.main()|
+
+      args =
+        Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+          ["-e", fake_agent_entry]
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          env: [{"FAKE_ACP_SCENARIO", "cancel"}],
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: false,
+          swarm_hooks: true,
+          swarm_hooks_module: EgressSpy
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+      assert {:ok, _result} = KiroSession.new_session(session, File.cwd!())
+
+      # Start a prompt to set turn_status to :running
+      task = Task.async(fn -> KiroSession.prompt(session, "long-running") end)
+
+      # Wait for the initial chunk so the agent is in its blocking read
+      assert_receive {:kiro_stream_event, ^session, _}, 2_000
+
+      # Cancel — routes through EgressSpy
+      :ok = KiroSession.cancel(session)
+
+      # Let the prompt complete
+      Task.await(task, 5_000)
+
+      calls = EgressSpy.get_calls()
+      egress_calls = Enum.filter(calls, &match?({:run_egress, _, _}, &1))
+      assert length(egress_calls) >= 1, "expected run_egress call, got: #{inspect(calls)}"
+
+      {_, _action, opts} = List.last(egress_calls)
+
+      assert Keyword.get(opts, :enabled) == true,
+             "egress opts must include enabled: true when swarm_hooks is true, " <>
+               "got: #{inspect(Keyword.get(opts, :enabled))}"
+
+      KiroSession.stop(session)
+    end
+
+    test "KiroSession egress opts include test_bypass: true when swarm_test_bypass is true" do
+      # Proves egress_boundary_opts propagates test_bypass from
+      # state.swarm_test_bypass so ActionBoundary.run_egress/3 can
+      # allow non-exempt egress in test env (kiro-fmn).
+      EgressSpy.start_link()
+      EgressSpy.reset()
+
+      elixir = System.find_executable("elixir") || flunk("elixir not on PATH")
+
+      ebin_dirs =
+        Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
+
+      fake_agent_entry = ~s|KiroCockpit.Test.Acp.FakeAgent.main()|
+
+      args =
+        Enum.flat_map(ebin_dirs, fn dir -> ["-pa", dir] end) ++
+          ["-e", fake_agent_entry]
+
+      {:ok, session} =
+        KiroSession.start_link(
+          executable: elixir,
+          args: args,
+          env: [{"FAKE_ACP_SCENARIO", "cancel"}],
+          subscriber: self(),
+          persist_messages: false,
+          auto_callbacks: false,
+          swarm_hooks: true,
+          swarm_hooks_module: EgressSpy,
+          test_bypass: true
+        )
+
+      assert {:ok, _} = KiroSession.initialize(session)
+      assert {:ok, _result} = KiroSession.new_session(session, File.cwd!())
+
+      # Start a prompt to set turn_status to :running
+      task = Task.async(fn -> KiroSession.prompt(session, "long-running") end)
+
+      # Wait for the initial chunk so the agent is in its blocking read
+      assert_receive {:kiro_stream_event, ^session, _}, 2_000
+
+      # Cancel — routes through EgressSpy
+      :ok = KiroSession.cancel(session)
+
+      # Let the prompt complete
+      Task.await(task, 5_000)
+
+      calls = EgressSpy.get_calls()
+      egress_calls = Enum.filter(calls, &match?({:run_egress, _, _}, &1))
+      assert length(egress_calls) >= 1, "expected run_egress call, got: #{inspect(calls)}"
+
+      {_, _action, opts} = List.last(egress_calls)
+
+      assert Keyword.get(opts, :test_bypass) == true,
+             "egress opts must include test_bypass: true when swarm_test_bypass is true, " <>
+               "got: #{inspect(Keyword.get(opts, :test_bypass))}"
+
+      KiroSession.stop(session)
+    end
+  end
+
+  describe "run_egress/3 — test_bypass (kiro-fmn)" do
+    test "test_bypass allows non-exempt egress when boundary disabled in test env" do
+      {:ok, exec_counter} = Agent.start_link(fn -> 0 end)
+
+      result =
+        ActionBoundary.run_egress(
+          :acp_egress_notify,
+          [enabled: false, test_bypass: true],
+          fn ->
+            Agent.update(exec_counter, &(&1 + 1))
+            :notified
+          end
+        )
+
+      assert {:ok, :notified} = result
+
+      assert Agent.get(exec_counter, & &1) == 1,
+             "executor should have run for test_bypass non-exempt egress"
+
+      Agent.stop(exec_counter)
+    end
+
+    test "test_bypass false still fails closed for non-exempt egress" do
+      {:ok, exec_counter} = Agent.start_link(fn -> 0 end)
+
+      result =
+        ActionBoundary.run_egress(
+          :acp_egress_notify,
+          [enabled: false, test_bypass: false],
+          fn ->
+            Agent.update(exec_counter, &(&1 + 1))
+            :should_not_run
+          end
+        )
+
+      assert {:error, {:swarm_boundary_disabled, :acp_egress_notify}} = result
+
+      assert Agent.get(exec_counter, & &1) == 0,
+             "executor must not have run when test_bypass is false"
+
+      Agent.stop(exec_counter)
+    end
+
+    test "test_bypass does not affect exempt egress when boundary disabled" do
+      # Exempt egress should always execute with Bronze audit regardless
+      # of test_bypass setting when boundary is disabled.
+      with_bronze_capture(fn ->
+        session_id = "fmn-tb-exempt-#{System.unique_integer([:positive])}"
+
+        _result =
+          ActionBoundary.run_egress(
+            :acp_egress_cancel,
+            [enabled: false, test_bypass: false, session_id: session_id, agent_id: "a"],
+            fn -> :cancel_sent end
+          )
+
+        # Exempt egress should still have Bronze audit
+        actions = BronzeAction.list_actions(session_id)
+        before_events = Enum.filter(actions, &(&1.event_type == "action_before"))
+
+        assert length(before_events) >= 1,
+               "exempt egress must persist Bronze even without test_bypass"
+      end)
     end
   end
 end

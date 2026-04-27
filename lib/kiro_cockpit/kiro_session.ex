@@ -962,16 +962,21 @@ defmodule KiroCockpit.KiroSession do
   @impl GenServer
   def handle_cast({:notify, method, params}, %{port_process: port_pid} = state)
       when is_pid(port_pid) do
-    # Route egress through ActionBoundary.run_egress/3 (kiro-bih).
+    # Route egress through ActionBoundary.run_egress/3 (kiro-bih, kiro-fmn).
     # notify is NON-EXEMPT — pre-hooks may block it. When blocked, the
     # notification is dropped (fire-and-forget cast semantics), but the
     # blocked attempt is recorded in Bronze per §27.11 inv. 7.
+    # kiro-fmn: when boundary is disabled and swarm_hooks is false, non-exempt
+    # egress fails closed — the notification is dropped (same semantics as
+    # a block, but the boundary returns {:swarm_boundary_disabled, action}).
     case run_egress_if_hooks(state, :acp_egress_notify, [method: method], fn ->
            PortProcess.notify(port_pid, method, params)
          end) do
       {:ok, _} -> :ok
       # dropped, Bronze records it
       {:error, {:swarm_blocked, _reason, _messages}} -> :ok
+      # kiro-fmn: boundary disabled for non-exempt egress — fail closed
+      {:error, {:swarm_boundary_disabled, _action}} -> :ok
     end
 
     {:noreply, state}
@@ -1255,25 +1260,23 @@ defmodule KiroCockpit.KiroSession do
     end
   end
 
-  # -- ACP egress boundary routing (kiro-bih) --------------------------------
+  # -- ACP egress boundary routing (kiro-bih, kiro-fmn) ---------------------
   #
-  # Routes ACP egress actions (cancel, respond, respond_error, notify)
-  # through ActionBoundary.run_egress/3 when swarm_hooks is enabled.
-  # When disabled, the egress executes directly (backward compatible).
+  # All ACP egress actions are routed through ActionBoundary.run_egress/3
+  # with enabled: state.swarm_hooks so the boundary decides enforcement.
   #
-  # Exempt actions (cancel, respond, respond_error) skip pre-hook gating
-  # but still emit Bronze audit records. Non-exempt actions (notify) run
-  # through the full boundary where pre-hooks can block.
+  # When swarm_hooks is true, the boundary enforces:
+  #   - Exempt actions (cancel, respond, respond_error) — execute with Bronze audit
+  #   - Non-exempt actions (notify) — full boundary pipeline (can be blocked)
+  #
+  # When swarm_hooks is false (enabled: false), the boundary fails closed
+  # for non-exempt egress and executes exempt egress with Bronze audit
+  # (kiro-fmn: non-bypassable enforcement for egress).
 
   defp run_egress_if_hooks(state, action, extra, fun)
        when is_list(extra) and is_function(fun, 0) do
-    if state.swarm_hooks do
-      boundary_opts = egress_boundary_opts(state, extra)
-      state.swarm_hooks_module.run_egress(action, boundary_opts, fun)
-    else
-      # Hooks disabled — execute directly, skip boundary entirely.
-      {:ok, fun.()}
-    end
+    boundary_opts = egress_boundary_opts(state, extra)
+    state.swarm_hooks_module.run_egress(action, boundary_opts, fun)
   end
 
   # Build boundary options for ACP egress actions.
@@ -1293,7 +1296,15 @@ defmodule KiroCockpit.KiroSession do
         permission_level: :read,
         project_dir: state.cwd,
         plan_mode: plan_mode,
-        swarm_ctx: state.swarm_ctx
+        swarm_ctx: state.swarm_ctx,
+        # kiro-fmn: pass session's swarm_hooks as enabled so the boundary
+        # enforces fail-closed for non-exempt egress even when app config
+        # has :swarm_action_hooks_enabled = false.
+        enabled: state.swarm_hooks,
+        # kiro-fmn: pass test_bypass so ActionBoundary.run_egress/3 can
+        # allow non-exempt egress in test env when boundary is disabled
+        # (mirrors the test_bypass_allowed? check in handle_disabled_boundary/3).
+        test_bypass: state.swarm_test_bypass
       ]
 
     extra_map = Enum.into(extra, %{})
