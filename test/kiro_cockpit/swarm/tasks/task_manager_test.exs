@@ -3,6 +3,7 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManagerTest do
 
   import Ecto.Query
 
+  alias KiroCockpit.Swarm.Events
   alias KiroCockpit.Swarm.Tasks.{Task, TaskManager}
 
   @valid_attrs %{
@@ -387,6 +388,121 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManagerTest do
 
     test "returns error for nonexistent task" do
       assert {:error, :not_found} = TaskManager.delete(Ecto.UUID.generate())
+    end
+  end
+
+  # -----------------------------------------------------------------
+  # Durable lifecycle audit (kiro-qvq)
+  # -----------------------------------------------------------------
+
+  describe "durable task lifecycle audit" do
+    test "create/1 writes the canonical lifecycle audit row in the same durable path" do
+      attrs = Map.merge(@valid_attrs, %{session_id: "audit_create_one"})
+
+      assert {:ok, task} = TaskManager.create(attrs)
+
+      assert [event] = Events.list_by_task(task.id)
+      assert event.event_type == "task_lifecycle"
+      assert event.phase == "lifecycle"
+      assert event.session_id == task.session_id
+      assert event.agent_id == task.owner_id
+      assert event.plan_id == task.plan_id
+      assert event.payload["action"] == "task_create"
+      assert event.payload["from_status"] == nil
+      assert event.payload["to_status"] == "pending"
+      assert event.hook_results == []
+    end
+
+    test "create_all/1 writes one lifecycle audit row per created task atomically" do
+      session_id = "audit_create_all"
+
+      attrs_list = [
+        Map.merge(@valid_attrs, %{session_id: session_id, sequence: 1, content: "Task 1"}),
+        Map.merge(@valid_attrs, %{session_id: session_id, sequence: 2, content: "Task 2"})
+      ]
+
+      assert {:ok, tasks} = TaskManager.create_all(attrs_list)
+
+      audited_task_ids =
+        session_id
+        |> Events.list_by_session()
+        |> Enum.filter(&(&1.event_type == "task_lifecycle"))
+        |> Enum.map(& &1.task_id)
+        |> Enum.sort()
+
+      assert audited_task_ids == tasks |> Enum.map(& &1.id) |> Enum.sort()
+    end
+
+    test "failed create_all/1 rolls back both tasks and lifecycle audit rows" do
+      session_id = "audit_create_all_rollback"
+
+      attrs_list = [
+        Map.merge(@valid_attrs, %{session_id: session_id, sequence: 1, content: "Task 1"}),
+        Map.merge(@valid_attrs, %{session_id: session_id, sequence: 2, content: ""})
+      ]
+
+      assert {:error, :transaction_failed} = TaskManager.create_all(attrs_list)
+      assert [] = TaskManager.list(session_id)
+      assert [] = Events.list_by_session(session_id)
+    end
+
+    test "state transitions write lifecycle audit rows with from/to status" do
+      attrs = Map.merge(@valid_attrs, %{session_id: "audit_transitions"})
+
+      assert {:ok, task} = TaskManager.create(attrs)
+      assert {:ok, activated} = TaskManager.activate(task.id)
+      assert {:ok, completed} = TaskManager.complete(task.id)
+
+      events = Events.list_by_task(task.id)
+
+      assert Enum.map(events, & &1.payload["action"]) == [
+               "task_create",
+               "task_activate",
+               "task_complete"
+             ]
+
+      activate_event = Enum.find(events, &(&1.payload["action"] == "task_activate"))
+      assert activate_event.payload["from_status"] == "pending"
+      assert activate_event.payload["to_status"] == "in_progress"
+      assert activate_event.payload["status"] == activated.status
+
+      complete_event = Enum.find(events, &(&1.payload["action"] == "task_complete"))
+      assert complete_event.payload["from_status"] == "in_progress"
+      assert complete_event.payload["to_status"] == "completed"
+      assert complete_event.payload["status"] == completed.status
+    end
+
+    test "block/1 and delete/1 write canonical lifecycle audit rows without relying on post-hooks" do
+      attrs = Map.merge(@valid_attrs, %{session_id: "audit_block_delete"})
+
+      assert {:ok, task} = TaskManager.create(attrs)
+      assert {:ok, _activated} = TaskManager.activate(task.id)
+      assert {:ok, _blocked} = TaskManager.block(task.id)
+      assert {:ok, reactivated} = TaskManager.activate(task.id)
+      assert {:ok, _deleted} = TaskManager.delete(reactivated.id)
+
+      actions =
+        task.id
+        |> Events.list_by_task()
+        |> Enum.map(& &1.payload["action"])
+
+      assert actions == [
+               "task_create",
+               "task_activate",
+               "task_block",
+               "task_activate",
+               "task_delete"
+             ]
+    end
+
+    test "invalid transitions write neither state change nor lifecycle audit row" do
+      attrs = Map.merge(@valid_attrs, %{session_id: "audit_invalid_transition"})
+
+      assert {:ok, task} = TaskManager.create(attrs)
+      assert {:error, %Ecto.Changeset{}} = TaskManager.complete(task.id)
+
+      assert [event] = Events.list_by_task(task.id)
+      assert event.payload["action"] == "task_create"
     end
   end
 

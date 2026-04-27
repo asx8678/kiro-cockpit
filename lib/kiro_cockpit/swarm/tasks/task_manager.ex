@@ -14,10 +14,11 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   ## Dual-write discipline (§6.3)
 
   All state transitions that could emit events use `Ecto.Multi` to
-  ensure canonical state and events are written atomically. For this
-  Phase 10 foundation, we persist task state changes; event emission
-  is a thin `Multi.insert` of an event row when the full event schema
-  lands in a later phase.
+  ensure canonical state and Bronze lifecycle audit rows are written
+  atomically. Post-hooks may enrich, notify, or write additional trace
+  rows after commit; they are deliberately not the source of durable
+  truth for task lifecycle audit. Canonical state and canonical audit
+  share fate in the same transaction.
 
   ## Execution lane
 
@@ -32,6 +33,7 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   alias Ecto.Multi
   alias KiroCockpit.Repo
   alias KiroCockpit.Swarm.ActionBoundary
+  alias KiroCockpit.Swarm.Events.SwarmEvent
   alias KiroCockpit.Swarm.Tasks.{Guidance, Task}
 
   # Dialyzer false positives: Ecto.Multi opacity and Repo.insert success-typing
@@ -63,6 +65,9 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
 
     Multi.new()
     |> Multi.insert(:task, changeset)
+    |> Multi.insert(:task_lifecycle_audit, fn %{task: task} ->
+      lifecycle_audit_changeset(:task_create, task, nil, task.status)
+    end)
     |> Repo.transaction()
     |> case do
       {:ok, %{task: task}} ->
@@ -92,7 +97,12 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
     |> Enum.with_index()
     |> Enum.reduce(Multi.new(), fn {attrs, idx}, multi ->
       changeset = Task.changeset(%Task{}, attrs)
-      Multi.insert(multi, {:task, idx}, changeset)
+
+      multi
+      |> Multi.insert({:task, idx}, changeset)
+      |> Multi.insert({:task_lifecycle_audit, idx}, fn %{{:task, ^idx} => task} ->
+        lifecycle_audit_changeset(:task_create, task, nil, task.status)
+      end)
     end)
     |> Repo.transaction()
     |> case do
@@ -378,6 +388,14 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
 
     Multi.new()
     |> Multi.update(:task, changeset)
+    |> Multi.insert(:task_lifecycle_audit, fn %{task: updated_task} ->
+      lifecycle_audit_changeset(
+        lifecycle_action_for_status(target_status),
+        updated_task,
+        task.status,
+        target_status
+      )
+    end)
     |> Repo.transaction()
     |> case do
       {:ok, %{task: task}} ->
@@ -391,6 +409,39 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
         end
     end
   end
+
+  @spec lifecycle_audit_changeset(atom(), Task.t(), String.t() | nil, String.t()) ::
+          Ecto.Changeset.t()
+  defp lifecycle_audit_changeset(action_name, %Task{} = task, from_status, to_status) do
+    %SwarmEvent{}
+    |> SwarmEvent.changeset(%{
+      session_id: task.session_id,
+      plan_id: task.plan_id,
+      task_id: task.id,
+      agent_id: task.owner_id,
+      event_type: "task_lifecycle",
+      phase: "lifecycle",
+      payload: %{
+        "action" => to_string(action_name),
+        "from_status" => from_status,
+        "to_status" => to_status,
+        "status" => task.status,
+        "task_id" => task.id,
+        "plan_id" => task.plan_id,
+        "owner_id" => task.owner_id,
+        "sequence" => task.sequence,
+        "category" => task.category,
+        "priority" => task.priority
+      },
+      raw_payload: %{},
+      hook_results: []
+    })
+  end
+
+  defp lifecycle_action_for_status("in_progress"), do: :task_activate
+  defp lifecycle_action_for_status("completed"), do: :task_complete
+  defp lifecycle_action_for_status("blocked"), do: :task_block
+  defp lifecycle_action_for_status("deleted"), do: :task_delete
 
   defp active_task_unique_error?(%Ecto.Changeset{errors: errors}) do
     Enum.any?(errors, fn
