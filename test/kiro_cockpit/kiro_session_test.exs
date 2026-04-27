@@ -45,7 +45,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert Process.alive?(session)
@@ -63,7 +64,8 @@ defmodule KiroCockpit.KiroSessionTest do
           executable: elixir,
           args: args,
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -87,7 +89,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -129,7 +132,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -181,7 +185,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -239,7 +244,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session2) end)
@@ -259,7 +265,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -298,7 +305,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session2) end)
@@ -328,7 +336,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -397,7 +406,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session2) end)
@@ -413,7 +423,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session2) end)
@@ -455,7 +466,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -534,7 +546,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       assert {:ok, _} = KiroSession.initialize(session)
@@ -580,7 +593,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: args,
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -607,7 +621,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: [],
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -631,7 +646,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: [],
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -655,7 +671,8 @@ defmodule KiroCockpit.KiroSessionTest do
           args: [],
           subscriber: self(),
           persist_messages: false,
-          auto_callbacks: false
+          auto_callbacks: false,
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)

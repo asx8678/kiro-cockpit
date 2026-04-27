@@ -36,7 +36,9 @@ defmodule KiroCockpit.KiroSession.CallbacksIntegrationTest do
       env: [{"FAKE_ACP_SCENARIO", scenario}],
       subscriber: self(),
       persist_messages: false,
-      auto_callbacks: auto_callbacks
+      auto_callbacks: auto_callbacks,
+      # kiro-egn: test_bypass for non-bypassable action boundary in test env
+      test_bypass: true
     ]
 
     callback_policy_opts =
@@ -311,7 +313,9 @@ defmodule KiroCockpit.KiroSession.CallbacksIntegrationTest do
           subscriber: self(),
           persist_messages: false,
           auto_callbacks: true,
-          callback_policy: :read_only
+          callback_policy: :read_only,
+          # kiro-egn: test_bypass for non-bypassable action boundary in test env
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)
@@ -385,7 +389,9 @@ defmodule KiroCockpit.KiroSession.CallbacksIntegrationTest do
           subscriber: self(),
           persist_messages: false,
           auto_callbacks: true,
-          callback_policy: :all
+          callback_policy: :all,
+          # kiro-egn: test_bypass for non-bypassable action boundary in test env
+          test_bypass: true
         )
 
       on_exit(fn -> safe_stop(session) end)

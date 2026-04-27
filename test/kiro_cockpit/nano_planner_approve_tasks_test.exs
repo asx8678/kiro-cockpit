@@ -135,7 +135,9 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
     [
       kiro_session_module: FakeKiroSession,
       project_dir: dir,
-      session_id: session_id
+      session_id: session_id,
+      # kiro-egn: test_bypass for non-bypassable action boundary in test env
+      test_bypass: true
     ]
   end
 
@@ -143,7 +145,7 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
     NanoPlanner.approve(
       :fake_session,
       plan_id,
-      [kiro_session_module: FakeKiroSession, project_dir: dir] ++ extra_opts
+      [kiro_session_module: FakeKiroSession, project_dir: dir, test_bypass: true] ++ extra_opts
     )
   end
 

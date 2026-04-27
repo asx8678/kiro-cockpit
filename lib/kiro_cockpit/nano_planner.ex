@@ -131,9 +131,10 @@ defmodule KiroCockpit.NanoPlanner do
     end
   end
 
-  # Run action through boundary if hooks are enabled; otherwise invoke
-  # the fun directly. Unifies the if/case nesting pattern used by
-  # plan, approve, and other boundary-wrapped entry points.
+  # Run action through boundary if hooks are enabled; otherwise fail closed
+  # for non-exempt actions (kiro-egn). When boundary is disabled, non-exempt
+  # actions return {:error, {:swarm_boundary_disabled, action}} instead of
+  # executing directly. Tests can use :test_bypass opt to bypass in test env.
   defp run_boundary_if_enabled(action, boundary_opts, enabled?, fun) do
     if enabled? do
       case ActionBoundary.run(action, boundary_opts, fun) do
@@ -142,9 +143,25 @@ defmodule KiroCockpit.NanoPlanner do
 
         {:error, {:swarm_blocked, reason, messages}} ->
           {:error, {:swarm_blocked, reason, messages}}
+
+        {:error, {:swarm_boundary_disabled, ^action}} ->
+          {:error, {:swarm_boundary_disabled, action}}
       end
     else
-      fun.()
+      # Boundary disabled — delegate to ActionBoundary which enforces
+      # non-bypassability (kiro-egn). Exempt actions execute; non-exempt
+      # fail closed. :test_bypass opt only effective in Mix.env() == :test.
+      ActionBoundary.run(action, Keyword.put(boundary_opts, :enabled, false), fun)
+      |> case do
+        {:ok, result} ->
+          result
+
+        {:error, {:swarm_blocked, reason, messages}} ->
+          {:error, {:swarm_blocked, reason, messages}}
+
+        {:error, {:swarm_boundary_disabled, _action}} ->
+          {:error, {:swarm_boundary_disabled, action}}
+      end
     end
   end
 
@@ -168,6 +185,7 @@ defmodule KiroCockpit.NanoPlanner do
     |> maybe_put_opt(opts, :post_hooks)
     |> maybe_put_opt(opts, :hook_manager_module)
     |> maybe_put_opt(opts, :task_manager_module)
+    |> maybe_put_opt(opts, :test_bypass)
   end
 
   defp truncate_request(request) when is_binary(request) and byte_size(request) > 200 do
@@ -332,6 +350,7 @@ defmodule KiroCockpit.NanoPlanner do
     |> maybe_put_opt(opts, :stale_plan_confirmed?)
     |> maybe_put_opt(opts, :context_builder_module)
     |> maybe_put_opt(opts, :staleness_module)
+    |> maybe_put_opt(opts, :test_bypass)
   end
 
   @doc """

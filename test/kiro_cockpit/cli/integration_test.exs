@@ -169,8 +169,9 @@ defmodule KiroCockpit.CLI.IntegrationTest do
       plan = create_real_plan_with_hash(snapshot.hash)
       {:ok, _approved} = Plans.approve_plan(plan.id)
 
+      # kiro-egn: test_bypass needed when hooks disabled (default test config)
       assert {:ok, %{kind: :plan_running, status: "running"}} =
-               CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
+               CLI.run("/plan run #{plan.id}", opts(project_dir: dir, test_bypass: true))
 
       assert Plans.get_plan(plan.id).status == "running"
 
@@ -194,15 +195,30 @@ defmodule KiroCockpit.CLI.IntegrationTest do
       File.rm_rf!(dir)
     end
 
-    test "run_plan stale check skipped when hooks disabled (default test config)" do
+    test "run_plan fails closed when hooks disabled for non-exempt action (kiro-egn)" do
       dir = setup_integration_project_dir()
       plan = create_real_plan()
       {:ok, _approved} = Plans.approve_plan(plan.id)
 
-      # With hooks disabled (default test config), staleness check is skipped
-      # and the plan transitions to running directly
-      assert {:ok, %{kind: :plan_running}} =
+      # kiro-egn: With hooks disabled (default test config), non-exempt
+      # actions fail closed rather than bypassing the boundary
+      assert {:error, %{code: :swarm_boundary_disabled}} =
                CLI.run("/plan run #{plan.id}", opts(project_dir: dir))
+
+      assert Plans.get_plan(plan.id).status == "approved"
+
+      File.rm_rf!(dir)
+    end
+
+    test "run_plan with test_bypass allows execution (kiro-egn)" do
+      dir = setup_integration_project_dir()
+      plan = create_real_plan()
+      {:ok, _approved} = Plans.approve_plan(plan.id)
+
+      # test_bypass allows direct execution in test env only
+      # (boundary disabled by default test config)
+      assert {:ok, %{kind: :plan_running}} =
+               CLI.run("/plan run #{plan.id}", opts(project_dir: dir, test_bypass: true))
 
       assert Plans.get_plan(plan.id).status == "running"
 

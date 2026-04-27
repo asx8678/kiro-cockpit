@@ -72,16 +72,108 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
     task
   end
 
-  describe "run/3 — boundary disabled" do
-    test "executes fun directly when boundary disabled via opts" do
+  describe "run/3 — boundary disabled (kiro-egn non-bypassable)" do
+    test "non-exempt action fails closed when boundary disabled via opts" do
       result =
         ActionBoundary.run(
-          :test_action,
+          :kiro_session_prompt,
+          [enabled: false],
+          fn -> {:hello, :world} end
+        )
+
+      assert {:error, {:swarm_boundary_disabled, :kiro_session_prompt}} = result
+    end
+
+    test "non-exempt plan action fails closed when boundary disabled" do
+      result =
+        ActionBoundary.run(
+          :nano_plan_generate,
+          [enabled: false],
+          fn -> :executed end
+        )
+
+      assert {:error, {:swarm_boundary_disabled, :nano_plan_generate}} = result
+    end
+
+    test "non-exempt callback action fails closed when boundary disabled" do
+      result =
+        ActionBoundary.run(
+          :fs_write_requested,
+          [enabled: false],
+          fn -> :written end
+        )
+
+      assert {:error, {:swarm_boundary_disabled, :fs_write_requested}} = result
+    end
+
+    test "exempt action executes directly when boundary disabled" do
+      result =
+        ActionBoundary.run(
+          :task_created,
           [enabled: false],
           fn -> {:hello, :world} end
         )
 
       assert {:ok, {:hello, :world}} = result
+    end
+
+    test "test_bypass allows execution in test env when boundary disabled" do
+      result =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [enabled: false, test_bypass: true],
+          fn -> {:hello, :world} end
+        )
+
+      assert {:ok, {:hello, :world}} = result
+    end
+
+    test "test_bypass is ignored when set to false" do
+      result =
+        ActionBoundary.run(
+          :kiro_session_prompt,
+          [enabled: false, test_bypass: false],
+          fn -> {:hello, :world} end
+        )
+
+      assert {:error, {:swarm_boundary_disabled, :kiro_session_prompt}} = result
+    end
+
+    test "exempt_actions/0 returns known exempt actions" do
+      exempt = ActionBoundary.exempt_actions()
+      assert is_list(exempt)
+      assert :task_created in exempt
+      assert :task_activated in exempt
+      assert :task_completed in exempt
+      assert :task_blocked in exempt
+      assert :plan_approved_lifecycle in exempt
+      assert :lifecycle_post_hook in exempt
+    end
+
+    test "exempt_action?/1 correctly classifies actions" do
+      assert ActionBoundary.exempt_action?(:task_created)
+      assert ActionBoundary.exempt_action?(:lifecycle_post_hook)
+      refute ActionBoundary.exempt_action?(:kiro_session_prompt)
+      refute ActionBoundary.exempt_action?(:nano_plan_generate)
+      refute ActionBoundary.exempt_action?(:fs_write_requested)
+    end
+
+    test "boundary disabled via app config fails closed for non-exempt" do
+      original = Application.get_env(:kiro_cockpit, :swarm_action_hooks_enabled)
+      Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, false)
+
+      try do
+        result =
+          ActionBoundary.run(
+            :kiro_session_prompt,
+            [],
+            fn -> :executed end
+          )
+
+        assert {:error, {:swarm_boundary_disabled, :kiro_session_prompt}} = result
+      after
+        Application.put_env(:kiro_cockpit, :swarm_action_hooks_enabled, original)
+      end
     end
   end
 

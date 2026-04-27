@@ -165,7 +165,8 @@ defmodule KiroCockpit.KiroSession do
           swarm_hooks: boolean(),
           swarm_agent_id: String.t(),
           swarm_plan_id: String.t() | nil,
-          swarm_ctx: map()
+          swarm_ctx: map(),
+          swarm_test_bypass: boolean()
         }
 
   # Internal state — 37 fields: unavoidable GenServer state; splitting
@@ -202,6 +203,9 @@ defmodule KiroCockpit.KiroSession do
             swarm_ctx: %{},
             plan_mode: nil,
             swarm_hooks_module: ActionBoundary,
+            # kiro-egn: test bypass flag for non-bypassable action boundary.
+            # Only effective in Mix.env() == :test. In production, always false.
+            swarm_test_bypass: false,
             # Stream normalization (kiro-1rd) -----------------------------
             stream_buffer: nil,
             stream_buffer_size: 0,
@@ -509,6 +513,12 @@ defmodule KiroCockpit.KiroSession do
       swarm_ctx = Keyword.get(opts, :swarm_ctx, %{})
       plan_mode = Keyword.get(opts, :plan_mode)
       swarm_hooks_module = Keyword.get(opts, :swarm_hooks_module, ActionBoundary)
+      # kiro-egn: test_bypass only effective in Mix.env() == :test.
+      # Allows direct execution when swarm_hooks is disabled.
+      # In production (dev/staging/prod), Mix.env() != :test, so this
+      # is always false — non-exempt actions can NEVER bypass.
+      explicit_test_bypass = Keyword.get(opts, :test_bypass, false)
+      swarm_test_bypass = explicit_test_bypass and Mix.env() == :test
 
       port_opts =
         [executable: executable, args: args, owner: self()] ++ extra_port_opts(opts)
@@ -540,6 +550,7 @@ defmodule KiroCockpit.KiroSession do
             swarm_ctx: swarm_ctx,
             plan_mode: plan_mode,
             swarm_hooks_module: swarm_hooks_module,
+            swarm_test_bypass: swarm_test_bypass,
             stream_buffer: :queue.new(),
             stream_buffer_limit: buffer_limit
           }
@@ -739,6 +750,10 @@ defmodule KiroCockpit.KiroSession do
     # pre/post trace semantics match the real action start.
     # Blocked prompts return immediately and do not start a turn or send
     # a prompt to the agent.
+    # kiro-egn: Non-bypassable action boundary.
+    # When swarm_hooks is disabled, non-exempt actions (like prompts)
+    # MUST fail closed. Only test_bypass allows direct execution in
+    # test environment.
     if state.swarm_hooks do
       boundary_opts = prompt_boundary_opts(state, opts)
 
@@ -750,7 +765,14 @@ defmodule KiroCockpit.KiroSession do
         state
       )
     else
-      do_start_prompt(prompt_or_blocks, opts, from, state)
+      # swarm_hooks disabled — non-exempt action must fail closed (kiro-egn)
+      # Only test_bypass (set at init, only effective in Mix.env() == :test)
+      # allows direct execution.
+      if state.swarm_test_bypass do
+        do_start_prompt(prompt_or_blocks, opts, from, state)
+      else
+        {:reply, {:error, {:swarm_boundary_disabled, :kiro_session_prompt}}, state}
+      end
     end
   end
 
@@ -801,7 +823,8 @@ defmodule KiroCockpit.KiroSession do
       swarm_hooks: state.swarm_hooks,
       swarm_agent_id: state.swarm_agent_id,
       swarm_plan_id: state.swarm_plan_id,
-      swarm_ctx: state.swarm_ctx
+      swarm_ctx: state.swarm_ctx,
+      swarm_test_bypass: state.swarm_test_bypass
     }
 
     {:reply, summary, state}
@@ -1176,7 +1199,24 @@ defmodule KiroCockpit.KiroSession do
         :ok
 
       true ->
-        dispatch_callback(state, port_pid, id, method, params)
+        # kiro-egn: swarm_hooks is disabled but method is known and
+        # policy allows it. Non-exempt callback actions must fail closed
+        # rather than executing without boundary enforcement.
+        # Only swarm_test_bypass (set at init, only in Mix.env() == :test)
+        # allows direct execution.
+        {action, _permission} = Callbacks.action_mapping(method)
+
+        if state.swarm_test_bypass or ActionBoundary.exempt_action?(action) do
+          dispatch_callback(state, port_pid, id, method, params)
+        else
+          PortProcess.respond_error(
+            port_pid,
+            id,
+            -32_000,
+            "Action blocked: swarm boundary disabled for non-exempt action",
+            nil
+          )
+        end
     end
 
     :ok

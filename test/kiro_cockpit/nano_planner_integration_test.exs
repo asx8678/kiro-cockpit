@@ -122,7 +122,9 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
     [
       kiro_session_module: FakeKiroSession,
       project_dir: dir,
-      session_id: "int-test-session"
+      session_id: "int-test-session",
+      # kiro-egn: test_bypass for non-bypassable action boundary in test env
+      test_bypass: true
     ]
   end
 
@@ -218,7 +220,8 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
       assert {:ok, %{plan: approved_plan, prompt_result: result}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 test_bypass: true
                )
 
       assert approved_plan.status == "approved"
@@ -251,7 +254,8 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
       assert {:error, {:prompt_failed, failed_plan, :connection_lost}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 test_bypass: true
                )
 
       # Plan was still approved in DB
@@ -432,7 +436,8 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
           nano_planner_module: NanoPlanner,
           session: :fake_session,
           kiro_session_module: FakeKiroSession,
-          project_dir: dir
+          project_dir: dir,
+          test_bypass: true
         )
 
       assert result.kind == :plan_approved
@@ -468,7 +473,8 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
           nano_planner_module: NanoPlanner,
           session: :fake_session,
           kiro_session_module: FakeKiroSession,
-          project_dir: dir
+          project_dir: dir,
+          test_bypass: true
         )
 
       assert result.kind == :plan_revised
@@ -501,7 +507,8 @@ defmodule KiroCockpit.NanoPlannerIntegrationTest do
       assert {:ok, %{plan: approved, prompt_result: result}} =
                NanoPlanner.approve(:fake_session, plan.id,
                  kiro_session_module: FakeKiroSession,
-                 project_dir: dir
+                 project_dir: dir,
+                 test_bypass: true
                )
 
       # Critical: prompt/3 was actually called

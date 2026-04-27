@@ -129,48 +129,67 @@ defmodule KiroCockpit.CLI.Commands.Plan do
           message: "Plan #{plan.id} approved and execution prompt sent to Kiro"
         })
 
-      {:error, :not_found} ->
-        Result.error(:not_found, "plan not found: #{id}", plan_id: id)
-
-      {:error, :stale_plan} ->
-        Result.error(
-          :stale_plan,
-          "plan #{id} is stale — the project has changed since it was generated; revise or regenerate",
-          plan_id: id
-        )
-
-      {:error, :stale_plan_unknown} ->
-        Result.error(
-          :stale_plan_unknown,
-          "plan #{id} staleness cannot be determined — project dir unavailable or snapshot failed; provide project_dir to proceed",
-          plan_id: id
-        )
-
-      {:error, :invalid_transition} ->
-        Result.error(
-          :invalid_transition,
-          "plan #{id} is not in `draft` status — cannot approve",
-          plan_id: id
-        )
-
-      {:error, {:prompt_failed, plan, reason}} ->
-        Result.error(
-          :prompt_failed,
-          "plan #{plan.id} was approved but the execution prompt failed: #{inspect(reason)}",
-          plan_id: plan.id,
-          plan: plan
-        )
-
-      {:error, {:swarm_blocked, reason, _messages}} ->
-        Result.error(
-          :stale_plan,
-          "plan #{id} is stale — #{reason}",
-          plan_id: id
-        )
-
       {:error, reason} ->
-        Result.error(:approve_failed, "could not approve plan: #{inspect(reason)}", plan_id: id)
+        approve_error(id, reason)
     end
+  end
+
+  defp approve_error(id, :not_found) do
+    Result.error(:not_found, "plan not found: #{id}", plan_id: id)
+  end
+
+  defp approve_error(id, :stale_plan) do
+    Result.error(
+      :stale_plan,
+      "plan #{id} is stale — the project has changed since it was generated; revise or regenerate",
+      plan_id: id
+    )
+  end
+
+  defp approve_error(id, :stale_plan_unknown) do
+    Result.error(
+      :stale_plan_unknown,
+      "plan #{id} staleness cannot be determined — project dir unavailable or snapshot failed; provide project_dir to proceed",
+      plan_id: id
+    )
+  end
+
+  defp approve_error(id, :invalid_transition) do
+    Result.error(
+      :invalid_transition,
+      "plan #{id} is not in `draft` status — cannot approve",
+      plan_id: id
+    )
+  end
+
+  defp approve_error(_id, {:prompt_failed, plan, reason}) do
+    Result.error(
+      :prompt_failed,
+      "plan #{plan.id} was approved but the execution prompt failed: #{inspect(reason)}",
+      plan_id: plan.id,
+      plan: plan
+    )
+  end
+
+  defp approve_error(id, {:swarm_blocked, reason, _messages}) do
+    Result.error(
+      :stale_plan,
+      "plan #{id} is stale — #{reason}",
+      plan_id: id
+    )
+  end
+
+  defp approve_error(id, {:swarm_boundary_disabled, action}) do
+    Result.error(
+      :swarm_boundary_disabled,
+      "plan #{id} cannot be approved — swarm boundary disabled for non-exempt action #{action}",
+      plan_id: id,
+      action: action
+    )
+  end
+
+  defp approve_error(id, reason) do
+    Result.error(:approve_failed, "could not approve plan: #{inspect(reason)}", plan_id: id)
   end
 
   @doc """
@@ -359,6 +378,14 @@ defmodule KiroCockpit.CLI.Commands.Plan do
           plan_id: id
         )
 
+      {:error, {:swarm_boundary_disabled, action}} ->
+        Result.error(
+          :swarm_boundary_disabled,
+          "plan #{id} cannot run — swarm boundary disabled for non-exempt action #{action}",
+          plan_id: id,
+          action: action
+        )
+
       {:error, reason} ->
         Result.error(:run_failed, "could not transition plan to running: #{inspect(reason)}",
           plan_id: id
@@ -367,7 +394,7 @@ defmodule KiroCockpit.CLI.Commands.Plan do
   end
 
   defp run_opts(opts) do
-    Keyword.take(opts, [:project_dir, :context_builder_module, :swarm_hooks])
+    Keyword.take(opts, [:project_dir, :context_builder_module, :swarm_hooks, :test_bypass])
     |> Keyword.put(:payload, %{"source" => "cli"})
   end
 
