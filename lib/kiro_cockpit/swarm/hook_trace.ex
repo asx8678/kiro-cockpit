@@ -78,27 +78,25 @@ defmodule KiroCockpit.Swarm.HookTrace do
   """
   @spec maybe_persist_trace(Event.t(), map(), map()) :: :ok
   def maybe_persist_trace(event, trace_summary, ctx) do
-    try do
-      attrs = %{
-        session_id: event.session_id,
-        plan_id: event.plan_id,
-        task_id: event.task_id,
-        agent_id: event.agent_id,
-        event_type: "hook_trace",
-        phase: to_string(ctx[:phase] || :lifecycle),
-        payload: safe_map(trace_summary["payload"]),
-        raw_payload: safe_map(trace_summary["raw_payload"]),
-        hook_results: trace_summary
-      }
+    attrs = %{
+      session_id: event.session_id,
+      plan_id: event.plan_id,
+      task_id: event.task_id,
+      agent_id: event.agent_id,
+      event_type: "hook_trace",
+      phase: to_string(ctx[:phase] || :lifecycle),
+      payload: safe_map(trace_summary["payload"]),
+      raw_payload: safe_map(trace_summary["raw_payload"]),
+      hook_results: trace_summary
+    }
 
-      case Events.create_event(attrs) do
-        {:ok, _} -> :ok
-        {:error, changeset} -> emit_persistence_error(changeset)
-      end
-    rescue
-      exception ->
-        emit_persistence_error(exception)
+    case Events.create_event(attrs) do
+      {:ok, _} -> :ok
+      {:error, changeset} -> emit_persistence_error(changeset)
     end
+  rescue
+    exception ->
+      emit_persistence_error(exception)
   end
 
   # Internal helpers

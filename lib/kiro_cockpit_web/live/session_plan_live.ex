@@ -130,12 +130,8 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   @impl true
   def handle_event("approve_plan", %{"id" => plan_id}, socket) do
     case approve_plan_for_session(plan_id, socket.assigns.session_id) do
-      {:ok, %{plan: plan}} ->
-        broadcast_plan_update(socket.assigns.session_id, plan)
-        socket = refresh_plans_and_notify(socket, "Plan approved successfully")
-        {:noreply, socket}
-
-      {:ok, plan} ->
+      {:ok, result} ->
+        plan = unwrap_approve_result(result)
         broadcast_plan_update(socket.assigns.session_id, plan)
         socket = refresh_plans_and_notify(socket, "Plan approved successfully")
         {:noreply, socket}
@@ -144,20 +140,10 @@ defmodule KiroCockpitWeb.SessionPlanLive do
         {:noreply, put_flash(socket, :error, "Plan not found")}
 
       {:error, :stale_plan} ->
-        {:noreply,
-         put_flash(
-           socket,
-           :error,
-           "Plan is stale — the project has changed since it was generated. Revise or regenerate."
-         )}
+        {:noreply, put_flash(socket, :error, stale_plan_flash())}
 
       {:error, {:swarm_blocked, _reason, _messages}} ->
-        {:noreply,
-         put_flash(
-           socket,
-           :error,
-           "Plan is stale — the project has changed since it was generated. Revise or regenerate."
-         )}
+        {:noreply, put_flash(socket, :error, stale_plan_flash())}
 
       {:error, :invalid_transition} ->
         {:noreply, put_flash(socket, :error, "Cannot approve plan: invalid status transition")}
@@ -695,6 +681,15 @@ defmodule KiroCockpitWeb.SessionPlanLive do
       nil -> nil
     end
   end
+
+  defp stale_plan_flash do
+    "Plan is stale — the project has changed since it was generated. Revise or regenerate."
+  end
+
+  # Unwrap the two result shapes from approve_plan_for_session:
+  # {:ok, %{plan: plan}} (plan+tasks result) or {:ok, plan} (plan-only).
+  defp unwrap_approve_result(%{plan: plan}), do: plan
+  defp unwrap_approve_result(plan), do: plan
 
   defp format_error(%Ecto.Changeset{} = changeset) do
     changeset.errors

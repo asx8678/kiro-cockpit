@@ -36,7 +36,7 @@ defmodule KiroCockpit.Swarm.DataPipeline do
   with `safe: true` or globally for development.
   """
 
-  alias KiroCockpit.Swarm.DataPipeline.{BronzeAction, BronzeAcp}
+  alias KiroCockpit.Swarm.DataPipeline.{BronzeAcp, BronzeAction}
   alias KiroCockpit.Swarm.Event
 
   # Action lifecycle capture -------------------------------------------------

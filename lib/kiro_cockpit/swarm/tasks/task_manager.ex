@@ -317,6 +317,9 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   # Guidance attachment
   # -------------------------------------------------------------------
 
+  # Dialyzer false positive: called in create/1 via Repo.transaction success path,
+  # but Dialyzer cannot infer the {:ok, %{task: task}} tuple from Multi.transaction.
+  @dialyzer {:nowarn_function, attach_create_guidance: 1}
   @spec attach_create_guidance(Task.t()) :: Task.t()
   defp attach_create_guidance(%Task{session_id: sid, owner_id: oid} = task) do
     active_exists? = not is_nil(get_active(sid, oid))

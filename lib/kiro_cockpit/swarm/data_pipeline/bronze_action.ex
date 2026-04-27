@@ -307,8 +307,6 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAction do
     map_size(payload) * 100
   end
 
-  defp estimate_payload_size(_), do: 0
-
   # Truncate payload to max bytes (rough approximation)
   defp truncate_payload(payload, max_bytes) do
     case Jason.encode(payload) do
