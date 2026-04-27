@@ -28,7 +28,8 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
   @fake_agent_entry ~s|KiroCockpit.Test.Acp.FakeAgent.main()|
 
   setup do
-    elixir_path = System.find_executable("elixir") || flunk("elixir not on PATH; cannot run port test")
+    elixir_path =
+      System.find_executable("elixir") || flunk("elixir not on PATH; cannot run port test")
 
     ebin_dirs =
       Path.wildcard(Path.expand("_build/#{Mix.env()}/lib/*/ebin", File.cwd!()))
@@ -64,6 +65,29 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
     end
   end
 
+  # Polling helper: waits up to `timeout` ms for predicate to return truthy.
+  # Polls every 20ms to resolve quickly when conditions are met early,
+  # reducing test flakes compared to a fixed Process.sleep.
+  defp assert_eventually(pred, timeout \\ 500) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    poll_until(pred, deadline)
+  end
+
+  defp poll_until(pred, deadline) do
+    if pred.() do
+      :ok
+    else
+      remaining = deadline - System.monotonic_time(:millisecond)
+
+      if remaining <= 0 do
+        flunk("Condition not met within timeout")
+      else
+        Process.sleep(min(remaining, 20))
+        poll_until(pred, deadline)
+      end
+    end
+  end
+
   describe "Bronze ACP persists when persist_messages: false (raw persistence disabled)" do
     setup %{elixir: elixir, args: args} do
       {:ok, session_pid} =
@@ -90,9 +114,12 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
       sid = state.session_id
       assert sid != nil
 
-      Process.sleep(150)
+      # Drain pause for negative assertion: we must allow async persistence to
+      # finish before asserting nothing landed in raw ACP storage.
+      Process.sleep(100)
 
       raw_msgs = EventStore.list_acp_messages(sid)
+
       assert raw_msgs == [],
              "Expected zero raw_acp_message rows when persist_messages: false, " <>
                "got #{length(raw_msgs)}: #{inspect(Enum.map(raw_msgs, & &1.method))}"
@@ -108,19 +135,22 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
       sid = state.session_id
       assert sid != nil
 
-      Process.sleep(150)
+      assert_eventually(fn -> length(BronzeAcp.list_acp_events(sid)) >= 1 end)
 
       acp_events = BronzeAcp.list_acp_events(sid)
+
       assert length(acp_events) >= 1,
              "Expected at least one Bronze ACP event when persist_messages: false, " <>
                "got #{length(acp_events)}"
 
       request_events = Enum.filter(acp_events, &(&1.event_type == "acp_request"))
+
       assert Enum.any?(request_events, fn event ->
                event.hook_results["direction"] == "client_to_agent"
              end)
 
       response_events = Enum.filter(acp_events, &(&1.event_type == "acp_response"))
+
       assert Enum.any?(response_events, fn event ->
                event.hook_results["direction"] == "agent_to_client"
              end)
@@ -136,7 +166,7 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
       sid = state.session_id
       assert sid != nil
 
-      Process.sleep(150)
+      assert_eventually(fn -> length(BronzeAcp.list_acp_events(sid)) >= 1 end)
 
       acp_events = BronzeAcp.list_acp_events(sid)
 
@@ -176,13 +206,17 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
       sid = state.session_id
       assert sid != nil
 
-      Process.sleep(150)
+      assert_eventually(fn -> length(EventStore.list_acp_messages(sid)) >= 1 end)
 
       raw_msgs = EventStore.list_acp_messages(sid)
+
       assert length(raw_msgs) >= 1,
              "Expected raw_acp_message rows when persist_messages: true"
 
+      assert_eventually(fn -> length(BronzeAcp.list_acp_events(sid)) >= 1 end)
+
       acp_events = BronzeAcp.list_acp_events(sid)
+
       assert length(acp_events) >= 1,
              "Expected Bronze ACP events when persist_messages: true"
     end
@@ -217,15 +251,20 @@ defmodule KiroCockpit.Swarm.DataPipeline.BronzeAcpIndependentPersistenceTest do
         sid = state.session_id
         assert sid != nil
 
-        Process.sleep(150)
+        # Drain pause for negative assertion: allow async ops to settle.
+        Process.sleep(100)
 
         refute KiroCockpit.Swarm.DataPipeline.acp_capture_enabled?()
 
         raw_msgs = EventStore.list_acp_messages(sid)
+
         assert raw_msgs == [],
                "Expected zero raw_acp_message rows when persist_messages: false"
 
+        assert_eventually(fn -> length(BronzeAcp.list_acp_events(sid)) >= 1 end)
+
         acp_events = BronzeAcp.list_acp_events(sid)
+
         assert length(acp_events) >= 1,
                "Expected Bronze ACP events even with both flags false"
       end)
