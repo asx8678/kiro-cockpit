@@ -269,6 +269,15 @@ defmodule KiroCockpit.PlansTest do
       assert {:error, :invalid_transition} =
                Plans.approve_plan_with_tasks(plan.id, "kiro-executor", TaskManager)
     end
+
+    test "returns {:error, :not_found} for a missing plan" do
+      alias KiroCockpit.Swarm.Tasks.TaskManager
+
+      missing_id = Ecto.UUID.generate()
+
+      assert {:error, :not_found} =
+               Plans.approve_plan_with_tasks(missing_id, "kiro-executor", TaskManager)
+    end
   end
 
   describe "reject_plan/2" do

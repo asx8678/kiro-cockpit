@@ -33,17 +33,38 @@ defmodule KiroCockpit.Swarm.Hooks.PlanModeFirstActionHook do
   @impl true
   def on_event(event, ctx) do
     plan_mode = Map.get(ctx, :plan_mode) || PlanMode.new()
-    first_action_shown = Map.get(ctx, :first_action_shown, false)
+    session_id = event.session_id
+
+    # Check durable sentinel: prefer process dictionary (coordination artifact
+    # per §4.1 — the Postgres plan row is domain truth) over ctx, since
+    # hooks cannot write back into ctx and ctx is recreated per invocation.
+    # Fall back to ctx for backward compatibility with unit tests that
+    # explicitly set first_action_shown.
+    first_action_shown =
+      Process.get(sentinel_key(session_id)) || Map.get(ctx, :first_action_shown, false)
 
     if PlanMode.planning_locked?(plan_mode) and not first_action_shown do
       guidance = build_guidance(event, plan_mode)
-      # Mark that we've shown the first action guidance
-      _updated_ctx = Map.put(ctx, :first_action_shown, true)
+      # Track sentinel durably so subsequent invocations skip guidance
+      Process.put(sentinel_key(session_id), true)
       HookResult.modify(event, [guidance], hook_metadata: %{first_action_shown: true})
     else
       HookResult.continue(event)
     end
   end
+
+  @doc """
+  Clears the first-action sentinel for a session.
+
+  Called when plan mode resets (e.g. plan approved/rejected) so a new
+  planning cycle can inject guidance again.
+  """
+  @spec clear_sentinel(String.t()) :: true
+  def clear_sentinel(session_id) do
+    Process.delete(sentinel_key(session_id))
+  end
+
+  defp sentinel_key(session_id), do: {__MODULE__, session_id, :first_action_shown}
 
   defp build_guidance(event, plan_mode) do
     action = event.action_name

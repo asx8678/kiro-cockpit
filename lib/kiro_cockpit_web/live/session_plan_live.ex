@@ -583,8 +583,12 @@ defmodule KiroCockpitWeb.SessionPlanLive do
   rescue
     e ->
       # Handle cases where NanoPlanner might not be available
+      # Use Exception.message/1 per §22.6/§25.6 — never inspect raw
+      # exception structs into logs (may contain PII/secrets).
       require Logger
-      Logger.warning("NanoPlanner.plan failed: #{inspect(e)}")
+
+      Logger.warning("NanoPlanner.plan failed: #{Exception.message(e)}")
+
       {:error, :planner_unavailable}
   end
 
@@ -698,12 +702,29 @@ defmodule KiroCockpitWeb.SessionPlanLive do
 
   defp format_error(reason) when is_atom(reason), do: to_string(reason)
   defp format_error(reason) when is_binary(reason), do: reason
-  defp format_error(reason), do: inspect(reason)
+  defp format_error(%{__exception__: true} = reason), do: Exception.message(reason)
+  defp format_error(reason) when is_list(reason), do: format_error(inspect(reason))
+  defp format_error(reason), do: "unexpected error: #{type_name(reason)}"
+
+  # Returns a safe type name for an unknown value — never inspects
+  # the value body, only its type, to avoid leaking PII/secrets.
+  @spec type_name(term()) :: String.t()
+  defp type_name(value) when is_map(value), do: "map"
+  defp type_name(value) when is_tuple(value), do: "tuple"
+  defp type_name(value) when is_pid(value), do: "pid"
+  defp type_name(value) when is_function(value), do: "function"
+  defp type_name(value) when is_port(value), do: "port"
+  defp type_name(value) when is_reference(value), do: "reference"
+  defp type_name(value) when is_float(value), do: "float"
+  defp type_name(value) when is_integer(value), do: "integer"
+  defp type_name(_value), do: "unknown"
 
   defp format_exit(:normal), do: "normal exit"
   defp format_exit(:shutdown), do: "shutdown"
-  defp format_exit({:shutdown, reason}), do: "shutdown: #{inspect(reason)}"
-  defp format_exit(reason), do: inspect(reason)
+  defp format_exit({:shutdown, reason}) when is_binary(reason), do: "shutdown: #{reason}"
+  defp format_exit({:shutdown, _reason}), do: "shutdown"
+  defp format_exit(reason) when is_atom(reason), do: to_string(reason)
+  defp format_exit(_reason), do: "unexpected exit"
 
   defp truncate(text, max_length) do
     if String.length(text) > max_length do
