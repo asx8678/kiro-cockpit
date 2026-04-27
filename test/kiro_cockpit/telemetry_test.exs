@@ -54,12 +54,14 @@ defmodule KiroCockpit.TelemetryTest do
 
   describe "contexts/0, actions/1, metadata_keys/0" do
     test "expose the closed sets" do
-      assert T.contexts() == [:acp, :session, :event_store, :hook]
+      assert T.contexts() == [:acp, :session, :event_store, :hook, :bronze]
       assert :create in T.actions(:session)
       assert :append in T.actions(:event_store)
       assert :prompt in T.actions(:acp)
       assert :chain in T.actions(:hook)
       assert :run in T.actions(:hook)
+      assert :action in T.actions(:bronze)
+      assert :acp in T.actions(:bronze)
 
       keys = T.metadata_keys()
       assert :session_id in keys

@@ -201,10 +201,13 @@ defmodule KiroCockpit.Plans do
     alias KiroCockpit.Swarm.Tasks.Task
 
     multi
-    |> Multi.update(:plan, Plan.changeset(plan, %{
-      status: "approved",
-      approved_at: DateTime.utc_now()
-    }))
+    |> Multi.update(
+      :plan,
+      Plan.changeset(plan, %{
+        status: "approved",
+        approved_at: DateTime.utc_now()
+      })
+    )
     |> Multi.insert(:event, fn %{plan: updated_plan} ->
       PlanEvent.changeset(%PlanEvent{}, %{
         plan_id: updated_plan.id,
@@ -248,7 +251,9 @@ defmodule KiroCockpit.Plans do
   end
 
   # Handle transaction result, preloading associations on success.
-  defp handle_approval_transaction_result({:ok, %{plan: plan, tasks: tasks, active_task: active_task}}) do
+  defp handle_approval_transaction_result(
+         {:ok, %{plan: plan, tasks: tasks, active_task: active_task}}
+       ) do
     plan_with_assocs = Repo.preload(plan, [:plan_steps, :plan_events])
     {:ok, %{plan: plan_with_assocs, tasks: tasks, active_task: active_task}}
   end
@@ -603,7 +608,8 @@ defmodule KiroCockpit.Plans do
         |> Enum.filter(&valid_permission?/1)
 
       %{
-        plan_id: nil, # Will be set during insertion
+        # Will be set during insertion
+        plan_id: nil,
         session_id: plan.session_id,
         owner_id: agent_id,
         sequence: step.phase_number * 100 + step.step_number,

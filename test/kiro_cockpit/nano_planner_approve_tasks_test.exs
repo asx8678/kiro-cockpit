@@ -700,5 +700,4 @@ defmodule KiroCockpit.NanoPlannerApproveTasksTest do
       assert result == %{"stopReason" => "end_turn"}
     end
   end
-
 end

@@ -89,12 +89,15 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
       assert reason =~ "No active task"
       assert is_list(messages)
 
-      # Bronze hook_trace should be persisted
+      # Bronze events should be persisted: action_before, hook_trace, action_blocked
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
-      assert length(events) == 1
-      bronze = List.first(events)
-      assert bronze.event_type == "hook_trace"
-      assert bronze.phase == "pre"
+      event_types = Enum.map(events, & &1.event_type)
+      assert "hook_trace" in event_types
+      # §35 Phase 3: action_before and action_blocked also persisted
+      assert "action_before" in event_types
+      assert "action_blocked" in event_types
+      hook_trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert hook_trace.phase == "pre"
     end
 
     test "active task allows executor and writes post trace" do
@@ -127,11 +130,13 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
 
       assert {:ok, :executed} = result
 
-      # Pre-hook trace persisted
+      # Pre-hook trace persisted (alongside §35 action events)
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
-      assert length(events) >= 1
-      bronze = List.first(events)
-      assert bronze.event_type == "hook_trace"
+      event_types = Enum.map(events, & &1.event_type)
+      assert "hook_trace" in event_types
+      # §35 Phase 3: action_before and action_after also present
+      assert "action_before" in event_types
+      assert "action_after" in event_types
     end
 
     test "file scope blocks with out-of-scope target path" do
@@ -1196,13 +1201,15 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
           session_id,
           "Test plan for hydration",
           "nano",
-          [%{
-            title: "Step 1",
-            permission_level: "write",
-            phase_number: 1,
-            step_number: 1,
-            status: "planned"
-          }],
+          [
+            %{
+              title: "Step 1",
+              permission_level: "write",
+              phase_number: 1,
+              step_number: 1,
+              status: "planned"
+            }
+          ],
           plan_markdown: "# Test Plan",
           execution_prompt: "Execute the plan",
           project_snapshot_hash: "abc123"
@@ -1522,13 +1529,15 @@ defmodule KiroCockpit.Swarm.ActionBoundaryTest do
           session_id,
           "DB plan",
           "nano",
-          [%{
-            title: "Step",
-            permission_level: "write",
-            phase_number: 1,
-            step_number: 1,
-            status: "planned"
-          }],
+          [
+            %{
+              title: "Step",
+              permission_level: "write",
+              phase_number: 1,
+              step_number: 1,
+              status: "planned"
+            }
+          ],
           plan_markdown: "# DB Plan",
           execution_prompt: "Execute the plan",
           project_snapshot_hash: "def456"

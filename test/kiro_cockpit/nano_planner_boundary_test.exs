@@ -142,8 +142,10 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
       assert length(events) >= 1
 
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_after events are also persisted;
+      # find the hook_trace specifically.
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       # The hook_results should contain the nano_plan_generate action
       assert trace.hook_results["action"] == "nano_plan_generate"
     end
@@ -275,8 +277,10 @@ defmodule KiroCockpit.NanoPlannerBoundaryTest do
       # Bronze trace is still persisted for the blocked attempt
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
       assert length(events) >= 1
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_blocked events are also present;
+      # find the hook_trace specifically.
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       assert trace.hook_results["outcome"] == "blocked"
     end
   end

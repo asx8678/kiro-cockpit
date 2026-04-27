@@ -47,7 +47,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   """
 
   alias KiroCockpit.NanoPlanner.Staleness
-  alias KiroCockpit.Swarm.{Event, HookManager}
+  alias KiroCockpit.Swarm.{DataPipeline, Event, HookManager}
   alias KiroCockpit.Swarm.Tasks.TaskManager
 
   @default_pre_hooks [
@@ -153,6 +153,12 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     pre_hooks = Keyword.get(opts, :pre_hooks, @default_pre_hooks)
     post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
 
+    # Bronze Phase 3: Record action_before for audit trail (§35)
+    # This captures the action entering the boundary before pre-hooks run
+    if DataPipeline.action_capture_enabled?() do
+      DataPipeline.record_action_before(event, ctx)
+    end
+
     case hm.run(event, pre_hooks, ctx, :pre) do
       {:ok, modified_event, messages} ->
         # kiro-4dk: Thread modified event and hook messages to executor and post-hooks
@@ -167,11 +173,42 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
         # kiro-4dk: Pass the modified event (not original) so post-hooks see pre-hook changes
         _ = hm.run(event_for_executor, post_hooks, ctx, :post)
 
+        # Bronze Phase 3: Record action_after with result (§35)
+        # This captures successful action completion with result status
+        if DataPipeline.action_capture_enabled?() do
+          DataPipeline.record_action_after(event_for_executor, {:ok, result}, ctx)
+        end
+
         {:ok, result}
 
-      {:blocked, _event, reason, messages} ->
+      {:blocked, blocked_event, reason, messages} ->
+        # Bronze Phase 3: Record action_blocked for fail-closed audit (§35)
+        # Blocked actions always persist a Bronze record per §27.11 inv. 7
+        if DataPipeline.action_capture_enabled?() do
+          blocking_hook = extract_blocking_hook(messages)
+
+          DataPipeline.record_action_blocked(blocked_event, reason, messages, ctx,
+            blocking_hook: blocking_hook
+          )
+        end
+
         {:error, {:swarm_blocked, reason, messages}}
     end
+  end
+
+  # Extract the hook name that blocked from hook result messages
+  # This is a best-effort heuristic for audit purposes
+  defp extract_blocking_hook(messages) do
+    # Look for message patterns that indicate which hook blocked
+    # Default to "unknown" if we can't determine
+    Enum.find_value(messages, "unknown", fn msg ->
+      cond do
+        String.contains?(msg, "TaskEnforcement") -> "TaskEnforcementHook"
+        String.contains?(msg, "Steering") -> "SteeringPreActionHook"
+        String.contains?(msg, "PlanMode") -> "PlanModeFirstActionHook"
+        true -> nil
+      end
+    end)
   end
 
   # Prepare context for executor based on function arity.
@@ -389,6 +426,7 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
   # Hydrate :plan from Plans.get_plan/1 if plan_id is available and not in ctx
   defp maybe_hydrate_plan(ctx, _opts, _event) when is_map_key(ctx, :plan), do: ctx
   defp maybe_hydrate_plan(ctx, _opts, %{plan_id: nil}), do: ctx
+
   defp maybe_hydrate_plan(ctx, _opts, %{plan_id: plan_id}) do
     case safe_get_plan(plan_id) do
       nil -> ctx
@@ -504,7 +542,25 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
       ctx = build_ctx(opts, event, staleness_mod, tm)
       post_hooks = Keyword.get(opts, :post_hooks, @default_post_hooks)
 
-      _ = hm.run(event, post_hooks, ctx, :post)
+      # Bronze Phase 3: Record lifecycle action_before for completeness (§35)
+      if DataPipeline.action_capture_enabled?() do
+        DataPipeline.record_action_before(event, Map.put(ctx, :lifecycle, true))
+      end
+
+      result = hm.run(event, post_hooks, ctx, :post)
+
+      # Bronze Phase 3: Record lifecycle action_after for completeness (§35)
+      # Lifecycle actions always succeed (they've already happened)
+      if DataPipeline.action_capture_enabled?() do
+        normalized_result =
+          case result do
+            {:ok, _evt, _msgs} -> {:ok, :lifecycle_completed}
+            {:blocked, _evt, _reason, _msgs} -> {:blocked, "post-hook blocked", []}
+            _ -> {:ok, :lifecycle_completed}
+          end
+
+        DataPipeline.record_action_after(event, normalized_result, Map.put(ctx, :lifecycle, true))
+      end
     end
 
     :ok

@@ -656,8 +656,9 @@ defmodule KiroCockpit.NanoPlannerTest do
       # Bronze trace should be persisted
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
       assert length(events) >= 1
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_blocked also present; find hook_trace specifically
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       assert trace.hook_results["outcome"] == "blocked"
       assert trace.hook_results["action"] == "nano_plan_approve"
     end
@@ -732,8 +733,9 @@ defmodule KiroCockpit.NanoPlannerTest do
       # Bronze trace should be persisted
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
       assert length(events) >= 1
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_blocked also present; find hook_trace specifically
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       assert trace.hook_results["outcome"] == "blocked"
       assert trace.hook_results["action"] == "nano_plan_approve"
     end
@@ -783,8 +785,9 @@ defmodule KiroCockpit.NanoPlannerTest do
       # Bronze trace should be persisted
       events = KiroCockpit.Swarm.Events.list_by_session(session_id, limit: 10)
       assert length(events) >= 1
-      trace = List.first(events)
-      assert trace.event_type == "hook_trace"
+      # §35 Phase 3: action_before/action_blocked also present; find hook_trace specifically
+      trace = Enum.find(events, &(&1.event_type == "hook_trace"))
+      assert trace != nil
       assert trace.hook_results["outcome"] == "blocked"
       assert trace.hook_results["action"] == "nano_plan_approve"
     end
