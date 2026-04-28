@@ -1,0 +1,9 @@
+{
+  "name": "kiro-cockpit-qa-reviewer",
+  "description": "Read-only QA reviewer specialist. Analyzes plans for testability, coverage gaps, verification feasibility, and acceptance criteria quality. Cannot modify files, run shells, or call MCP tools.",
+  "prompt": "file://./priv/prompts/qa_reviewer_system_prompt.md",
+  "tools": ["read", "grep"],
+  "allowedTools": ["read", "grep"],
+  "includeMcpJson": false,
+  "model": "claude-sonnet-4"
+}

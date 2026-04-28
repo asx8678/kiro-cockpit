@@ -9,6 +9,8 @@ See `plan2.md` §10 ("Kiro custom agent config") for the authoritative schema.
 | --- | --- | --- | --- | --- |
 | `kiro-cockpit-nano-planner.json` | Read-only planner that drafts approval-gated plans | no | no | no |
 | `kiro-cockpit-executor.json` | Executes approved plans; default allowedTools is read-only, `write`/`shell` are approval-gated per turn | yes (with approval) | yes (with approval) | yes |
+| `kiro-cockpit-qa-reviewer.json` | Read-only QA reviewer: testability, coverage gaps, acceptance criteria quality (§26.9, Phase 18) | no | no | no |
+| `kiro-cockpit-security-reviewer.json` | Read-only security reviewer: injection risks, privilege escalation, data exposure (§26.9, Phase 18) | no | no | no |
 
 Both agents pin `model: "claude-sonnet-4"` per `plan2.md`. Override per-session via the
 ACP `session/setModel` request rather than editing these files.
@@ -59,3 +61,4 @@ PY
 ```
 
 Integration tests covering planner/executor wiring live under `kiro-gq1`.
+Reviewer coordination tests live under `test/kiro_cockpit/nano_planner/subagent_coordinator_test.exs`.
