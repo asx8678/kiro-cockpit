@@ -95,7 +95,14 @@ defmodule KiroCockpit.Swarm.ActionBoundary do
     KiroCockpit.Swarm.Hooks.SteeringPreActionHook
   ]
 
-  @default_post_hooks [KiroCockpit.Swarm.Hooks.TaskGuidanceHook]
+  @default_post_hooks [
+    KiroCockpit.Swarm.Hooks.WriteValidationHook,
+    KiroCockpit.Swarm.Hooks.PostActingHook,
+    KiroCockpit.Swarm.Hooks.TaskMaintenanceHook,
+    KiroCockpit.Swarm.Hooks.ToolResultAnalysisHook,
+    KiroCockpit.Swarm.Hooks.TaskGuidanceHook,
+    KiroCockpit.Swarm.Hooks.LocalFindingsHook
+  ]
 
   # Actions exempt from boundary enforcement (kiro-egn).
   # These are internal/lifecycle actions that don't need pre-hook gating.

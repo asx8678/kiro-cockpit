@@ -307,6 +307,26 @@ defmodule KiroCockpit.Swarm.Tasks.TaskManager do
   end
 
   # -------------------------------------------------------------------
+  # Count by status
+  # -------------------------------------------------------------------
+
+  @doc """
+  Returns the count of tasks with the given status for an execution lane.
+
+  Used by post-action hooks (e.g. TaskMaintenanceHook) to check task health
+  without loading full task structs.
+  """
+  @spec count_by_status(session_id(), owner_id(), String.t()) :: non_neg_integer()
+  def count_by_status(session_id, owner_id, status)
+      when is_binary(session_id) and is_binary(owner_id) and is_binary(status) do
+    Task
+    |> where([t], t.session_id == ^session_id and t.owner_id == ^owner_id and t.status == ^status)
+    |> select([t], count(t.id))
+    |> Repo.one()
+    |> Kernel.||(0)
+  end
+
+  # -------------------------------------------------------------------
   # Post-hook fire (Bronze trace capture)
   # -------------------------------------------------------------------
 
