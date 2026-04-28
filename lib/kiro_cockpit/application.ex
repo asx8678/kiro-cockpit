@@ -21,6 +21,7 @@ defmodule KiroCockpit.Application do
       KiroCockpit.Repo,
       {Phoenix.PubSub, name: KiroCockpit.PubSub},
       KiroCockpitWeb.Telemetry,
+      KiroCockpit.PuppyBrain.Callbacks,
       KiroCockpitWeb.Endpoint
     ]
 
