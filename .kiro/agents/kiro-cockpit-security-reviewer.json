@@ -1,0 +1,9 @@
+{
+  "name": "kiro-cockpit-security-reviewer",
+  "description": "Read-only security reviewer specialist. Analyzes plans for injection risks, privilege escalation, data exposure, authentication gaps, and compliance issues. Cannot modify files, run shells, or call MCP tools.",
+  "prompt": "file://./priv/prompts/security_reviewer_system_prompt.md",
+  "tools": ["read", "grep"],
+  "allowedTools": ["read", "grep"],
+  "includeMcpJson": false,
+  "model": "claude-sonnet-4"
+}

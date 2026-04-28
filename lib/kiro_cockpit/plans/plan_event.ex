@@ -10,7 +10,7 @@ defmodule KiroCockpit.Plans.PlanEvent do
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
-  @event_types ~w(created revised approved rejected running completed failed superseded)
+  @event_types ~w(created revised approved rejected running completed failed superseded reviewer_output)
 
   @required_fields ~w(plan_id event_type created_at)a
 
